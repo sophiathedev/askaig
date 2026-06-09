@@ -39,8 +39,12 @@ namespace search {
 
     constexpr int DELTA_MARGIN = 200; // qsearch delta pruning: safety margin above the captured value
 
-    // Per-thread abort flag. Helper (Lazy-SMP) threads point this at the shared stop flag so they
-    // bail out of a deep search promptly; the main thread leaves it null and always runs to depth.
+    // Global stop flag, set by request_stop() (the UCI "stop" command) and cleared at the start of
+    // each think(). Every search thread (main + helpers) points its t_stop at this.
+    std::atomic<bool> g_stop{false};
+
+    // Per-thread abort flag, pointing at g_stop while a search runs so negamax/quiescence bail out
+    // promptly. Left null outside a search.
     thread_local const std::atomic<bool> *t_stop = nullptr;
 
     bool aborted() noexcept { return t_stop != nullptr && t_stop->load(std::memory_order_relaxed); }
@@ -529,7 +533,18 @@ namespace search {
       return dst;
     }
 
+    // The first legal move (any), used as a safe fallback bestmove if the search is stopped before
+    // even depth 1 completes.
+    template<Color Us>
+    Move first_legal(Position &p) {
+      MoveList<Us> list(p);
+      return list.size() ? *list.begin() : Move{};
+    }
+    Move any_legal_move(Position &p) { return p.turn() == WHITE ? first_legal<WHITE>(p) : first_legal<BLACK>(p); }
+
   } // namespace
+
+  void request_stop() { g_stop.store(true, std::memory_order_relaxed); }
 
   Result think(const Position &pos, int max_depth, int threads, const InfoCallback &on_iteration) {
     if (is_illegal(pos))
@@ -539,48 +554,55 @@ namespace search {
     if (threads < 1)
       threads = 1;
 
+    g_stop.store(false, std::memory_order_relaxed); // fresh search: clear any leftover stop request
+
     // Lazy SMP: helper threads search the same root on their own board copies, all sharing the
     // (lockless) transposition table. Their work fills the TT, giving the main thread extra
-    // cut-offs. Helpers check `stop` between iterations.
-    std::atomic<bool>        stop{false};
+    // cut-offs. Every thread aborts when g_stop is set.
     std::atomic<uint64_t>    total_nodes{0}; // nodes summed across all threads (for the reported nps)
     std::vector<std::thread> helpers;
     helpers.reserve(static_cast<size_t>(threads - 1));
     for (int t = 1; t < threads; ++t)
-      helpers.emplace_back([&pos, max_depth, t, &stop, &total_nodes]() {
-        t_stop          = &stop; // let this thread's search abort promptly when stop is set
+      helpers.emplace_back([&pos, max_depth, t, &total_nodes]() {
+        t_stop          = &g_stop; // abort promptly when a stop is requested
         Position  local = clone(pos);
         const int start = 1 + (t % 2); // stagger start depth so helpers don't march in lockstep
-        // Keep re-deepening (refilling the shared TT) until the main thread signals stop.
-        while (!stop.load(std::memory_order_relaxed))
-          for (int d = start; d <= max_depth && !stop.load(std::memory_order_relaxed); ++d)
+        while (!g_stop.load(std::memory_order_relaxed))
+          for (int d = start; d <= max_depth && !g_stop.load(std::memory_order_relaxed); ++d)
             total_nodes.fetch_add(search_to_depth(local, d, -INF, INF).nodes, std::memory_order_relaxed);
       });
 
     // Main thread: iterative deepening, reporting each completed depth. (Helper threads are freshly
     // spawned, so their thread_local killer/history tables are already zero-initialised.)
+    t_stop = &g_stop; // the main search thread is interruptible too
     clear_heuristics();
     Position   main_pos   = clone(pos);
     const auto t0         = std::chrono::steady_clock::now();
     int        prev_score = 0;
-    Result     r{};
+    Result     best{};
+    best.best = any_legal_move(main_pos); // guarantees a real move even if stopped before depth 1 finishes
+
     for (int d = 1; d <= max_depth; ++d) {
-      r          = aspiration_search(main_pos, d, prev_score);
-      prev_score = r.score;
+      Result r = aspiration_search(main_pos, d, prev_score);
       total_nodes.fetch_add(r.nodes, std::memory_order_relaxed);
+      if (aborted()) // this iteration was interrupted: discard it, keep the last completed one
+        break;
+      best       = r;
+      prev_score = r.score;
       const auto ms =
               std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
       const uint64_t nodes = total_nodes.load(std::memory_order_relaxed); // all threads so far
-      r.nodes              = nodes;
-      on_iteration(d, r, nodes, static_cast<long long>(ms));
-      if (is_mate(r.score))
+      best.nodes           = nodes;
+      on_iteration(d, best, nodes, static_cast<long long>(ms));
+      if (is_mate(best.score))
         break; // forced mate found; deeper search cannot find a faster one
     }
 
-    stop.store(true, std::memory_order_relaxed);
+    g_stop.store(true, std::memory_order_relaxed); // stop the helpers
     for (std::thread &h: helpers)
       h.join();
-    return r;
+    t_stop = nullptr;
+    return best;
   }
 
 } // namespace search

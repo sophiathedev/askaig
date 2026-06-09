@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -19,6 +20,20 @@ namespace {
 
   // Number of search threads (the "Threads" UCI option).
   int g_threads = 1;
+
+  // The search runs on this background thread so the UCI loop stays responsive (stop/isready work
+  // mid-search). `g_out` serialises stdout so the search thread's "info"/"bestmove" lines never
+  // interleave with the main thread's replies.
+  std::thread g_search;
+  std::mutex  g_out;
+
+  // Stops any running search and joins its thread. Called before any command that mutates engine
+  // state, so a search never runs concurrently with a position/option change.
+  void stop_search() {
+    search::request_stop();
+    if (g_search.joinable())
+      g_search.join();
+  }
 
   // Largest sensible thread count to advertise/accept.
   unsigned max_threads() {
@@ -164,35 +179,43 @@ namespace {
   // iterative-deepening, multi-threaded (Lazy SMP) negamax/alpha-beta search ("go depth <n>",
   // default DEFAULT_DEPTH), printing an info line per depth. Time-control args are ignored.
   void go_cmd(Position &pos, std::istringstream &is) {
+    stop_search(); // never run two searches at once, nor search while pos can change
+
     int         depth = DEFAULT_DEPTH;
     std::string token;
     while (is >> token) {
       if (token == "perft") {
         int d = 1;
         is >> d;
-        run_perft(pos, d);
+        run_perft(pos, d); // synchronous: perft is a debug node count, not a game move
         return;
       }
       if (token == "depth")
         is >> depth;
     }
 
-    search::Result r =
-            search::think(pos, depth, g_threads, [](int d, const search::Result &res, uint64_t nodes, long long ms) {
-              const uint64_t nps = ms > 0 ? nodes * 1000 / static_cast<uint64_t>(ms) : nodes * 1000;
-              std::cout << "info depth " << d << " score " << format_score(res.score) << " nodes " << nodes << " nps "
-                        << nps << " time " << ms;
-              if (!res.pv.empty()) {
-                std::cout << " pv";
-                for (Move m: res.pv)
-                  std::cout << " " << move_to_uci(m);
-              } else if (res.best.to_from() != 0)
-                std::cout << " pv " << move_to_uci(res.best);
-              std::cout << "\n" << std::flush;
-            });
+    // Search on a background thread; the loop keeps reading stdin so "stop"/"isready" stay live.
+    // `pos` is safe to capture by pointer: every pos-mutating command calls stop_search() first.
+    Position *pp = &pos;
+    g_search     = std::thread([pp, depth]() {
+      search::Result r =
+              search::think(*pp, depth, g_threads, [](int d, const search::Result &res, uint64_t nodes, long long ms) {
+                const uint64_t              nps = ms > 0 ? nodes * 1000 / static_cast<uint64_t>(ms) : nodes * 1000;
+                std::lock_guard<std::mutex> lk(g_out);
+                std::cout << "info depth " << d << " score " << format_score(res.score) << " nodes " << nodes << " nps "
+                          << nps << " time " << ms;
+                if (!res.pv.empty()) {
+                  std::cout << " pv";
+                  for (Move m: res.pv)
+                    std::cout << " " << move_to_uci(m);
+                } else if (res.best.to_from() != 0)
+                  std::cout << " pv " << move_to_uci(res.best);
+                std::cout << "\n" << std::flush;
+              });
 
-    const bool has_move = r.best.to_from() != 0;
-    std::cout << "bestmove " << (has_move ? move_to_uci(r.best) : "0000") << "\n";
+      std::lock_guard<std::mutex> lk(g_out);
+      std::cout << "bestmove " << (r.best.to_from() != 0 ? move_to_uci(r.best) : "0000") << "\n" << std::flush;
+    });
   }
 
 } // namespace
@@ -215,18 +238,23 @@ void uci::loop() {
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
       std::cout << "uciok\n";
     } else if (cmd == "isready") {
-      std::cout << "readyok\n";
+      // Must answer even mid-search, so this never touches engine state.
+      std::lock_guard<std::mutex> lk(g_out);
+      std::cout << "readyok\n" << std::flush;
     } else if (cmd == "ucinewgame") {
+      stop_search();
       pos.emplace();
       Position::set(DEFAULT_FEN, *pos);
       tt::clear();
     } else if (cmd == "position") {
+      stop_search();
       position_cmd(pos, is);
     } else if (cmd == "go") {
       go_cmd(*pos, is);
     } else if (cmd == "d" || cmd == "display") {
       std::cout << *pos;
     } else if (cmd == "setoption") {
+      stop_search(); // resizing the TT (or changing threads) under a running search is unsafe
       // setoption name <id> [value <x>]
       std::string token;
       std::string name;
@@ -242,13 +270,18 @@ void uci::loop() {
         if (is >> t)
           g_threads = t < 1 ? 1 : (t > 1024 ? 1024 : t);
       }
-    } else if (cmd == "stop" || cmd == "ponderhit" || cmd == "register" || cmd.empty()) {
+    } else if (cmd == "stop") {
+      search::request_stop(); // the search thread finishes promptly and prints its bestmove
+    } else if (cmd == "ponderhit" || cmd == "register" || cmd.empty()) {
       // accepted but no-op
     } else if (cmd == "quit" || cmd == "exit") {
+      stop_search();
       break;
     }
     // unknown commands are silently ignored, as the UCI spec requires
 
     std::cout.flush();
   }
+
+  stop_search(); // joins the search thread on EOF/quit so its std::thread isn't destroyed while joinable
 }

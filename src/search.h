@@ -27,7 +27,13 @@ namespace search {
 
   // Iterative-deepening negamax/alpha-beta search to `max_depth` using `threads` threads (Lazy
   // SMP, sharing the transposition table). Returns the best move; invokes `on_iteration` after
-  // each main-thread depth. `pos` is not modified (each thread searches a copy).
+  // each main-thread depth. `pos` is not modified (each thread searches a copy). Runs until
+  // `max_depth` or until `request_stop()` is called, in which case it returns the best move from
+  // the last fully-completed iteration. Intended to be run on a background thread.
   Result think(const Position &pos, int max_depth, int threads, const InfoCallback &on_iteration);
+
+  // Asks an in-progress `think()` to stop as soon as possible (the UCI "stop" command). Safe to
+  // call from another thread; cleared automatically at the start of the next `think()`.
+  void request_stop();
 
 } // namespace search
