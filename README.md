@@ -85,7 +85,7 @@ printf 'position startpos\ngo perft 6\nquit\n' | ./build/askaig | grep "Nodes se
 # Nodes searched: 119060324
 ```
 
-This number must hold across all build configurations (scalar, NEON, AVX2). `go perft` is **parallelised** across the `Threads` option (root moves are split over worker threads), so it scales close to linearly with core count while the divide output and total stay identical to the single-threaded run.
+This number must hold across all build configurations (scalar, NEON, AVX2). `go perft` is **parallelised** across the `Threads` option (root moves are split over worker threads), so it scales close to linearly with core count while the divide output and total stay identical to the single-threaded run. It is also **memoised by an exact perft hash**: each entry stores the full move-generation state (placement + side + castling + en-passant) and is matched bit-for-bit, so — unlike a plain Zobrist-keyed perft hash — there is **no chance of an inaccurate count** from key collisions. The table is per-thread (never shared, never stale).
 
 ## Credits
 

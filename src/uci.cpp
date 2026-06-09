@@ -95,18 +95,102 @@ namespace {
     return "cp " + std::to_string(score);
   }
 
-  // perft (move-generation node count) — used by "go perft <depth>".
+  // ---- Exact perft hash (a pure-function memoisation) --------------------------------------------
+  //
+  // perft(position, depth) is a *pure function*: the node count for a position at a depth never
+  // changes, so cached entries are never stale and the table is never cleared.
+  //
+  // The Chess Programming Wiki notes perft hashing gives "a small chance for inaccurate results".
+  // That inaccuracy has two sources: (1) two different positions colliding on the same 64-bit
+  // Zobrist key, and — specific to this engine — (2) our Zobrist hash encodes only piece placement +
+  // side to move, NOT castling rights or the en-passant square, both of which change the legal-move
+  // count. We avoid BOTH by making each entry store the *full* move-generation state and accepting a
+  // hit only on an exact, bit-for-bit match (not merely a matching hash). A hit therefore means the
+  // position is provably identical, so the cached count is exact — zero chance of a wrong result.
+  //
+  // The table is thread_local, so the parallel perft workers never share it: no concurrent writes,
+  // hence no torn reads, hence exactness holds without any locking.
+  struct PerftEntry {
+    uint64_t board[4]; // the 64 squares packed 4 bits each — the exact piece placement
+    Bitboard castle; // history entry bitboard: distinguishes positions with different castling rights
+    uint64_t count; // the perft node count (valid only at `depth`)
+    int16_t  epsq; // en-passant square (or NO_SQUARE) — also affects the move count
+    int8_t   side; // side to move
+    int8_t   depth; // depth this count is for; -1 marks an empty slot
+  };
+
+  constexpr size_t PERFT_TT_ENTRIES     = 1u << 20; // per thread (~59 MB); only allocated when used
+  constexpr int    PERFT_HASH_MIN_DEPTH = 4; // memoise only where a subtree is big enough to pay
+
+  // Per-thread cache. Each perft worker is its own thread, so this is private to it (no races).
+  thread_local std::vector<PerftEntry> t_perft_tt;
+
+  // Allocate (once) the calling thread's table. Pure-function cache: if it already exists we keep it
+  // (it can never go stale), so repeat perfts on the main thread reuse prior work.
+  void ensure_perft_tt() {
+    if (t_perft_tt.size() != PERFT_TT_ENTRIES)
+      t_perft_tt.assign(PERFT_TT_ENTRIES, PerftEntry{{0, 0, 0, 0}, 0, 0, NO_SQUARE, 0, -1});
+  }
+
+  // Packs the full move-generation state of `p` into a PerftEntry fingerprint (count/depth unset).
+  PerftEntry perft_fingerprint(const Position &p) {
+    PerftEntry e{{0, 0, 0, 0}, 0, 0, NO_SQUARE, 0, -1};
+    for (int s = 0; s < NSQUARES; ++s)
+      e.board[s >> 4] |= static_cast<uint64_t>(p.at(Square(s)) & 0xF) << ((s & 15) * 4);
+    e.castle = p.history[p.ply()].entry;
+    e.epsq   = static_cast<int16_t>(p.history[p.ply()].epsq);
+    e.side   = static_cast<int8_t>(p.turn());
+    return e;
+  }
+
+  // True iff two fingerprints describe the bit-for-bit identical move-generation state.
+  bool same_position(const PerftEntry &a, const PerftEntry &b) {
+    return a.board[0] == b.board[0] && a.board[1] == b.board[1] && a.board[2] == b.board[2] &&
+           a.board[3] == b.board[3] && a.castle == b.castle && a.epsq == b.epsq && a.side == b.side;
+  }
+
+  size_t perft_index(uint64_t hash, const PerftEntry &k) {
+    // Mix the Zobrist hash with the ep/castling state (which the hash omits) so positions differing
+    // only in those spread to different slots; the exact compare still guarantees correctness.
+    const uint64_t h = hash ^ (static_cast<uint64_t>(static_cast<uint16_t>(k.epsq)) * 0x9E3779B97F4A7C15ull) ^ k.castle;
+    return h & (PERFT_TT_ENTRIES - 1);
+  }
+
+  // perft (move-generation node count) — used by "go perft <depth>". Memoised by the exact perft
+  // hash above when the calling thread has a table and the depth is worth caching.
   template<Color Us>
   uint64_t perft(Position &p, int depth) {
-    MoveList<Us> list(p);
-    if (depth <= 1)
+    if (depth <= 1) {
+      MoveList<Us> list(p);
       return static_cast<uint64_t>(list.size());
+    }
 
-    uint64_t nodes = 0;
+    const bool use_hash = !t_perft_tt.empty() && depth >= PERFT_HASH_MIN_DEPTH;
+    PerftEntry key{{0, 0, 0, 0}, 0, 0, NO_SQUARE, 0, -1};
+    size_t     idx = 0;
+    if (use_hash) {
+      key                 = perft_fingerprint(p);
+      idx                 = perft_index(p.get_hash(), key);
+      const PerftEntry &e = t_perft_tt[idx];
+      if (e.depth == depth && same_position(e, key)) // exact match — provably the same position
+        return e.count;
+    }
+
+    uint64_t     nodes = 0;
+    MoveList<Us> list(p);
     for (Move m: list) {
       p.play<Us>(m);
       nodes += perft<~Us>(p, depth - 1);
       p.undo<Us>(m);
+    }
+
+    if (use_hash) {
+      PerftEntry &e = t_perft_tt[idx]; // depth-preferred: keep the costlier (deeper) result on a clash
+      if (e.depth <= depth) {
+        key.count = nodes;
+        key.depth = static_cast<int8_t>(depth);
+        e         = key;
+      }
     }
     return nodes;
   }
@@ -138,10 +222,15 @@ namespace {
     if (nthreads > static_cast<int>(n))
       nthreads = static_cast<int>(n == 0 ? 1 : n);
 
+    // The exact perft hash pays off only for deep subtrees; allocate it then (per worker thread).
+    const bool hash = depth - 1 >= PERFT_HASH_MIN_DEPTH;
+
     const auto start = std::chrono::steady_clock::now();
 
     if (depth > 1) {
       if (nthreads <= 1) {
+        if (hash)
+          ensure_perft_tt();
         for (size_t i = 0; i < n; ++i) {
           p.play<Us>(moves[i]);
           counts[i] = perft<~Us>(p, depth - 1);
@@ -150,6 +239,8 @@ namespace {
       } else {
         std::atomic<size_t> next{0};
         auto                worker = [&]() {
+          if (hash)
+            ensure_perft_tt(); // this worker thread's private (thread_local) table
           Position local = clone_position(p);
           size_t   i;
           while ((i = next.fetch_add(1, std::memory_order_relaxed)) < n) {
