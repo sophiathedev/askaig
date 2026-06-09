@@ -25,6 +25,10 @@ namespace {
   // Number of search threads (the "Threads" UCI option).
   int g_threads = 1;
 
+  // Time budget for the current "go" (computed when the command is parsed). On a "ponderhit" these
+  // are handed to the search so the clock starts then. Touched only on the UCI thread.
+  int64_t g_ponder_soft = 0, g_ponder_hard = 0;
+
   // The search runs on this background thread so the UCI loop stays responsive (stop/isready work
   // mid-search). `g_out` serialises stdout so the search thread's "info"/"bestmove" lines never
   // interleave with the main thread's replies.
@@ -331,6 +335,7 @@ namespace {
     int64_t     movetime = 0, wtime = 0, btime = 0, winc = 0, binc = 0;
     int         movestogo = 0;
     bool        infinite  = false;
+    bool        ponder    = false;
     std::string token;
     while (is >> token) {
       if (token == "perft") {
@@ -355,6 +360,8 @@ namespace {
         is >> movestogo;
       else if (token == "infinite")
         infinite = true;
+      else if (token == "ponder")
+        ponder = true;
     }
 
     // Resolve the limits into (max_depth, soft_ms, hard_ms). Time limits (<=0 means none) drive the
@@ -379,13 +386,19 @@ namespace {
     } else if (depth > 0) {
       max_depth = depth;
     }
+    if (ponder) // ponder: think deep on the opponent's clock until ponderhit/stop arms the limit
+      max_depth = search::MAX_DEPTH;
     if (depth > 0) // an explicit depth is always an upper bound, even alongside a time limit
       max_depth = std::min(max_depth, depth);
+
+    // Remember the budget so a later "ponderhit" can start the clock (the search ignores it until then).
+    g_ponder_soft = soft_ms;
+    g_ponder_hard = hard_ms;
 
     // Search on a background thread; the loop keeps reading stdin so "stop"/"isready" stay live.
     // `pos` is safe to capture by pointer: every pos-mutating command calls stop_search() first.
     Position *pp = &pos;
-    g_search     = std::thread([pp, max_depth, soft_ms, hard_ms]() {
+    g_search     = std::thread([pp, max_depth, soft_ms, hard_ms, ponder]() {
       search::Result r = search::think(
               *pp, max_depth, g_threads,
               [](int d, const search::Result &res, uint64_t nodes, long long ms) {
@@ -401,10 +414,13 @@ namespace {
                   std::cout << " pv " << move_to_uci(res.best);
                 std::cout << "\n" << std::flush;
               },
-              soft_ms, hard_ms);
+              soft_ms, hard_ms, ponder);
 
       std::lock_guard<std::mutex> lk(g_out);
-      std::cout << "bestmove " << (r.best.to_from() != 0 ? move_to_uci(r.best) : "0000") << "\n" << std::flush;
+      std::cout << "bestmove " << (r.best.to_from() != 0 ? move_to_uci(r.best) : "0000");
+      if (r.pv.size() >= 2) // the move we expect the opponent to reply with -> the GUI can ponder on it
+        std::cout << " ponder " << move_to_uci(r.pv[1]);
+      std::cout << "\n" << std::flush;
     });
   }
 
@@ -426,6 +442,7 @@ void uci::loop() {
       std::cout << "id author " << ENGINE_AUTHOR << "\n";
       std::cout << "option name Hash type spin default " << tt::DEFAULT_HASH_MB << " min 1 max 65536\n";
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
+      std::cout << "option name Ponder type check default false\n"; // enables the GUI to send "go ponder"
       std::cout << "uciok\n";
     } else if (cmd == "isready") {
       // Must answer even mid-search, so this never touches engine state.
@@ -462,7 +479,10 @@ void uci::loop() {
       }
     } else if (cmd == "stop") {
       search::request_stop(); // the search thread finishes promptly and prints its bestmove
-    } else if (cmd == "ponderhit" || cmd == "register" || cmd.empty()) {
+    } else if (cmd == "ponderhit") {
+      // The predicted move was played: start our clock now (no-op if we aren't pondering).
+      search::request_ponderhit(g_ponder_soft, g_ponder_hard);
+    } else if (cmd == "register" || cmd.empty()) {
       // accepted but no-op
     } else if (cmd == "quit" || cmd == "exit") {
       stop_search();

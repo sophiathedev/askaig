@@ -43,15 +43,43 @@ namespace search {
     // each think(). Every search thread (main + helpers) points its t_stop at this.
     std::atomic<bool> g_stop{false};
 
-    // Time control. `g_timed` is set once per think() (before any helper spawns) and `g_deadline` is
-    // the hard cut-off. Plain (non-atomic) is safe: both are written before the search threads start
-    // (thread creation establishes happens-before) and only read afterwards.
-    bool                                  g_timed = false;
-    std::chrono::steady_clock::time_point g_deadline;
+    // Time control. The deadlines may be armed either at think() start (a normal timed search) or
+    // mid-search by request_ponderhit() (a ponder search whose predicted move just appeared), so the
+    // active flags are atomic. Each deadline time_point is written *before* its flag is set true and
+    // is never modified again, so once a thread observes the flag (acquire) the time_point is stable
+    // — no torn read. `g_ponder` is set while searching on the opponent's time (no limits enforced,
+    // and think() must not return a move until ponderhit or stop).
+    std::atomic<bool>                     g_timed{false}; // a hard deadline is active
+    std::chrono::steady_clock::time_point g_deadline; // hard cut-off (abort the search)
+    std::atomic<bool>                     g_soft{false}; // a soft deadline is active
+    std::chrono::steady_clock::time_point g_soft_deadline; // soft budget (don't start a new iteration)
+    std::atomic<bool>                     g_ponder{false}; // searching on the opponent's time
     constexpr uint64_t                    TIME_CHECK_MASK = 2047; // poll the clock every 2048 nodes
 
+    // Arms the time control relative to `from`: a hard deadline `from + hard_ms` and a soft deadline
+    // `from + soft_ms` (each only if its budget is > 0). Used both at search start and on ponderhit.
+    void arm_time(std::chrono::steady_clock::time_point from, int64_t soft_ms, int64_t hard_ms) noexcept {
+      if (hard_ms > 0) {
+        g_deadline = from + std::chrono::milliseconds(hard_ms);
+        g_timed.store(true, std::memory_order_release);
+      } else
+        g_timed.store(false, std::memory_order_relaxed);
+      if (soft_ms > 0) {
+        g_soft_deadline = from + std::chrono::milliseconds(soft_ms);
+        g_soft.store(true, std::memory_order_release);
+      } else
+        g_soft.store(false, std::memory_order_relaxed);
+    }
+
     // True once the hard time budget has elapsed. Cheap when untimed (short-circuits before now()).
-    [[gnu::hot]] inline bool time_up() noexcept { return g_timed && std::chrono::steady_clock::now() >= g_deadline; }
+    [[gnu::hot]] inline bool time_up() noexcept {
+      return g_timed.load(std::memory_order_acquire) && std::chrono::steady_clock::now() >= g_deadline;
+    }
+
+    // True once the soft budget has elapsed (checked between iterations to avoid starting a new one).
+    inline bool soft_up() noexcept {
+      return g_soft.load(std::memory_order_acquire) && std::chrono::steady_clock::now() >= g_soft_deadline;
+    }
 
     // Per-thread abort flag, pointing at g_stop while a search runs so negamax/quiescence bail out
     // promptly. Left null outside a search.
@@ -568,8 +596,15 @@ namespace search {
 
   void request_stop() { g_stop.store(true, std::memory_order_relaxed); }
 
+  void request_ponderhit(int64_t soft_ms, int64_t hard_ms) {
+    // The predicted move was actually played, so our clock starts now: arm the time control relative
+    // to this moment and leave ponder mode. The in-progress search then runs as a normal timed one.
+    arm_time(std::chrono::steady_clock::now(), soft_ms, hard_ms);
+    g_ponder.store(false, std::memory_order_relaxed);
+  }
+
   Result think(const Position &pos, int max_depth, int threads, const InfoCallback &on_iteration, int64_t soft_ms,
-               int64_t hard_ms) {
+               int64_t hard_ms, bool ponder) {
     if (is_illegal(pos))
       return Result{Move{}, 0, 0}; // refuse to search -> caller emits "bestmove 0000"
     if (max_depth < 1)
@@ -581,12 +616,16 @@ namespace search {
 
     g_stop.store(false, std::memory_order_relaxed); // fresh search: clear any leftover stop request
 
-    // Arm the time control before any thread starts (so all threads see g_timed/g_deadline). The
-    // same `t0` is reused for both the deadline and the reported elapsed time.
+    // Arm the time control before any thread starts (so all threads see the flags/deadlines). While
+    // pondering we run unbounded (like "infinite"); request_ponderhit() arms the clock later. The
+    // same `t0` is reused for the reported elapsed time.
     const auto t0 = std::chrono::steady_clock::now();
-    g_timed       = hard_ms > 0;
-    if (g_timed)
-      g_deadline = t0 + std::chrono::milliseconds(hard_ms);
+    g_ponder.store(ponder, std::memory_order_relaxed);
+    if (ponder) {
+      g_timed.store(false, std::memory_order_relaxed);
+      g_soft.store(false, std::memory_order_relaxed);
+    } else
+      arm_time(t0, soft_ms, hard_ms);
 
     // Lazy SMP: helper threads search the same root on their own board copies, all sharing the
     // (lockless) transposition table. Their work fills the TT, giving the main thread extra
@@ -627,14 +666,22 @@ namespace search {
       on_iteration(d, best, nodes, static_cast<long long>(ms));
       if (is_mate(best.score))
         break; // forced mate found; deeper search cannot find a faster one
-      if (soft_ms > 0 && ms >= soft_ms)
+      if (soft_up())
         break; // soft budget spent: the next iteration would likely overrun, so don't start it
     }
+
+    // If the search ran out (mate / depth ceiling / soft limit) while still pondering, UCI forbids
+    // emitting a move until the GUI says so, so wait for ponderhit (clears g_ponder) or stop.
+    while (g_ponder.load(std::memory_order_relaxed) && !g_stop.load(std::memory_order_relaxed))
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
     g_stop.store(true, std::memory_order_relaxed); // stop the helpers
     for (std::thread &h: helpers)
       h.join();
     t_stop = nullptr;
+    g_timed.store(false, std::memory_order_relaxed); // disarm so a later untimed search isn't affected
+    g_soft.store(false, std::memory_order_relaxed);
+    g_ponder.store(false, std::memory_order_relaxed);
     return best;
   }
 

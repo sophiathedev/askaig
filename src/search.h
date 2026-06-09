@@ -41,11 +41,20 @@ namespace search {
   //    the best move from the last completed depth.
   //  - `soft_ms`: a soft budget — once it is exceeded, no further iteration is *started* (the one in
   //    progress finishes). Normally soft_ms <= hard_ms.
+  //
+  // When `ponder` is true (the UCI "go ponder"), the search runs unbounded (the time limits are NOT
+  // applied) and does not return a move until `request_ponderhit()` or `request_stop()` is called —
+  // it is thinking on the opponent's clock about a predicted move.
   Result think(const Position &pos, int max_depth, int threads, const InfoCallback &on_iteration, int64_t soft_ms = 0,
-               int64_t hard_ms = 0);
+               int64_t hard_ms = 0, bool ponder = false);
 
   // Asks an in-progress `think()` to stop as soon as possible (the UCI "stop" command). Safe to
   // call from another thread; cleared automatically at the start of the next `think()`.
   void request_stop();
+
+  // The UCI "ponderhit": the predicted move was actually played, so a pondering `think()` should
+  // leave ponder mode and start enforcing the time control (`soft_ms`/`hard_ms`) from now. Safe to
+  // call from another thread; a no-op if the search is not pondering.
+  void request_ponderhit(int64_t soft_ms, int64_t hard_ms);
 
 } // namespace search
