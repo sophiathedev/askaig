@@ -1,0 +1,335 @@
+#include "eval.h"
+#include "position.h"
+#include "types.h"
+
+namespace eval {
+
+  namespace {
+
+    // --- Pawn structure ---------------------------------------------------------------------
+
+    constexpr Bitboard file_bb(int f) { return UINT64_C(0x0101010101010101) << f; }
+    constexpr Bitboard rank_bb(int r) { return UINT64_C(0xff) << (8 * r); }
+
+    // Penalties (centipawns) and a passed-pawn bonus indexed by the pawn's own rank of advancement
+    // (rank 1 = just left home ... rank 6 = one step from promotion).
+    constexpr int DOUBLED_PENALTY  = 12;
+    constexpr int ISOLATED_PENALTY = 15;
+    // Passed-pawn bonus, indexed by rank of advancement, tapered: passers are worth far more in the
+    // endgame (often decisive) than the middlegame (where pieces blockade/round them up).
+    constexpr int PASSED_MG[8]   = {0, 5, 10, 15, 25, 40, 60, 0};
+    constexpr int PASSED_EG[8]   = {0, 15, 25, 40, 65, 100, 150, 0};
+    constexpr int CENTERED_BONUS = 10; // pawn on a central square (d4/e4/d5/e5)
+    constexpr int OUTPOST_BONUS  = 25; // knight on a hole, defended by a pawn, in advanced ranks
+
+    // King safety: penalty per missing pawn-shield file and per open/semi-open file by the king,
+    // scaled by the opponent's attacking material (KS_MAX_POWER = full middlegame) so it fades out
+    // in the endgame, where the king should instead be active.
+    constexpr int SHIELD_DEFICIT    = 18;
+    constexpr int OPEN_FILE_PENALTY = 20;
+    constexpr int KS_MAX_POWER      = 12;
+
+    // Mobility: bonus per safe square a piece can move to (not onto own pieces or enemy-pawn-
+    // controlled squares), indexed by PieceType and tapered — sliders are worth more per square in
+    // the (open) endgame. Pinned: penalty per piece pinned to its own king.
+    constexpr int MOB_MG[NPIECE_TYPES] = {0, 4, 3, 2, 1, 0}; // P N B R Q K
+    constexpr int MOB_EG[NPIECE_TYPES] = {0, 4, 5, 4, 2, 0};
+    constexpr int PIN_PENALTY          = 18;
+
+    // Piece bonuses: the bishop pair (worth more in the open endgame), a rook on a fully open or
+    // semi-open (no friendly pawn) file, and a rook on the relative 7th rank (decisive in endgames).
+    constexpr int BISHOP_PAIR_MG = 25;
+    constexpr int BISHOP_PAIR_EG = 45;
+    constexpr int ROOK_OPEN      = 25; // file with no pawns at all
+    constexpr int ROOK_SEMIOPEN  = 12; // file with no friendly pawns
+    constexpr int ROOK_7TH_MG    = 15;
+    constexpr int ROOK_7TH_EG    = 35;
+
+    // A middlegame/endgame score pair and its interpolation by game phase (PHASE_MAX = middlegame).
+    struct Score {
+      int mg = 0;
+      int eg = 0;
+    };
+    [[gnu::const, gnu::always_inline]] inline int taper(Score s, int phase) noexcept {
+      return (s.mg * phase + s.eg * (psqt::PHASE_MAX - phase)) / psqt::PHASE_MAX;
+    }
+
+    // Central squares (d4/e4/d5/e5): a pawn here gets a small "centered pawn" bonus.
+    constexpr Bitboard CENTER = (file_bb(3) | file_bb(4)) & (rank_bb(3) | rank_bb(4));
+
+    // Precomputed (at compile time) pawn masks:
+    //  - adjacent[f]: the files either side of file f (a pawn is isolated if no friendly pawn is here)
+    //  - passed[color][sq]: the squares an enemy pawn must avoid for the pawn on sq to be passed
+    //  - span[color][sq]: the pawn attack span — squares on adjacent files ahead of sq that the
+    //    pawn (or its advanced self) could attack. A square not in either side's span is a "hole".
+    struct PawnMasks {
+      Bitboard adjacent[8]{};
+      Bitboard passed[NCOLORS][NSQUARES]{};
+      Bitboard span[NCOLORS][NSQUARES]{};
+      Bitboard king_shield[NCOLORS][NSQUARES]{}; // pawn-shield squares (3 files, 2 ranks in front)
+
+      constexpr PawnMasks() {
+        for (int f = 0; f < 8; ++f)
+          adjacent[f] = (f > 0 ? file_bb(f - 1) : 0) | (f < 7 ? file_bb(f + 1) : 0);
+        for (int sq = 0; sq < 64; ++sq) {
+          int      f     = sq & 7;
+          int      r     = sq >> 3;
+          Bitboard files = file_bb(f) | adjacent[f];
+          Bitboard above = 0;
+          Bitboard below = 0;
+          for (int rr = r + 1; rr < 8; ++rr)
+            above |= rank_bb(rr);
+          for (int rr = r - 1; rr >= 0; --rr)
+            below |= rank_bb(rr);
+          passed[WHITE][sq]      = files & above; // white promotes upward
+          passed[BLACK][sq]      = files & below; // black promotes downward
+          span[WHITE][sq]        = adjacent[f] & above;
+          span[BLACK][sq]        = adjacent[f] & below;
+          Bitboard wFront        = (r + 1 < 8 ? rank_bb(r + 1) : 0) | (r + 2 < 8 ? rank_bb(r + 2) : 0);
+          Bitboard bFront        = (r - 1 >= 0 ? rank_bb(r - 1) : 0) | (r - 2 >= 0 ? rank_bb(r - 2) : 0);
+          king_shield[WHITE][sq] = files & wFront;
+          king_shield[BLACK][sq] = files & bFront;
+        }
+      }
+    };
+    constexpr PawnMasks PM;
+
+    // Evaluates pawn structure (doubled, isolated, passed) from White's perspective. The passed-pawn
+    // bonus is tapered by `phase`; the other terms are phase-independent.
+    [[gnu::pure, gnu::hot]] int pawn_structure(const Position &pos, int phase) noexcept {
+      const Bitboard wp = pos.bitboard_of(WHITE, PAWN);
+      const Bitboard bp = pos.bitboard_of(BLACK, PAWN);
+      int            s  = 0;
+
+      for (int f = 0; f < 8; ++f) {
+        int wc = pop_count(wp & file_bb(f));
+        int bc = pop_count(bp & file_bb(f));
+        if (wc > 1)
+          s -= DOUBLED_PENALTY * (wc - 1);
+        if (bc > 1)
+          s += DOUBLED_PENALTY * (bc - 1);
+        if (wc > 0 && !(wp & PM.adjacent[f]))
+          s -= ISOLATED_PENALTY * wc;
+        if (bc > 0 && !(bp & PM.adjacent[f]))
+          s += ISOLATED_PENALTY * bc;
+      }
+
+      Bitboard w = wp;
+      while (w) {
+        Square sq = pop_lsb(&w);
+        if (!(bp & PM.passed[WHITE][sq])) {
+          int r = rank_of(sq);
+          s += taper({PASSED_MG[r], PASSED_EG[r]}, phase);
+        }
+      }
+      Bitboard b = bp;
+      while (b) {
+        Square sq = pop_lsb(&b);
+        if (!(wp & PM.passed[BLACK][sq])) {
+          int r = 7 - rank_of(sq);
+          s -= taper({PASSED_MG[r], PASSED_EG[r]}, phase);
+        }
+      }
+
+      // Centered pawns.
+      s += CENTERED_BONUS * pop_count(wp & CENTER);
+      s -= CENTERED_BONUS * pop_count(bp & CENTER);
+
+      // Holes / knight outposts. A square is a hole for one side if no pawn of that side can ever
+      // attack it (not in its pawn attack span). A knight sitting on the enemy's hole — defended by
+      // a friendly pawn, in advanced ranks — is a strong outpost.
+      Bitboard wspan = 0;
+      Bitboard bspan = 0;
+      for (Bitboard t = wp; t;)
+        wspan |= PM.span[WHITE][pop_lsb(&t)];
+      for (Bitboard t = bp; t;)
+        bspan |= PM.span[BLACK][pop_lsb(&t)];
+
+      for (Bitboard wn = pos.bitboard_of(WHITE, KNIGHT); wn;) {
+        Square sq = pop_lsb(&wn);
+        if (rank_of(sq) >= RANK4 && rank_of(sq) <= RANK6 && !(bspan & SQUARE_BB[sq]) &&
+            (wp & pawn_attacks<BLACK>(SQUARE_BB[sq])))
+          s += OUTPOST_BONUS;
+      }
+      for (Bitboard bn = pos.bitboard_of(BLACK, KNIGHT); bn;) {
+        Square sq = pop_lsb(&bn);
+        if (rank_of(sq) <= RANK5 && rank_of(sq) >= RANK3 && !(wspan & SQUARE_BB[sq]) &&
+            (bp & pawn_attacks<WHITE>(SQUARE_BB[sq])))
+          s -= OUTPOST_BONUS;
+      }
+      return s;
+    }
+
+    // Attacking material of side `c`, used to scale how much the enemy king's exposure matters.
+    [[gnu::pure]] int attack_power(const Position &pos, Color c) noexcept {
+      return pop_count(pos.bitboard_of(c, KNIGHT)) + pop_count(pos.bitboard_of(c, BISHOP)) +
+             2 * pop_count(pos.bitboard_of(c, ROOK)) + 4 * pop_count(pos.bitboard_of(c, QUEEN));
+    }
+
+    // Unscaled danger for `c`'s king: missing pawn-shield files and open/semi-open files beside it.
+    [[gnu::pure]] int king_danger(Square ks, Bitboard pawns, Color c) noexcept {
+      const int kf      = file_of(ks);
+      const int shield  = pop_count(pawns & PM.king_shield[c][ks]);
+      int       penalty = SHIELD_DEFICIT * (shield < 3 ? 3 - shield : 0);
+      const int lo      = kf > 0 ? kf - 1 : 0;
+      const int hi      = kf < 7 ? kf + 1 : 7;
+      for (int f = lo; f <= hi; ++f)
+        if (!(pawns & file_bb(f)))
+          penalty += OPEN_FILE_PENALTY;
+      return penalty;
+    }
+
+    // King safety from White's perspective: each king's danger scaled by the opponent's attacking
+    // material (so it vanishes once the heavy pieces are traded off).
+    [[gnu::pure, gnu::hot]] int king_safety(const Position &pos) noexcept {
+      const Square   wk    = bsf(pos.bitboard_of(WHITE, KING));
+      const Square   bk    = bsf(pos.bitboard_of(BLACK, KING));
+      const Bitboard wp    = pos.bitboard_of(WHITE, PAWN);
+      const Bitboard bp    = pos.bitboard_of(BLACK, PAWN);
+      const int      bPow  = attack_power(pos, BLACK);
+      const int      wPow  = attack_power(pos, WHITE);
+      const int      wScal = bPow < KS_MAX_POWER ? bPow : KS_MAX_POWER;
+      const int      bScal = wPow < KS_MAX_POWER ? wPow : KS_MAX_POWER;
+
+      int s = 0;
+      s -= king_danger(wk, wp, WHITE) * wScal / KS_MAX_POWER;
+      s += king_danger(bk, bp, BLACK) * bScal / KS_MAX_POWER;
+      return s;
+    }
+
+    // Mobility of one side's minor/major pieces over `targets` (squares not occupied by own pieces
+    // and not attacked by enemy pawns).
+    template<Color C>
+    [[gnu::pure]] Score side_mobility(const Position &pos, Bitboard occ, Bitboard targets) noexcept {
+      Score s;
+      for (Bitboard b = pos.bitboard_of(C, KNIGHT); b;) {
+        int c = pop_count(attacks<KNIGHT>(pop_lsb(&b), occ) & targets);
+        s.mg += MOB_MG[KNIGHT] * c, s.eg += MOB_EG[KNIGHT] * c;
+      }
+      for (Bitboard b = pos.bitboard_of(C, BISHOP); b;) {
+        int c = pop_count(attacks<BISHOP>(pop_lsb(&b), occ) & targets);
+        s.mg += MOB_MG[BISHOP] * c, s.eg += MOB_EG[BISHOP] * c;
+      }
+      for (Bitboard b = pos.bitboard_of(C, ROOK); b;) {
+        int c = pop_count(attacks<ROOK>(pop_lsb(&b), occ) & targets);
+        s.mg += MOB_MG[ROOK] * c, s.eg += MOB_EG[ROOK] * c;
+      }
+      for (Bitboard b = pos.bitboard_of(C, QUEEN); b;) {
+        int c = pop_count(attacks<QUEEN>(pop_lsb(&b), occ) & targets);
+        s.mg += MOB_MG[QUEEN] * c, s.eg += MOB_EG[QUEEN] * c;
+      }
+      return s;
+    }
+
+    [[gnu::pure, gnu::hot]] int mobility(const Position &pos, int phase) noexcept {
+      const Bitboard wpieces  = pos.all_pieces<WHITE>();
+      const Bitboard bpieces  = pos.all_pieces<BLACK>();
+      const Bitboard occ      = wpieces | bpieces;
+      const Bitboard wPawnAtt = pawn_attacks<WHITE>(pos.bitboard_of(WHITE, PAWN));
+      const Bitboard bPawnAtt = pawn_attacks<BLACK>(pos.bitboard_of(BLACK, PAWN));
+      const Score    w        = side_mobility<WHITE>(pos, occ, ~wpieces & ~bPawnAtt);
+      const Score    b        = side_mobility<BLACK>(pos, occ, ~bpieces & ~wPawnAtt);
+      return taper({w.mg - b.mg, w.eg - b.eg}, phase);
+    }
+
+    // The bitboard of `C`'s pieces pinned against their own king by an enemy slider.
+    template<Color C>
+    [[gnu::pure]] Bitboard pinned_of(const Position &pos) noexcept {
+      const Square   ks  = bsf(pos.bitboard_of(C, KING));
+      const Bitboard us  = pos.all_pieces<C>();
+      const Bitboard occ = us | pos.all_pieces<~C>();
+      Bitboard       pin = 0;
+
+      Bitboard pinners = get_xray_rook_attacks(ks, occ, us) & pos.orthogonal_sliders<~C>();
+      while (pinners)
+        pin |= SQUARES_BETWEEN_BB[ks][pop_lsb(&pinners)] & us;
+      pinners = get_xray_bishop_attacks(ks, occ, us) & pos.diagonal_sliders<~C>();
+      while (pinners)
+        pin |= SQUARES_BETWEEN_BB[ks][pop_lsb(&pinners)] & us;
+      return pin;
+    }
+
+    [[gnu::pure, gnu::hot]] int pin_penalty(const Position &pos) noexcept {
+      return PIN_PENALTY * (pop_count(pinned_of<BLACK>(pos)) - pop_count(pinned_of<WHITE>(pos)));
+    }
+
+    // Bishop pair + rook placement (open/semi-open files, 7th rank), White's perspective, tapered.
+    [[gnu::pure, gnu::hot]] int piece_bonuses(const Position &pos, int phase) noexcept {
+      const Bitboard wp = pos.bitboard_of(WHITE, PAWN);
+      const Bitboard bp = pos.bitboard_of(BLACK, PAWN);
+      Score          s;
+
+      if (pop_count(pos.bitboard_of(WHITE, BISHOP)) >= 2)
+        s.mg += BISHOP_PAIR_MG, s.eg += BISHOP_PAIR_EG;
+      if (pop_count(pos.bitboard_of(BLACK, BISHOP)) >= 2)
+        s.mg -= BISHOP_PAIR_MG, s.eg -= BISHOP_PAIR_EG;
+
+      for (Bitboard r = pos.bitboard_of(WHITE, ROOK); r;) {
+        Square   sq = pop_lsb(&r);
+        Bitboard fl = file_bb(file_of(sq));
+        if (!((wp | bp) & fl))
+          s.mg += ROOK_OPEN, s.eg += ROOK_OPEN;
+        else if (!(wp & fl))
+          s.mg += ROOK_SEMIOPEN, s.eg += ROOK_SEMIOPEN;
+        if (rank_of(sq) == RANK7)
+          s.mg += ROOK_7TH_MG, s.eg += ROOK_7TH_EG;
+      }
+      for (Bitboard r = pos.bitboard_of(BLACK, ROOK); r;) {
+        Square   sq = pop_lsb(&r);
+        Bitboard fl = file_bb(file_of(sq));
+        if (!((wp | bp) & fl))
+          s.mg -= ROOK_OPEN, s.eg -= ROOK_OPEN;
+        else if (!(bp & fl))
+          s.mg -= ROOK_SEMIOPEN, s.eg -= ROOK_SEMIOPEN;
+        if (rank_of(sq) == RANK2)
+          s.mg -= ROOK_7TH_MG, s.eg -= ROOK_7TH_EG;
+      }
+      return taper(s, phase);
+    }
+
+    // Per-thread cache of the static evaluation, keyed by the full Zobrist hash. The evaluation is
+    // a pure function of the position, so entries never go stale and need no clearing; collisions
+    // are resolved by the full-key check. thread_local => no locking under Lazy SMP.
+    constexpr size_t EVAL_CACHE_SIZE = 1U << 17; // 131072 entries (~2 MiB per thread)
+    constexpr size_t EVAL_CACHE_MASK = EVAL_CACHE_SIZE - 1;
+    struct EvalEntry {
+      uint64_t key;
+      int      eval;
+    };
+    thread_local EvalEntry eval_cache[EVAL_CACHE_SIZE];
+
+  } // namespace
+
+  [[gnu::pure]] bool is_passed_pawn(const Position &pos, Color c, Square sq) noexcept {
+    return !(pos.bitboard_of(~c, PAWN) & PM.passed[c][sq]);
+  }
+
+  [[gnu::hot]] int evaluate(const Position &pos) noexcept {
+    const uint64_t key = pos.get_hash();
+    EvalEntry     &e   = eval_cache[key & EVAL_CACHE_MASK];
+    if (e.key == key)
+      return e.eval; // cache hit
+
+    // Taper the (incremental) material + piece-square score between the middlegame and endgame
+    // tables by the game phase (full board -> middlegame, few pieces -> endgame).
+    int phase = pop_count(pos.bitboard_of(WHITE, KNIGHT) | pos.bitboard_of(BLACK, KNIGHT)) +
+                pop_count(pos.bitboard_of(WHITE, BISHOP) | pos.bitboard_of(BLACK, BISHOP)) +
+                2 * pop_count(pos.bitboard_of(WHITE, ROOK) | pos.bitboard_of(BLACK, ROOK)) +
+                4 * pop_count(pos.bitboard_of(WHITE, QUEEN) | pos.bitboard_of(BLACK, QUEEN));
+    if (phase > psqt::PHASE_MAX)
+      phase = psqt::PHASE_MAX; // promotions can exceed the starting material
+
+    int s = (pos.psqt_mg() * phase + pos.psqt_eg() * (psqt::PHASE_MAX - phase)) / psqt::PHASE_MAX;
+    s += pawn_structure(pos, phase);
+    s += king_safety(pos);
+    s += mobility(pos, phase);
+    s += pin_penalty(pos);
+    s += piece_bonuses(pos, phase);
+
+    const int result = pos.turn() == WHITE ? s : -s;
+    e.key            = key;
+    e.eval           = result;
+    return result;
+  }
+
+} // namespace eval
