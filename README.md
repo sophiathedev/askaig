@@ -73,8 +73,8 @@ printf 'uci\nposition startpos moves e2e4 e7e5\ngo depth 12\nquit\n' | ./build/a
 ```
 
 Supported commands: `uci`, `isready`, `ucinewgame`, `position [startpos | fen <fen>] [moves ...]`,
-`go [depth <n>]`, `go perft <depth>`, `setoption name Hash value <MB>`, `setoption name Threads value <n>`,
-`d` / `display`, `stop`, `quit`.
+`go [depth <n>]`, `go infinite` (search until `stop`), `go perft <depth>`, `setoption name Hash value <MB>`,
+`setoption name Threads value <n>`, `d` / `display`, `stop`, `quit`.
 
 ## Correctness (perft)
 

@@ -20,7 +20,7 @@ namespace search {
     constexpr int MAX_MATE_PLY  = 256; // scores beyond MATE - this are treated as mates
     constexpr int TT_MOVE_SCORE = 2'000'000; // ordering score for the transposition-table move
 
-    constexpr int MAX_PLY       = 128; // killer table depth
+    constexpr int MAX_PLY       = MAX_DEPTH; // killer table depth (== the public search ceiling)
     constexpr int KILLER1_SCORE = 900'000; // first killer (quiet) — ranked just below captures
     constexpr int KILLER2_SCORE = 800'000; // second killer
     constexpr int HISTORY_MAX   = 100'000; // cap on history scores (kept below the killers)
@@ -551,6 +551,8 @@ namespace search {
       return Result{Move{}, 0, 0}; // refuse to search -> caller emits "bestmove 0000"
     if (max_depth < 1)
       max_depth = 1;
+    if (max_depth > MAX_DEPTH) // "go infinite" passes MAX_DEPTH; never iterate past the ply ceiling
+      max_depth = MAX_DEPTH;
     if (threads < 1)
       threads = 1;
 

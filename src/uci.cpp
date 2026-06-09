@@ -317,7 +317,8 @@ namespace {
 
   // Handles "go ...". "go perft <depth>" counts move-generation nodes; otherwise it runs an
   // iterative-deepening, multi-threaded (Lazy SMP) negamax/alpha-beta search ("go depth <n>",
-  // default DEFAULT_DEPTH), printing an info line per depth. Time-control args are ignored.
+  // default DEFAULT_DEPTH; "go infinite" searches until "stop"), printing an info line per depth.
+  // Time-control args (wtime/btime/movetime/...) are ignored.
   void go_cmd(Position &pos, std::istringstream &is) {
     stop_search(); // never run two searches at once, nor search while pos can change
 
@@ -332,6 +333,8 @@ namespace {
       }
       if (token == "depth")
         is >> depth;
+      else if (token == "infinite")
+        depth = search::MAX_DEPTH; // search to the ply ceiling — effectively until "stop"
     }
 
     // Search on a background thread; the loop keeps reading stdin so "stop"/"isready" stay live.

@@ -14,6 +14,10 @@ namespace search {
   constexpr int INF  = 32000;
   constexpr int MATE = 31000;
 
+  // The search's hard ply ceiling, and the depth used for "go infinite": iterative deepening runs
+  // up to here, which in practice no real position ever reaches before a "stop" arrives.
+  constexpr int MAX_DEPTH = 128;
+
   struct Result {
     Move              best; // the chosen move (a null Move{} if there are no legal moves)
     int               score; // score in centipawns from the side-to-move's perspective (or a mate score)
