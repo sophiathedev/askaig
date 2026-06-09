@@ -39,7 +39,7 @@ Together these cut the searched node count by **~95%+** on quiet positions versu
 
 A **tapered** (middlegame ↔ endgame) evaluation, interpolated by game phase from the remaining material:
 
-- **Material + piece-square tables** — maintained **incrementally** in the make/unmake primitives (two MG/EG accumulators); the king table tapers from "hide on the back rank" to "march to the centre".
+- **Material + piece-square tables** — [**PeSTO's Evaluation Function**](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) (Ronald Friederich's tuned tables), with separate middlegame/endgame material values and tables for every piece, maintained **incrementally** in the make/unmake primitives (two MG/EG accumulators) and interpolated by game phase.
 - **Pawn structure** — doubled / isolated penalties, a **tapered passed-pawn** bonus, centered pawns, and knight **outposts** (a knight on an enemy "hole" defended by a pawn).
 - **King safety** — missing pawn-shield and open/semi-open files beside the king, **scaled by the opponent's attacking material** (fades out in the endgame).
 - **Mobility** — per safe square each piece attacks, **tapered** (sliders are worth more on the open endgame board).
@@ -93,5 +93,5 @@ This number must hold across all build configurations (scalar, NEON, AVX2). `go 
 ## Credits
 
 - Move generation ported from **[nkarve/surge](https://github.com/nkarve/surge)** (MIT License).
-- Piece-square tables are Tomasz Michniewski's "Simplified Evaluation Function".
+- Piece-square tables are [PeSTO's Evaluation Function](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) (Ronald Friederich / rofChade).
 - Many search/evaluation techniques follow the [Chess Programming Wiki](https://www.chessprogramming.org/).
