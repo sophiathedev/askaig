@@ -1,4 +1,5 @@
 #include "uci.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -313,16 +314,23 @@ namespace {
     }
   }
 
-  constexpr int DEFAULT_DEPTH = 8;
+  constexpr int     DEFAULT_DEPTH    = 8;
+  constexpr int64_t MOVE_OVERHEAD_MS = 30; // safety buffer for GUI/transport lag, reserved from the clock
 
   // Handles "go ...". "go perft <depth>" counts move-generation nodes; otherwise it runs an
-  // iterative-deepening, multi-threaded (Lazy SMP) negamax/alpha-beta search ("go depth <n>",
-  // default DEFAULT_DEPTH; "go infinite" searches until "stop"), printing an info line per depth.
-  // Time-control args (wtime/btime/movetime/...) are ignored.
+  // iterative-deepening, multi-threaded (Lazy SMP) negamax/alpha-beta search. Recognised limits:
+  //   depth <n>            — fixed depth (default DEFAULT_DEPTH when no limit is given)
+  //   infinite             — until "stop"
+  //   movetime <ms>        — fixed time per move
+  //   wtime/btime <ms>, winc/binc <ms>, movestogo <n> — clock-based time management
+  // (searchmoves/ponder/nodes/mate are not implemented and are ignored.)
   void go_cmd(Position &pos, std::istringstream &is) {
     stop_search(); // never run two searches at once, nor search while pos can change
 
-    int         depth = DEFAULT_DEPTH;
+    int         depth    = 0; // 0 => not specified
+    int64_t     movetime = 0, wtime = 0, btime = 0, winc = 0, binc = 0;
+    int         movestogo = 0;
+    bool        infinite  = false;
     std::string token;
     while (is >> token) {
       if (token == "perft") {
@@ -333,16 +341,54 @@ namespace {
       }
       if (token == "depth")
         is >> depth;
+      else if (token == "movetime")
+        is >> movetime;
+      else if (token == "wtime")
+        is >> wtime;
+      else if (token == "btime")
+        is >> btime;
+      else if (token == "winc")
+        is >> winc;
+      else if (token == "binc")
+        is >> binc;
+      else if (token == "movestogo")
+        is >> movestogo;
       else if (token == "infinite")
-        depth = search::MAX_DEPTH; // search to the ply ceiling — effectively until "stop"
+        infinite = true;
     }
+
+    // Resolve the limits into (max_depth, soft_ms, hard_ms). Time limits (<=0 means none) drive the
+    // search to the ply ceiling and let the clock stop it; a bare depth caps it instead.
+    int     max_depth = DEFAULT_DEPTH;
+    int64_t soft_ms = 0, hard_ms = 0;
+    if (movetime > 0) {
+      max_depth = search::MAX_DEPTH;
+      hard_ms   = std::max<int64_t>(movetime - MOVE_OVERHEAD_MS, 1);
+      soft_ms   = hard_ms; // a fixed move time: use (almost) all of it
+    } else if (wtime > 0 || btime > 0) {
+      max_depth           = search::MAX_DEPTH;
+      const int64_t t     = pos.turn() == WHITE ? wtime : btime; // our remaining time
+      const int64_t inc   = pos.turn() == WHITE ? winc : binc; // our increment
+      const int     mtg   = movestogo > 0 ? movestogo : 40; // assume 40 moves to go under sudden death
+      const int64_t avail = std::max<int64_t>(t - MOVE_OVERHEAD_MS, 1);
+      const int64_t opt   = std::min(avail / mtg + inc, avail); // a time slice plus the increment
+      soft_ms             = std::max<int64_t>(opt, 1);
+      hard_ms             = std::min<int64_t>(avail, opt * 5); // never blow more than ~5x the optimum (or all we have)
+    } else if (infinite) {
+      max_depth = search::MAX_DEPTH; // search to the ply ceiling — effectively until "stop"
+    } else if (depth > 0) {
+      max_depth = depth;
+    }
+    if (depth > 0) // an explicit depth is always an upper bound, even alongside a time limit
+      max_depth = std::min(max_depth, depth);
 
     // Search on a background thread; the loop keeps reading stdin so "stop"/"isready" stay live.
     // `pos` is safe to capture by pointer: every pos-mutating command calls stop_search() first.
     Position *pp = &pos;
-    g_search     = std::thread([pp, depth]() {
-      search::Result r =
-              search::think(*pp, depth, g_threads, [](int d, const search::Result &res, uint64_t nodes, long long ms) {
+    g_search     = std::thread([pp, max_depth, soft_ms, hard_ms]() {
+      search::Result r = search::think(
+              *pp, max_depth, g_threads,
+              [](int d, const search::Result &res, uint64_t nodes, long long ms) {
                 const uint64_t              nps = ms > 0 ? nodes * 1000 / static_cast<uint64_t>(ms) : nodes * 1000;
                 std::lock_guard<std::mutex> lk(g_out);
                 std::cout << "info depth " << d << " seldepth " << res.seldepth << " score " << format_score(res.score)
@@ -354,7 +400,8 @@ namespace {
                 } else if (res.best.to_from() != 0)
                   std::cout << " pv " << move_to_uci(res.best);
                 std::cout << "\n" << std::flush;
-              });
+              },
+              soft_ms, hard_ms);
 
       std::lock_guard<std::mutex> lk(g_out);
       std::cout << "bestmove " << (r.best.to_from() != 0 ? move_to_uci(r.best) : "0000") << "\n" << std::flush;

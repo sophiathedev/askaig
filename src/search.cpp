@@ -43,6 +43,16 @@ namespace search {
     // each think(). Every search thread (main + helpers) points its t_stop at this.
     std::atomic<bool> g_stop{false};
 
+    // Time control. `g_timed` is set once per think() (before any helper spawns) and `g_deadline` is
+    // the hard cut-off. Plain (non-atomic) is safe: both are written before the search threads start
+    // (thread creation establishes happens-before) and only read afterwards.
+    bool                                  g_timed = false;
+    std::chrono::steady_clock::time_point g_deadline;
+    constexpr uint64_t                    TIME_CHECK_MASK = 2047; // poll the clock every 2048 nodes
+
+    // True once the hard time budget has elapsed. Cheap when untimed (short-circuits before now()).
+    [[gnu::hot]] inline bool time_up() noexcept { return g_timed && std::chrono::steady_clock::now() >= g_deadline; }
+
     // Per-thread abort flag, pointing at g_stop while a search runs so negamax/quiescence bail out
     // promptly. Left null outside a search.
     thread_local const std::atomic<bool> *t_stop = nullptr;
@@ -232,8 +242,10 @@ namespace search {
     template<Color Us>
     [[gnu::hot]] int negamax(Position &p, int depth, int ply, int alpha, int beta, uint64_t &nodes, bool null_ok,
                              Square recap_sq = NO_SQUARE, Move excluded = Move{}) {
+      if ((nodes & TIME_CHECK_MASK) == 0 && time_up())
+        g_stop.store(true, std::memory_order_relaxed); // hard deadline hit -> abort via the stop path
       if (aborted())
-        return 0; // helper thread is stopping; value is discarded
+        return 0; // stop requested / time up: value is discarded, last completed depth is kept
       if (ply > t_seldepth)
         t_seldepth = ply; // track the deepest ply reached, for the reported selective depth
       if (ply >= MAX_PLY)
@@ -556,7 +568,8 @@ namespace search {
 
   void request_stop() { g_stop.store(true, std::memory_order_relaxed); }
 
-  Result think(const Position &pos, int max_depth, int threads, const InfoCallback &on_iteration) {
+  Result think(const Position &pos, int max_depth, int threads, const InfoCallback &on_iteration, int64_t soft_ms,
+               int64_t hard_ms) {
     if (is_illegal(pos))
       return Result{Move{}, 0, 0}; // refuse to search -> caller emits "bestmove 0000"
     if (max_depth < 1)
@@ -567,6 +580,13 @@ namespace search {
       threads = 1;
 
     g_stop.store(false, std::memory_order_relaxed); // fresh search: clear any leftover stop request
+
+    // Arm the time control before any thread starts (so all threads see g_timed/g_deadline). The
+    // same `t0` is reused for both the deadline and the reported elapsed time.
+    const auto t0 = std::chrono::steady_clock::now();
+    g_timed       = hard_ms > 0;
+    if (g_timed)
+      g_deadline = t0 + std::chrono::milliseconds(hard_ms);
 
     // Lazy SMP: helper threads search the same root on their own board copies, all sharing the
     // (lockless) transposition table. Their work fills the TT, giving the main thread extra
@@ -588,10 +608,9 @@ namespace search {
     // spawned, so their thread_local killer/history tables are already zero-initialised.)
     t_stop = &g_stop; // the main search thread is interruptible too
     clear_heuristics();
-    Position   main_pos   = clone(pos);
-    const auto t0         = std::chrono::steady_clock::now();
-    int        prev_score = 0;
-    Result     best{};
+    Position main_pos   = clone(pos);
+    int      prev_score = 0;
+    Result   best{};
     best.best = any_legal_move(main_pos); // guarantees a real move even if stopped before depth 1 finishes
 
     for (int d = 1; d <= max_depth; ++d) {
@@ -608,6 +627,8 @@ namespace search {
       on_iteration(d, best, nodes, static_cast<long long>(ms));
       if (is_mate(best.score))
         break; // forced mate found; deeper search cannot find a faster one
+      if (soft_ms > 0 && ms >= soft_ms)
+        break; // soft budget spent: the next iteration would likely overrun, so don't start it
     }
 
     g_stop.store(true, std::memory_order_relaxed); // stop the helpers

@@ -35,7 +35,14 @@ namespace search {
   // each main-thread depth. `pos` is not modified (each thread searches a copy). Runs until
   // `max_depth` or until `request_stop()` is called, in which case it returns the best move from
   // the last fully-completed iteration. Intended to be run on a background thread.
-  Result think(const Position &pos, int max_depth, int threads, const InfoCallback &on_iteration);
+  //
+  // Time control (both in milliseconds; <= 0 means "no limit"):
+  //  - `hard_ms`: a hard deadline — the search aborts mid-iteration once it is exceeded and returns
+  //    the best move from the last completed depth.
+  //  - `soft_ms`: a soft budget — once it is exceeded, no further iteration is *started* (the one in
+  //    progress finishes). Normally soft_ms <= hard_ms.
+  Result think(const Position &pos, int max_depth, int threads, const InfoCallback &on_iteration, int64_t soft_ms = 0,
+               int64_t hard_ms = 0);
 
   // Asks an in-progress `think()` to stop as soon as possible (the UCI "stop" command). Safe to
   // call from another thread; cleared automatically at the start of the next `think()`.
