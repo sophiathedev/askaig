@@ -1,12 +1,15 @@
 #include "uci.h"
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 #include "position.h"
 #include "search.h"
 #include "tables.h"
@@ -108,21 +111,67 @@ namespace {
     return nodes;
   }
 
+  // Byte-clones a Position so each perft worker can make/unmake on its own copy. A plain copy would
+  // invoke UndoInfo's copy constructor (which resets epsq/captured) and corrupt the history stack;
+  // every Position member is plain data, so the bit pattern is a faithful, independent copy.
+  Position clone_position(const Position &src) {
+    Position dst;
+    std::memcpy(static_cast<void *>(&dst), static_cast<const void *>(&src), sizeof(Position));
+    return dst;
+  }
+
+  // Divides the perft node count by root move (the standard "divide" output), parallelised across
+  // the "Threads" option. Each root move's subtree is an independent computation, so workers grab
+  // root moves from a shared atomic counter and accumulate into per-move slots on their own board
+  // clone; the divide lines are then printed in move-generation order.
   template<Color Us>
   void perft_divide(Position &p, int depth) {
-    uint64_t     total = 0;
-    MoveList<Us> list(p);
+    std::vector<Move> moves;
+    {
+      MoveList<Us> list(p);
+      moves.assign(list.begin(), list.end());
+    }
+    const size_t          n = moves.size();
+    std::vector<uint64_t> counts(n, 1); // depth 1: every root move is itself one leaf
+
+    int nthreads = g_threads < 1 ? 1 : g_threads;
+    if (nthreads > static_cast<int>(n))
+      nthreads = static_cast<int>(n == 0 ? 1 : n);
 
     const auto start = std::chrono::steady_clock::now();
-    for (Move m: list) {
-      uint64_t n = 1;
-      if (depth > 1) {
-        p.play<Us>(m);
-        n = perft<~Us>(p, depth - 1);
-        p.undo<Us>(m);
+
+    if (depth > 1) {
+      if (nthreads <= 1) {
+        for (size_t i = 0; i < n; ++i) {
+          p.play<Us>(moves[i]);
+          counts[i] = perft<~Us>(p, depth - 1);
+          p.undo<Us>(moves[i]);
+        }
+      } else {
+        std::atomic<size_t> next{0};
+        auto                worker = [&]() {
+          Position local = clone_position(p);
+          size_t   i;
+          while ((i = next.fetch_add(1, std::memory_order_relaxed)) < n) {
+            local.play<Us>(moves[i]);
+            counts[i] = perft<~Us>(local, depth - 1);
+            local.undo<Us>(moves[i]);
+          }
+        };
+        std::vector<std::thread> pool;
+        pool.reserve(static_cast<size_t>(nthreads - 1));
+        for (int t = 1; t < nthreads; ++t)
+          pool.emplace_back(worker);
+        worker(); // this thread is a worker too
+        for (auto &th: pool)
+          th.join();
       }
-      std::cout << move_to_uci(m) << ": " << n << "\n";
-      total += n;
+    }
+
+    uint64_t total = 0;
+    for (size_t i = 0; i < n; ++i) {
+      std::cout << move_to_uci(moves[i]) << ": " << counts[i] << "\n";
+      total += counts[i];
     }
     const auto us =
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();

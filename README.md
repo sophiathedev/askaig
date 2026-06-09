@@ -85,7 +85,7 @@ printf 'position startpos\ngo perft 6\nquit\n' | ./build/askaig | grep "Nodes se
 # Nodes searched: 119060324
 ```
 
-This number must hold across all build configurations (scalar, NEON, AVX2).
+This number must hold across all build configurations (scalar, NEON, AVX2). `go perft` is **parallelised** across the `Threads` option (root moves are split over worker threads), so it scales close to linearly with core count while the divide output and total stay identical to the single-threaded run.
 
 ## Credits
 
