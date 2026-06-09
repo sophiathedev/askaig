@@ -60,6 +60,10 @@ namespace search {
     thread_local Move t_pv[MAX_PLY + 1][MAX_PLY + 1];
     thread_local int  t_pv_len[MAX_PLY + 1];
 
+    // Selective depth: the deepest ply any line reached this iteration (including quiescence). Reset
+    // once per iteration in aspiration_search and reported on each "info" line as "seldepth".
+    thread_local int t_seldepth = 0;
+
     // Records `m` followed by the child's PV as the PV at `ply`.
     [[gnu::always_inline]] inline void update_pv(int ply, Move m) noexcept {
       t_pv[ply][0] = m;
@@ -165,7 +169,9 @@ namespace search {
     // Quiescence search: at the search horizon, keep resolving captures (in MVV-LVA order) until the
     // position is "quiet", so the static eval is not taken mid-capture-sequence (horizon effect).
     template<Color Us>
-    [[gnu::hot]] int quiescence(Position &p, int alpha, int beta, uint64_t &nodes) {
+    [[gnu::hot]] int quiescence(Position &p, int alpha, int beta, uint64_t &nodes, int ply) {
+      if (ply > t_seldepth)
+        t_seldepth = ply; // quiescence reaches beyond the nominal depth -> it sets the selective depth
       int stand_pat = eval::evaluate(p);
       if (stand_pat >= beta)
         return beta;
@@ -200,7 +206,7 @@ namespace search {
 
         p.play<Us>(m);
         ++nodes;
-        int score = -quiescence<~Us>(p, -beta, -alpha, nodes);
+        int score = -quiescence<~Us>(p, -beta, -alpha, nodes, ply + 1);
         p.undo<Us>(m);
 
         if (score >= beta)
@@ -228,6 +234,8 @@ namespace search {
                              Square recap_sq = NO_SQUARE, Move excluded = Move{}) {
       if (aborted())
         return 0; // helper thread is stopping; value is discarded
+      if (ply > t_seldepth)
+        t_seldepth = ply; // track the deepest ply reached, for the reported selective depth
       if (ply >= MAX_PLY)
         return eval::evaluate(p); // hard ply cap: bound runaway check extensions / deep lines
 
@@ -270,7 +278,7 @@ namespace search {
       if (n == 0)
         return p.checkers ? -(MATE - ply) : 0; // checkmate (lose) : stalemate (draw)
       if (depth == 0)
-        return quiescence<Us>(p, alpha, beta, nodes);
+        return quiescence<Us>(p, alpha, beta, nodes, ply);
 
       // Captured now because the null-move / child searches below overwrite p.checkers.
       const bool in_check = p.checkers != 0;
@@ -476,6 +484,7 @@ namespace search {
         r.pv.assign(&t_pv[0][0], &t_pv[0][t_pv_len[0]]);
       else if (!(r.best == Move{}))
         r.pv = {r.best};
+      r.seldepth = std::max(depth, t_seldepth); // never report a selective depth below the nominal one
       return r;
     }
 
@@ -488,6 +497,7 @@ namespace search {
     // score), re-searching with a progressively wider window on a fail-high/low. Shallow depths and
     // mate scores fall back to a full window. The returned result carries the cumulative node count.
     Result aspiration_search(Position &p, int depth, int prev_score) {
+      t_seldepth = 0; // selective depth is measured per iteration; accumulate across this depth's re-searches
       if (depth <= 4 || prev_score > MATE - MAX_MATE_PLY || prev_score < -(MATE - MAX_MATE_PLY))
         return search_to_depth(p, depth, -INF, INF);
 

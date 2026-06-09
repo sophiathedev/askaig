@@ -345,8 +345,8 @@ namespace {
               search::think(*pp, depth, g_threads, [](int d, const search::Result &res, uint64_t nodes, long long ms) {
                 const uint64_t              nps = ms > 0 ? nodes * 1000 / static_cast<uint64_t>(ms) : nodes * 1000;
                 std::lock_guard<std::mutex> lk(g_out);
-                std::cout << "info depth " << d << " score " << format_score(res.score) << " nodes " << nodes << " nps "
-                          << nps << " time " << ms;
+                std::cout << "info depth " << d << " seldepth " << res.seldepth << " score " << format_score(res.score)
+                          << " nodes " << nodes << " nps " << nps << " time " << ms;
                 if (!res.pv.empty()) {
                   std::cout << " pv";
                   for (Move m: res.pv)
