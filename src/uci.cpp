@@ -371,16 +371,19 @@ namespace {
     if (movetime > 0) {
       max_depth = search::MAX_DEPTH;
       hard_ms   = std::max<int64_t>(movetime - MOVE_OVERHEAD_MS, 1);
-      soft_ms   = hard_ms; // a fixed move time: use (almost) all of it
+      soft_ms   = 0; // a fixed move time: run the whole budget, no adaptive early stop
     } else if (wtime > 0 || btime > 0) {
       max_depth           = search::MAX_DEPTH;
       const int64_t t     = pos.turn() == WHITE ? wtime : btime; // our remaining time
       const int64_t inc   = pos.turn() == WHITE ? winc : binc; // our increment
       const int     mtg   = movestogo > 0 ? movestogo : 40; // assume 40 moves to go under sudden death
       const int64_t avail = std::max<int64_t>(t - MOVE_OVERHEAD_MS, 1);
-      const int64_t opt   = std::min(avail / mtg + inc, avail); // a time slice plus the increment
-      soft_ms             = std::max<int64_t>(opt, 1);
-      hard_ms             = std::min<int64_t>(avail, opt * 5); // never blow more than ~5x the optimum (or all we have)
+      // Optimum slice of the clock for this move (a share of the remaining time plus the increment);
+      // the search scales it by best-move stability. The hard cap bounds a single move to ~5x the
+      // optimum and never more than 75% of what we have, so we keep reserves for the rest of the game.
+      const int64_t opt = std::min(avail / mtg + inc, avail);
+      soft_ms           = std::max<int64_t>(opt, 1);
+      hard_ms           = std::clamp<int64_t>(opt * 5, soft_ms, std::max<int64_t>(avail * 3 / 4, 1));
     } else if (infinite) {
       max_depth = search::MAX_DEPTH; // search to the ply ceiling — effectively until "stop"
     } else if (depth > 0) {

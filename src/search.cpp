@@ -51,13 +51,16 @@ namespace search {
     // and think() must not return a move until ponderhit or stop).
     std::atomic<bool>                     g_timed{false}; // a hard deadline is active
     std::chrono::steady_clock::time_point g_deadline; // hard cut-off (abort the search)
-    std::atomic<bool>                     g_soft{false}; // a soft deadline is active
-    std::chrono::steady_clock::time_point g_soft_deadline; // soft budget (don't start a new iteration)
+    std::atomic<bool>                     g_soft{false}; // a soft budget is active (clock-based search)
+    std::chrono::steady_clock::time_point g_soft_start; // when the soft budget started counting
+    int64_t                               g_soft_ms = 0; // base soft budget (ms), scaled per iteration
     std::atomic<bool>                     g_ponder{false}; // searching on the opponent's time
     constexpr uint64_t                    TIME_CHECK_MASK = 2047; // poll the clock every 2048 nodes
 
-    // Arms the time control relative to `from`: a hard deadline `from + hard_ms` and a soft deadline
-    // `from + soft_ms` (each only if its budget is > 0). Used both at search start and on ponderhit.
+    // Arms the time control relative to `from`: a hard deadline `from + hard_ms` (the safety cut-off,
+    // enforced in negamax) and a soft budget `g_soft_ms` counted from `from` (the main thread scales
+    // it by best-move stability and stops between iterations). Either is skipped when its budget <= 0.
+    // Used both at search start and on ponderhit.
     void arm_time(std::chrono::steady_clock::time_point from, int64_t soft_ms, int64_t hard_ms) noexcept {
       if (hard_ms > 0) {
         g_deadline = from + std::chrono::milliseconds(hard_ms);
@@ -65,7 +68,8 @@ namespace search {
       } else
         g_timed.store(false, std::memory_order_relaxed);
       if (soft_ms > 0) {
-        g_soft_deadline = from + std::chrono::milliseconds(soft_ms);
+        g_soft_start = from;
+        g_soft_ms    = soft_ms;
         g_soft.store(true, std::memory_order_release);
       } else
         g_soft.store(false, std::memory_order_relaxed);
@@ -74,11 +78,6 @@ namespace search {
     // True once the hard time budget has elapsed. Cheap when untimed (short-circuits before now()).
     [[gnu::hot]] inline bool time_up() noexcept {
       return g_timed.load(std::memory_order_acquire) && std::chrono::steady_clock::now() >= g_deadline;
-    }
-
-    // True once the soft budget has elapsed (checked between iterations to avoid starting a new one).
-    inline bool soft_up() noexcept {
-      return g_soft.load(std::memory_order_acquire) && std::chrono::steady_clock::now() >= g_soft_deadline;
     }
 
     // Per-thread abort flag, pointing at g_stop while a search runs so negamax/quiescence bail out
@@ -652,6 +651,13 @@ namespace search {
     Result   best{};
     best.best = any_legal_move(main_pos); // guarantees a real move even if stopped before depth 1 finishes
 
+    // Adaptive time management state (main thread, clock-based searches): how many iterations in a
+    // row the best move has been the same, and the previous iteration's score.
+    Move last_best    = Move{};
+    int  stable       = 0;
+    int  prev_iter_sc = 0;
+    bool have_prev_sc = false;
+
     for (int d = 1; d <= max_depth; ++d) {
       Result r = aspiration_search(main_pos, d, prev_score);
       total_nodes.fetch_add(r.nodes, std::memory_order_relaxed);
@@ -666,8 +672,29 @@ namespace search {
       on_iteration(d, best, nodes, static_cast<long long>(ms));
       if (is_mate(best.score))
         break; // forced mate found; deeper search cannot find a faster one
-      if (soft_up())
-        break; // soft budget spent: the next iteration would likely overrun, so don't start it
+
+      // Adaptive soft limit (clock searches only): scale the optimum by how settled the search is.
+      // A best move that keeps changing — or a score that just dropped — earns more time; a move
+      // that has been stable for several iterations lets us stop early and bank time for later moves.
+      // The hard deadline (negamax) is the safety net, so a long scale never risks flagging.
+      if (g_soft.load(std::memory_order_acquire)) {
+        stable    = best.best == last_best ? std::min(stable + 1, 10) : 0;
+        last_best = best.best;
+
+        double scale = 1.4 - 0.08 * stable; // 1.4 (just changed) down to 0.6 (very stable)
+        if (have_prev_sc && best.score + 30 < prev_iter_sc)
+          scale += 0.3; // the position got worse — look harder for something better
+        scale = std::clamp(scale, 0.5, 1.8);
+
+        prev_iter_sc = best.score;
+        have_prev_sc = true;
+
+        const int64_t soft_elapsed =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_soft_start)
+                        .count();
+        if (static_cast<double>(soft_elapsed) >= static_cast<double>(g_soft_ms) * scale)
+          break; // the (scaled) optimum is spent: starting another iteration would likely overrun it
+      }
     }
 
     // If the search ran out (mate / depth ceiling / soft limit) while still pondering, UCI forbids

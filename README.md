@@ -29,6 +29,7 @@ A multi-threaded **(Lazy SMP) iterative-deepening PVS** (negamax + alpha-beta) s
 - **Move ordering** — TT move → MVV-LVA captures → killer moves → history heuristic.
 - **Quiescence** search at the horizon (capture resolution) with **delta pruning**.
 - **Pruning** — null-move pruning (with a zugzwang guard), reverse futility / static null move, futility pruning, late move pruning (LMP), **late move reductions (LMR)**, and mate-distance pruning.
+- **Adaptive time management** — clock-based searches scale their per-move budget by best-move stability: more time when the best move keeps changing or the score drops, less when it has settled (banking time for later moves), with a hard cap as a safety net. Also supports `movetime` and pondering.
 - **Extensions** — check, mate-threat, one-reply, recapture, passed-pawn, and **singular** extensions.
 - The exact **principal variation** is collected via a triangular PV table and reported on each `info` line.
 
