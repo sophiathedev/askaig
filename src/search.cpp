@@ -34,6 +34,15 @@ namespace search {
     constexpr int FUTILITY_MARGIN    = 100; // per-depth eval deficit below alpha that prunes quiets
     constexpr int LMP_MAX_DEPTH      = 4; // late-move (move-count) pruning up to this depth
 
+    // SEE pruning in the main search (quiescence has its own): at shallow depths, skip moves that
+    // lose material to the exchange on their destination square. Captures get a per-depth^2
+    // allowance (a deep node may sacrifice for compensation the search can still find); quiets a
+    // stricter per-depth one (a quiet that just hangs the piece rarely justifies itself). Margins
+    // are in psqt::VALUE scale (pawn = 100) and are unproven starting values (Ethereal-like).
+    constexpr int SEE_PRUNE_MAX_DEPTH = 9;
+    constexpr int SEE_QUIET_MARGIN    = 65; // * depth
+    constexpr int SEE_CAPT_MARGIN     = 20; // * depth^2
+
     // Singular extensions: only attempted from this depth; the verification search excludes the TT
     // move and uses a window `SINGULAR_MARGIN * depth` below the TT score.
     constexpr int SINGULAR_MIN_DEPTH = 8;
@@ -296,25 +305,28 @@ namespace search {
     constexpr int SEE_VALUE[NPIECE_TYPES] = {psqt::VALUE[PAWN], psqt::VALUE[KNIGHT], psqt::VALUE[BISHOP],
                                              psqt::VALUE[ROOK], psqt::VALUE[QUEEN],  20000};
 
-    // True if the exchange sequence started by the capture `m` wins at least `threshold` cp for the
+    // True if the exchange sequence started by the move `m` wins at least `threshold` cp for the
     // mover, assuming both sides keep capturing on m.to() with their least valuable attacker (the
-    // classic swap algorithm). X-ray attackers are revealed as pieces are removed from `occ` (the
-    // static `diag`/`orth` masks may re-add an already-used slider, but `attackers &= occ` at the
-    // top of each round filters it before use). The king may only "recapture" if the opponent has
-    // no attacker left to answer. Non-plain captures (en passant, promotions — material swings the
-    // plain swap doesn't model) and quiets are treated optimistically (never reported as losing).
+    // classic swap algorithm). Plain captures AND plain quiet moves (victim value 0 — "is the moved
+    // piece simply lost on that square?") are evaluated; everything the swap doesn't model (en
+    // passant, promotions — material swings; castling — the king-to-rook encoding) is treated
+    // optimistically (never reported as losing). X-ray attackers are revealed as pieces are removed
+    // from `occ` (the static `diag`/`orth` masks may re-add an already-used slider, but
+    // `attackers &= occ` at the top of each round filters it before use). The king may only
+    // "recapture" if the opponent has no attacker left to answer.
     [[gnu::hot]] bool see_ge(const Position &p, Move m, int threshold) noexcept {
-      if (m.flags() != CAPTURE)
+      const MoveFlags fl = m.flags();
+      if (fl != CAPTURE && fl != QUIET && fl != DOUBLE_PUSH)
         return 0 >= threshold;
       const Square from = m.from();
       const Square to   = m.to();
 
-      int swap = SEE_VALUE[type_of(p.at(to))] - threshold;
+      int swap = (fl == CAPTURE ? SEE_VALUE[type_of(p.at(to))] : 0) - threshold;
       if (swap < 0)
         return false; // taking the victim even for free is below the threshold
       swap = SEE_VALUE[type_of(p.at(from))] - swap;
       if (swap <= 0)
-        return true; // losing the capturing piece outright still meets the threshold
+        return true; // losing the moved piece outright still meets the threshold
 
       const Bitboard diag  = p.bitboard_of(WHITE, BISHOP) | p.bitboard_of(BLACK, BISHOP) | p.bitboard_of(WHITE, QUEEN) |
                              p.bitboard_of(BLACK, QUEEN);
@@ -323,9 +335,10 @@ namespace search {
       const Bitboard kings = p.bitboard_of(WHITE, KING) | p.bitboard_of(BLACK, KING);
       const Bitboard side_bb[NCOLORS] = {p.all_pieces<WHITE>(), p.all_pieces<BLACK>()};
 
-      // The mover leaves `from` and stands on `to` (replacing the victim); it is deliberately NOT
-      // in `occ` — a piece on the contested square cannot block sliders aimed at that square.
-      Bitboard occ = (side_bb[WHITE] | side_bb[BLACK]) ^ SQUARE_BB[from] ^ SQUARE_BB[to];
+      // The mover leaves `from` and stands on `to` (replacing any victim); it is deliberately NOT
+      // in `occ` — a piece on the contested square cannot block sliders aimed at that square. The
+      // `& ~to` (rather than `^ to`) also clears the square when the move is quiet (`to` empty).
+      Bitboard occ = ((side_bb[WHITE] | side_bb[BLACK]) ^ SQUARE_BB[from]) & ~SQUARE_BB[to];
       Color    stm = color_of(p.at(from));
       // attackers_from omits kings (it serves in_check, where a king never gives check) -> OR them.
       Bitboard attackers =
@@ -587,6 +600,13 @@ namespace search {
           if (depth <= FUTILITY_MAX_DEPTH && static_eval + FUTILITY_MARGIN * depth <= alpha)
             continue;
         }
+        // SEE pruning: skip a move that loses material on its destination square (same gates as
+        // above, but captures included). `best > mated` means at least one move was searched, so
+        // the node always returns a real score; the first move (best == -INF) is never pruned, and
+        // see_ge is optimistic about what the swap can't model (promotions, ep, castling).
+        if (can_prune && best > -(MATE - MAX_MATE_PLY) && depth <= SEE_PRUNE_MAX_DEPTH &&
+            !see_ge(p, m, is_quiet(m) ? -SEE_QUIET_MARGIN * depth : -SEE_CAPT_MARGIN * depth * depth))
+          continue;
 
         // Per-move extension (capped at one ply): node-level (check / mate threat) or singular TT
         // move. (A recapture extension was tried and removed: it cost ~+40% nodes while quiescence
