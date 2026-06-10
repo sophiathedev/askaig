@@ -50,6 +50,17 @@ namespace eval {
       int mg = 0;
       int eg = 0;
     };
+
+    // Threats: a piece attacking a more (or equally) valuable enemy piece, and "hanging" pieces (a
+    // piece we attack that the enemy does not defend). Tapered. Values are deliberately modest and
+    // SHOULD be tuned by SPRT self-play (tools/sprt.sh) — these are reasonable starting points, not
+    // proven optima. Indexed by the *threatened* (victim) piece type; bigger victims = bigger threat.
+    constexpr Score THREAT_BY_PAWN                = {80, 55}; // a pawn attacks any enemy minor/rook/queen
+    constexpr Score THREAT_BY_MINOR[NPIECE_TYPES] = {{0, 0},   {22, 35}, {24, 35},
+                                                     {45, 50}, {48, 55}, {0, 0}}; // victim: P N B R Q K
+    constexpr Score THREAT_BY_ROOK[NPIECE_TYPES]  = {{0, 0},  {20, 40}, {22, 40},
+                                                     {0, 20}, {40, 40}, {0, 0}}; // rooks chiefly threaten R/Q
+    constexpr Score HANGING                       = {28, 22}; // per undefended enemy piece we attack
     [[gnu::const, gnu::always_inline]] inline int taper(Score s, int phase) noexcept {
       return (s.mg * phase + s.eg * (psqt::PHASE_MAX - phase)) / psqt::PHASE_MAX;
     }
@@ -287,6 +298,72 @@ namespace eval {
       return taper(s, phase);
     }
 
+    // The squares attacked by side C, split by attacker tier (pawns / minors / rooks) plus the full
+    // union (`all`, used to decide whether an enemy piece is defended). Computed once per side.
+    struct AttackMap {
+      Bitboard pawn  = 0;
+      Bitboard minor = 0; // knights + bishops
+      Bitboard rook  = 0;
+      Bitboard all   = 0; // every attacker, including queens and the king
+    };
+
+    template<Color C>
+    [[gnu::pure, gnu::hot]] AttackMap attack_maps(const Position &pos, Bitboard occ) noexcept {
+      AttackMap m;
+      m.pawn = pawn_attacks<C>(pos.bitboard_of(C, PAWN));
+      for (Bitboard b = pos.bitboard_of(C, KNIGHT); b;)
+        m.minor |= attacks<KNIGHT>(pop_lsb(&b), occ);
+      for (Bitboard b = pos.bitboard_of(C, BISHOP); b;)
+        m.minor |= attacks<BISHOP>(pop_lsb(&b), occ);
+      for (Bitboard b = pos.bitboard_of(C, ROOK); b;)
+        m.rook |= attacks<ROOK>(pop_lsb(&b), occ);
+      Bitboard queens = 0;
+      for (Bitboard b = pos.bitboard_of(C, QUEEN); b;)
+        queens |= attacks<QUEEN>(pop_lsb(&b), occ);
+      m.all = m.pawn | m.minor | m.rook | queens | attacks<KING>(bsf(pos.bitboard_of(C, KING)), occ);
+      return m;
+    }
+
+    // Threat bonus for side C against ~C: pieces of ~C attacked by our pawns / minors / rooks, plus
+    // any enemy piece we attack that ~C does not defend (`theyDefend` = ~C's full attack map).
+    template<Color C>
+    [[gnu::pure, gnu::hot]] Score side_threats(const Position &pos, const AttackMap &us, Bitboard theyDefend) noexcept {
+      const Color    Them        = ~C;
+      const Bitboard theirMinors = pos.bitboard_of(Them, KNIGHT) | pos.bitboard_of(Them, BISHOP);
+      const Bitboard theirR      = pos.bitboard_of(Them, ROOK);
+      const Bitboard theirQ      = pos.bitboard_of(Them, QUEEN);
+      const Bitboard theirPieces = theirMinors | theirR | theirQ; // enemy non-pawn, non-king pieces
+
+      Score s;
+      // Pawn threats: any enemy piece attacked by one of our pawns (flat — the pawn is cheap).
+      s.mg += THREAT_BY_PAWN.mg * pop_count(us.pawn & theirPieces);
+      s.eg += THREAT_BY_PAWN.eg * pop_count(us.pawn & theirPieces);
+      // Minor-piece threats, by the threatened piece's type.
+      for (Bitboard t = us.minor & theirPieces; t;) {
+        const int vt = type_of(pos.at(pop_lsb(&t)));
+        s.mg += THREAT_BY_MINOR[vt].mg, s.eg += THREAT_BY_MINOR[vt].eg;
+      }
+      // Rook threats (chiefly enemy rooks/queens, but minors too).
+      for (Bitboard t = us.rook & theirPieces; t;) {
+        const int vt = type_of(pos.at(pop_lsb(&t)));
+        s.mg += THREAT_BY_ROOK[vt].mg, s.eg += THREAT_BY_ROOK[vt].eg;
+      }
+      // Hanging: enemy pieces we attack that they do not defend.
+      const int hung = pop_count(theirPieces & us.all & ~theyDefend);
+      s.mg += HANGING.mg * hung, s.eg += HANGING.eg * hung;
+      return s;
+    }
+
+    // Threats from White's perspective, tapered by game phase.
+    [[gnu::pure, gnu::hot]] int threats(const Position &pos, int phase) noexcept {
+      const Bitboard  occ = pos.all_pieces<WHITE>() | pos.all_pieces<BLACK>();
+      const AttackMap w   = attack_maps<WHITE>(pos, occ);
+      const AttackMap b   = attack_maps<BLACK>(pos, occ);
+      const Score     sw  = side_threats<WHITE>(pos, w, b.all);
+      const Score     sb  = side_threats<BLACK>(pos, b, w.all);
+      return taper({sw.mg - sb.mg, sw.eg - sb.eg}, phase);
+    }
+
     // Per-thread cache of the static evaluation, keyed by the full Zobrist hash. The evaluation is
     // a pure function of the position, so entries never go stale and need no clearing; collisions
     // are resolved by the full-key check. thread_local => no locking under Lazy SMP.
@@ -325,6 +402,7 @@ namespace eval {
     s += mobility(pos, phase);
     s += pin_penalty(pos);
     s += piece_bonuses(pos, phase);
+    s += threats(pos, phase);
 
     const int result = pos.turn() == WHITE ? s : -s;
     e.key            = key;
