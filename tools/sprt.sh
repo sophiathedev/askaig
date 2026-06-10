@@ -5,17 +5,18 @@
 # candidate gains in (elo0, elo1); H0 = it does not). This is the ONLY reliable measure of strength —
 # node counts and tactical spot-checks confirm *correctness*, not Elo.
 #
-#   tools/sprt.sh [BASE_REF] [TEST_REF]
+#   tools/sprt.sh [BASE_REF]
 #
-#     BASE_REF   git ref for the baseline engine   (default: HEAD)
-#     TEST_REF   git ref for the candidate engine   (default: the current working tree)
+#     CANDIDATE  = cmake-build-release/askaig — the CLion "Release + SIMD" preset build of the
+#                  CURRENT source tree. The script re-runs that build (configuring the preset first
+#                  if the directory is missing) so the binary is fresh and in Release mode.
+#     BASELINE   = build/askaig — built (Release) from the git ref BASE_REF, default HEAD.
+#                  build/ is wiped and rebuilt from a temporary worktree of that commit each run.
 #
-# Typical loop — edit eval, then test the working tree against the last commit:
+# Typical loop — edit code (CLion keeps cmake-build-release current), test vs the last commit:
 #     tools/sprt.sh
-# If you already committed the change, compare against its parent:
+# If you already committed the change (so the source tree == HEAD), compare against its parent:
 #     tools/sprt.sh HEAD~1
-# Compare two specific commits/tags:
-#     tools/sprt.sh v1 v2
 #
 # Tunables via env: TC (5+0.05), HASH (16), CONCURRENCY (P-cores - 1), ELO0/ELO1 (0/10),
 #                   ALPHA/BETA (0.1), ROUNDS (5000), BOOK (UHO_4060_v3.epd).
@@ -60,38 +61,35 @@ BETA="${BETA:-0.1}"
 ROUNDS="${ROUNDS:-5000}"
 
 BASE_REF="${1:-HEAD}"
-TEST_REF="${2:-}" # empty => current working tree (includes uncommitted edits)
 
 WORK="$HERE/work"
 mkdir -p "$WORK"
 
-# Build a git ref into its own worktree+binary; an empty ref builds the current working tree in place.
-# Echoes the resulting binary path.
-build() { # build <ref|""> <outdir>
-  local ref="$1" out="$2" src
-  if [ -z "$ref" ]; then
-    src="$ROOT" # the live working tree (out-of-source build, so cmake-build-* is untouched)
-  else
-    src="$out/src"
-    [ -d "$src" ] && git -C "$ROOT" worktree remove --force "$src" >/dev/null 2>&1 || true
-    git -C "$ROOT" worktree add --detach -f "$src" "$ref" >/dev/null
-  fi
-  cmake -S "$src" -B "$out/build" -DCMAKE_BUILD_TYPE=Release >/dev/null
-  cmake --build "$out/build" -j"$CORES" >/dev/null
-  echo "$out/build/askaig"
-}
+# --- Candidate: the CLion Release+SIMD build of the current source tree --------------------------
+# Refresh it so the binary matches the sources (and configure the preset first if it's missing).
+CAND_DIR="$ROOT/cmake-build-release"
+echo ">> building candidate (current tree) -> cmake-build-release/ ..."
+if [ ! -f "$CAND_DIR/CMakeCache.txt" ]; then
+  cmake --preset release-simd -S "$ROOT" >/dev/null
+fi
+cmake --build "$CAND_DIR" -j"$CORES" >/dev/null
+CAND_BIN="$CAND_DIR/askaig"
+[ -x "$CAND_BIN" ] || { echo "candidate binary missing: $CAND_BIN"; exit 1; }
 
-cleanup() {
-  for wt in "$WORK/base/src" "$WORK/cand/src"; do
-    [ -d "$wt" ] && git -C "$ROOT" worktree remove --force "$wt" >/dev/null 2>&1 || true
-  done
-}
+# --- Baseline: BASE_REF built (Release) into build/ ----------------------------------------------
+# The commit is materialised in a temporary worktree; build/ is wiped first so the CMake cache never
+# points at a stale source directory.
+BASE_SRC="$WORK/base-src"
+cleanup() { git -C "$ROOT" worktree remove --force "$BASE_SRC" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
-
-echo ">> building baseline  ($BASE_REF) ..."
-BASE_BIN="$(build "$BASE_REF" "$WORK/base")"
-echo ">> building candidate (${TEST_REF:-working tree}) ..."
-CAND_BIN="$(build "$TEST_REF" "$WORK/cand")"
+cleanup
+echo ">> building baseline  ($BASE_REF) -> build/ ..."
+git -C "$ROOT" worktree add --detach -f "$BASE_SRC" "$BASE_REF" >/dev/null
+rm -rf "$ROOT/build"
+cmake -S "$BASE_SRC" -B "$ROOT/build" -DCMAKE_BUILD_TYPE=Release >/dev/null
+cmake --build "$ROOT/build" -j"$CORES" >/dev/null
+BASE_BIN="$ROOT/build/askaig"
+[ -x "$BASE_BIN" ] || { echo "baseline binary missing: $BASE_BIN"; exit 1; }
 
 echo ">> SPRT  cand vs base   TC=$TC  Hash=$HASH  concurrency=$CONCURRENCY  H1=elo in ($ELO0,$ELO1)  alpha=$ALPHA beta=$BETA"
 echo

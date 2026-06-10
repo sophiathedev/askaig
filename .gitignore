@@ -1,6 +1,7 @@
 CLAUDE.md
 cmake-build-debug/
 cmake-build-release/
+build/
 .idea/
 
 # SPRT harness: the (optional) built match runner, the downloaded book, and per-run build/PGN
