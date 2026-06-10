@@ -400,6 +400,10 @@ namespace search {
 
     // Quiescence search: at the search horizon, keep resolving captures (in MVV-LVA order) until the
     // position is "quiet", so the static eval is not taken mid-capture-sequence (horizon effect).
+    // The TT is probed and stored here too (depth-0 entries): this was tried and rejected when the
+    // table was single-slot always-replace (qsearch junk evicted deep analysis, +31% nodes), but
+    // the bucketed, aged table keeps depth-0 entries from displacing anything valuable — and the
+    // stored static eval replaces evaluate(), the dominant qsearch cost, on every revisit.
     template<Color Us>
     [[gnu::hot]] int quiescence(Position &p, int alpha, int beta, uint64_t &nodes, int ply) {
       if (stop_or_time_up())
@@ -408,9 +412,29 @@ namespace search {
         return eval::evaluate(p); // absolute undo-stack backstop (see Position::MAX_HISTORY)
       if (ply > t_seldepth)
         t_seldepth = ply; // quiescence reaches beyond the nominal depth -> it sets the selective depth
-      int stand_pat = eval::evaluate(p);
-      if (stand_pat >= beta)
+
+      const uint64_t key    = p.get_hash();
+      tt::Entry     *tte    = tt::probe(key);
+      Move           ttMove = Move{};
+      int            ttEval = tt::EVAL_NONE;
+      if (tte != nullptr) { // fields copied out (lockless table — see the negamax probe)
+        const int       ttScore = score_from_tt(tte->score, ply);
+        const tt::Bound ttBound = tte->bound();
+        ttMove                  = Move(tte->move);
+        ttEval                  = tte->eval;
+        // Any stored entry is at least as deep as a quiescence node (depth >= 0) -> usable bound.
+        if (ttBound == tt::EXACT || (ttBound == tt::LOWER && ttScore >= beta) ||
+            (ttBound == tt::UPPER && ttScore <= alpha))
+          return ttScore;
+      }
+
+      const int alpha_orig = alpha;
+      int       stand_pat  = ttEval != tt::EVAL_NONE ? ttEval : eval::evaluate(p);
+      if (stand_pat >= beta) {
+        if (!aborted())
+          tt::store(key, Move{}, score_to_tt(beta, ply), 0, tt::LOWER, stand_pat);
         return beta;
+      }
       if (stand_pat > alpha)
         alpha = stand_pat;
 
@@ -420,8 +444,9 @@ namespace search {
       int          n = 0;
       for (Move m: list)
         if (m.is_capture()) {
-          moves[n]  = m;
-          scores[n] = move_score(p, m, 0); // captures only -> ply unused (no killer/history)
+          moves[n] = m;
+          scores[n] =
+                  m == ttMove ? TT_MOVE_SCORE : move_score(p, m, 0); // captures only -> ply unused (no killer/history)
           ++n;
         }
 
@@ -449,11 +474,18 @@ namespace search {
         int score = -quiescence<~Us>(p, -beta, -alpha, nodes, ply + 1);
         p.undo<Us>(m);
 
-        if (score >= beta)
+        if (score >= beta) {
+          if (!aborted())
+            tt::store(key, m, score_to_tt(beta, ply), 0, tt::LOWER, stand_pat);
           return beta;
+        }
         if (score > alpha)
           alpha = score;
       }
+
+      // No cut-off: alpha raised -> exact; untouched -> an upper bound (true score <= alpha_orig).
+      if (!aborted())
+        tt::store(key, Move{}, score_to_tt(alpha, ply), 0, alpha > alpha_orig ? tt::EXACT : tt::UPPER, stand_pat);
       return alpha;
     }
 
