@@ -41,12 +41,13 @@ Together these cut the searched node count by **~95%+** on quiet positions versu
 A **tapered** (middlegame ↔ endgame) evaluation, interpolated by game phase from the remaining material:
 
 - **Material + piece-square tables** — [**PeSTO's Evaluation Function**](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) (Ronald Friederich's tuned tables), with separate middlegame/endgame material values and tables for every piece, maintained **incrementally** in the make/unmake primitives (two MG/EG accumulators) and interpolated by game phase.
-- **Pawn structure** — doubled / isolated penalties, a **tapered passed-pawn** bonus, centered pawns, and knight **outposts** (a knight on an enemy "hole" defended by a pawn).
-- **King safety** — missing pawn-shield and open/semi-open files beside the king, **scaled by the opponent's attacking material** (fades out in the endgame).
-- **Mobility** — per safe square each piece attacks, **tapered** (sliders are worth more on the open endgame board).
+- **Pawn structure** — doubled / isolated penalties, a **tapered passed-pawn** bonus (reduced when **blockaded**, plus an endgame **king-distance race** term), centered pawns, and knight **outposts** (a knight on an enemy "hole" defended by a pawn).
+- **King safety** — missing pawn-shield and open/semi-open files beside the king, **scaled by the opponent's attacking material** (fades out in the endgame), plus a **king-zone attack** term (weighted attacks into the ring around the enemy king, scaled by the number of attackers).
+- **Mobility** — per safe square each piece attacks, **tapered** (sliders are worth more on the open endgame board); mobility, threats and king-zone attacks share a **single pass** over the piece attack sets.
+- **Threats** — pieces attacked by pawns / minors / rooks (by victim type) and **hanging** (attacked, undefended) pieces.
 - **Pin penalties** for pieces pinned to their own king.
 - **Bishop pair** (tapered), **rook on an open / semi-open file**, and **rook on the 7th rank** (tapered).
-- A thread-local **evaluation cache** keyed by the Zobrist hash.
+- A **tempo** bonus for the side to move.
 
 ## Building
 
@@ -78,7 +79,7 @@ Supported commands: `uci`, `isready`, `ucinewgame`, `position [startpos | fen <f
 `go [depth <n>]`, `go movetime <ms>`, `go wtime <ms> btime <ms> [winc <ms>] [binc <ms>] [movestogo <n>]`
 (clock-based time management), `go ponder` + `ponderhit` (think on the opponent's time), `go infinite`
 (search until `stop`), `go perft <depth>`, `setoption name Hash value <MB>`, `setoption name Threads value <n>`,
-`d` / `display`, `stop`, `quit`.
+`d` / `display`, `eval` (static evaluation of the current position), `stop`, `quit`.
 
 ## Correctness (perft)
 
