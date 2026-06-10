@@ -105,6 +105,36 @@ namespace search {
     thread_local Move t_killers[MAX_PLY][2];
     thread_local int  t_history[NCOLORS][NSQUARES][NSQUARES];
 
+    // Continuation history: quiet-move history conditioned on a PREVIOUS move of the current line.
+    // t_cont_hist[0] is keyed by the move 1 ply back (countermove history: "after they played that,
+    // this reply cuts"), t_cont_hist[1] by our own move 2 plies back (follow-up history). Both moves
+    // are flattened to a (piece, to-square) index — piece identity matters more than the from-square
+    // (the standard formulation). Updated with the same gravity formula and bonus/malus as t_history
+    // and added into the quiet ordering score and the LMR history adjustment. Color needs no separate
+    // axis: the conditioning piece's color implies it. -1 in the line stack means "no conditioning
+    // move" (root, or a null move — passing carries no piece/square to condition on).
+    constexpr int    CONT_PLIES = 2; // 1 ply back (countermove) and 2 plies back (follow-up)
+    constexpr int    NPIECE_TO  = static_cast<int>(NPIECES) * static_cast<int>(NSQUARES);
+    thread_local int t_cont_hist[CONT_PLIES][NPIECE_TO][NPIECE_TO];
+    thread_local int t_move_stack[MAX_PLY + 1]; // (piece,to) played at each ply of the current line
+
+    // Flattened (piece, to-square) index of a move; must be taken BEFORE the move is played (the
+    // piece is read from its from-square).
+    [[gnu::always_inline]] inline int piece_to_index(Piece pc, Square to) noexcept {
+      return static_cast<int>(pc) * static_cast<int>(NSQUARES) + static_cast<int>(to);
+    }
+
+    // Combined quiet-move statistic: butterfly history plus the continuation histories against the
+    // moves 1 and 2 plies back. `pt_idx` is piece_to_index() of the move being scored.
+    [[gnu::hot]] inline int quiet_stat(Color c, Move m, int pt_idx, int ply) noexcept {
+      int s = t_history[c][m.from()][m.to()];
+      if (ply >= 1 && t_move_stack[ply - 1] >= 0)
+        s += t_cont_hist[0][t_move_stack[ply - 1]][pt_idx];
+      if (ply >= 2 && t_move_stack[ply - 2] >= 0)
+        s += t_cont_hist[1][t_move_stack[ply - 2]][pt_idx];
+      return s;
+    }
+
     // Triangular principal-variation table: t_pv[ply] holds the best line found from `ply` down,
     // and t_pv_len[ply] its length. A new best move at `ply` prepends itself to the child's line.
     thread_local Move t_pv[MAX_PLY + 1][MAX_PLY + 1];
@@ -143,6 +173,8 @@ namespace search {
     void clear_heuristics() noexcept {
       std::memset(static_cast<void *>(t_killers), 0, sizeof(t_killers));
       std::memset(t_history, 0, sizeof(t_history));
+      std::memset(t_cont_hist, 0, sizeof(t_cont_hist));
+      std::memset(t_move_stack, 0, sizeof(t_move_stack));
     }
 
     // A quiet move is a non-capture, non-promotion move (only these use killer/history ordering).
@@ -163,19 +195,32 @@ namespace search {
     // On a beta cut-off by a quiet move: store it as a killer for this ply, reward its history by
     // ~depth^2 — and penalise (malus) the quiet moves ALREADY TRIED at this node that failed to cut
     // (they were refuted where this move wasn't, so they should sort later next time). Only moves
-    // actually searched are punished; quiets skipped by LMP/futility were never refuted.
-    void update_heuristics(Color c, int ply, Move m, int depth, const Move *tried, int n_tried) noexcept {
+    // actually searched are punished; quiets skipped by LMP/futility were never refuted. The same
+    // bonus/malus also feeds the continuation histories against the moves 1 and 2 plies back (all
+    // moves are unmade here, so each quiet's piece is back on its from-square).
+    void update_heuristics(const Position &p, Color c, int ply, Move m, int depth, const Move *tried,
+                           int n_tried) noexcept {
       if (!is_quiet(m))
         return;
       if (ply < MAX_PLY && !(m == t_killers[ply][0])) {
         t_killers[ply][1] = t_killers[ply][0];
         t_killers[ply][0] = m;
       }
-      const int bonus = depth * depth;
-      history_update(t_history[c][m.from()][m.to()], bonus);
+      const int  bonus = depth * depth;
+      const int  prev1 = ply >= 1 ? t_move_stack[ply - 1] : -1;
+      const int  prev2 = ply >= 2 ? t_move_stack[ply - 2] : -1;
+      const auto bump  = [&](Move q, int b) noexcept {
+        history_update(t_history[c][q.from()][q.to()], b);
+        const int idx = piece_to_index(p.at(q.from()), q.to());
+        if (prev1 >= 0)
+          history_update(t_cont_hist[0][prev1][idx], b);
+        if (prev2 >= 0)
+          history_update(t_cont_hist[1][prev2][idx], b);
+      };
+      bump(m, bonus);
       for (int j = 0; j < n_tried; ++j)
         if (!(tried[j] == m))
-          history_update(t_history[c][tried[j].from()][tried[j].to()], -bonus);
+          bump(tried[j], -bonus);
     }
 
     // Mate scores are stored in the TT relative to the node (not the root): a forced mate is
@@ -221,14 +266,15 @@ namespace search {
         return score;
       }
 
-      // Quiet move: killers for this ply, then the history score.
+      // Quiet move: killers for this ply, then the combined history statistic (butterfly +
+      // continuation). Its magnitude is bounded by 3*HISTORY_MAX = 300'000, safely below the killers.
       if (ply < MAX_PLY) {
         if (m == t_killers[ply][0])
           return KILLER1_SCORE;
         if (m == t_killers[ply][1])
           return KILLER2_SCORE;
       }
-      return t_history[pos.turn()][m.from()][m.to()];
+      return quiet_stat(pos.turn(), m, piece_to_index(pos.at(m.from()), m.to()), ply);
     }
 
     // --- Static exchange evaluation (SEE) ---------------------------------------------------
@@ -487,7 +533,8 @@ namespace search {
           has_non_pawn_material(p, Us)) {
         const int R = 2 + depth / 6;
         p.play_null();
-        int score = -negamax<~Us>(p, depth - 1 - R, ply + 1, -beta, -beta + 1, nodes, false, Move{});
+        t_move_stack[ply] = -1; // a pass carries no (piece, to) to condition continuation history on
+        int score         = -negamax<~Us>(p, depth - 1 - R, ply + 1, -beta, -beta + 1, nodes, false, Move{});
         p.undo_null();
         if (score >= beta)
           return beta; // fail-high: prune this node
@@ -550,6 +597,11 @@ namespace search {
 
         const int nd = depth - 1 + ext;
 
+        // (piece, to) of this move, read BEFORE playing it; pushed onto the line stack so child
+        // nodes can condition their continuation-history lookups on it.
+        const int pt_idx  = piece_to_index(p.at(m.from()), m.to());
+        t_move_stack[ply] = pt_idx;
+
         p.play<Us>(m);
         ++nodes;
 
@@ -568,9 +620,10 @@ namespace search {
             reduction = LMR_TABLE[depth < 63 ? depth : 63][i < 63 ? i : 63];
             if (is_pv)
               --reduction;
-            // History-informed adjustment: quiets with a strong (signed) history record are reduced
-            // less, persistent fail-lows more.
-            reduction -= std::clamp(t_history[Us][m.from()][m.to()] / 8'192, -2, 2);
+            // History-informed adjustment: quiets with a strong (signed) record are reduced less,
+            // persistent fail-lows more. Uses the combined statistic (butterfly + continuation,
+            // range ±3*HISTORY_MAX) — hence the divisor is scaled up from the butterfly-only 8'192.
+            reduction -= std::clamp(quiet_stat(Us, m, pt_idx, ply) / 16'384, -2, 2);
             reduction = std::clamp(reduction, 0, nd);
           }
           // PVS scout at the (possibly reduced) depth with a null window.
@@ -601,7 +654,7 @@ namespace search {
         }
         if (alpha >= beta) {
           // Reward the quiet cut-off move; penalise the quiets tried before it (history malus).
-          update_heuristics(Us, ply, m, depth, quiets_tried, nq);
+          update_heuristics(p, Us, ply, m, depth, quiets_tried, nq);
           break;
         }
       }
@@ -643,7 +696,8 @@ namespace search {
         pick(moves, scores, i, n);
         if (aborted())
           return r; // helper thread is stopping; result is discarded, don't store
-        Move m = moves[i];
+        Move m          = moves[i];
+        t_move_stack[0] = piece_to_index(p.at(m.from()), m.to()); // root move: continuation context for ply 1
         p.play<Us>(m);
         ++r.nodes;
 
@@ -666,7 +720,7 @@ namespace search {
           }
         }
         if (alpha >= beta) {
-          update_heuristics(Us, 0, m, depth, nullptr, 0); // root fail-high: no malus (aspiration artifact)
+          update_heuristics(p, Us, 0, m, depth, nullptr, 0); // root fail-high: no malus (aspiration artifact)
           break; // fail-high: the caller re-searches with a wider window
         }
       }
