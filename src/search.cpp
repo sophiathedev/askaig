@@ -562,6 +562,9 @@ namespace search {
             reduction = LMR_TABLE[depth < 63 ? depth : 63][i < 63 ? i : 63];
             if (is_pv)
               --reduction;
+            // History-informed adjustment: quiets with a strong (signed) history record are reduced
+            // less, persistent fail-lows more.
+            reduction -= std::clamp(t_history[Us][m.from()][m.to()] / 8'192, -2, 2);
             reduction = std::clamp(reduction, 0, nd);
           }
           // PVS scout at the (possibly reduced) depth with a null window.
