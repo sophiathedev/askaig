@@ -71,6 +71,10 @@ namespace eval {
     constexpr int KING_ATT_SCALE[8]             = {0, 0, 50, 75, 88, 94, 97, 99}; // % by attacker count
     constexpr int KING_ATT_UNIT                 = 7; // cp per weighted unit (after the % scale)
 
+    // Tempo: a small bonus for simply being the side to move (the mover usually has the option to
+    // improve their position). Also damps eval oscillation between plies. Starting values for SPRT.
+    constexpr Score TEMPO = {18, 10};
+
     [[gnu::const, gnu::always_inline]] inline int taper(Score s, int phase) noexcept {
       return (s.mg * phase + s.eg * (psqt::PHASE_MAX - phase)) / psqt::PHASE_MAX;
     }
@@ -436,7 +440,8 @@ namespace eval {
     s += pin_penalty(pos);
     s += piece_bonuses(pos, phase);
 
-    return pos.turn() == WHITE ? s : -s;
+    // White-perspective score flipped to the side to move, plus the tempo bonus for that side.
+    return (pos.turn() == WHITE ? s : -s) + taper(TEMPO, phase);
   }
 
 } // namespace eval
