@@ -55,7 +55,7 @@ namespace search {
     std::chrono::steady_clock::time_point g_soft_start; // when the soft budget started counting
     int64_t                               g_soft_ms = 0; // base soft budget (ms), scaled per iteration
     std::atomic<bool>                     g_ponder{false}; // searching on the opponent's time
-    constexpr uint64_t                    TIME_CHECK_MASK = 2047; // poll the clock every 2048 nodes
+    constexpr int                         TIME_CHECK_INTERVAL = 2048; // poll the clock every N nodes
 
     // Arms the time control relative to `from`: a hard deadline `from + hard_ms` (the safety cut-off,
     // enforced in negamax) and a soft budget `g_soft_ms` counted from `from` (the main thread scales
@@ -100,6 +100,24 @@ namespace search {
     // Selective depth: the deepest ply any line reached this iteration (including quiescence). Reset
     // once per iteration in aspiration_search and reported on each "info" line as "seldepth".
     thread_local int t_seldepth = 0;
+
+    // Per-thread node countdown to the next clock poll. A plain `nodes & MASK == 0` test is unsafe:
+    // quiescence makes the node counter jump in big strides, so a negamax entry rarely lands exactly
+    // on a multiple and the clock can go unread for a very long time (a search that ignores its time
+    // limit). Counting down one-per-node fires every TIME_CHECK_INTERVAL nodes regardless of strides.
+    // Checked in BOTH negamax and quiescence so a big capture subtree is still interruptible.
+    thread_local int t_time_count = 0;
+
+    // Decrement the countdown; every TIME_CHECK_INTERVAL nodes, read the clock and set the global
+    // stop if the hard deadline passed. Returns true if the search should abort now (stop or time up).
+    [[gnu::hot, gnu::always_inline]] inline bool stop_or_time_up() noexcept {
+      if (--t_time_count <= 0) {
+        t_time_count = TIME_CHECK_INTERVAL;
+        if (time_up())
+          g_stop.store(true, std::memory_order_relaxed);
+      }
+      return aborted();
+    }
 
     // Records `m` followed by the child's PV as the PV at `ply`.
     [[gnu::always_inline]] inline void update_pv(int ply, Move m) noexcept {
@@ -207,6 +225,8 @@ namespace search {
     // position is "quiet", so the static eval is not taken mid-capture-sequence (horizon effect).
     template<Color Us>
     [[gnu::hot]] int quiescence(Position &p, int alpha, int beta, uint64_t &nodes, int ply) {
+      if (stop_or_time_up())
+        return alpha; // stop / time up: the value is discarded (whole iteration thrown away)
       if (ply > t_seldepth)
         t_seldepth = ply; // quiescence reaches beyond the nominal depth -> it sets the selective depth
       int stand_pat = eval::evaluate(p);
@@ -269,10 +289,8 @@ namespace search {
     template<Color Us>
     [[gnu::hot]] int negamax(Position &p, int depth, int ply, int alpha, int beta, uint64_t &nodes, bool null_ok,
                              Square recap_sq = NO_SQUARE, Move excluded = Move{}) {
-      if ((nodes & TIME_CHECK_MASK) == 0 && time_up())
-        g_stop.store(true, std::memory_order_relaxed); // hard deadline hit -> abort via the stop path
-      if (aborted())
-        return 0; // stop requested / time up: value is discarded, last completed depth is kept
+      if (stop_or_time_up())
+        return 0; // stop requested / hard deadline hit: value is discarded, last completed depth kept
       if (ply > t_seldepth)
         t_seldepth = ply; // track the deepest ply reached, for the reported selective depth
       if (ply >= MAX_PLY)
@@ -547,6 +565,10 @@ namespace search {
       while (true) {
         Result r = search_to_depth(p, depth, alpha, beta);
         nodes += r.nodes;
+        if (aborted()) { // stop/time-up: the result is incomplete (search_root may return -INF), so
+          r.nodes = nodes; // don't widen on it (that would spin forever) — hand it back; the caller discards it
+          return r;
+        }
         if (r.score <= alpha) // fail low: widen the lower bound
           alpha = std::max(r.score - delta, -INF);
         else if (r.score >= beta) // fail high: widen the upper bound

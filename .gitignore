@@ -2,3 +2,12 @@ CLAUDE.md
 cmake-build-debug/
 cmake-build-release/
 .idea/
+
+# SPRT harness: the (optional) built match runner, the downloaded book, and per-run build/PGN
+# artifacts. The scripts (tools/*.sh, tools/README.md) are committed; what they fetch/build is not.
+tools/fastchess-src/
+tools/books/
+tools/work/
+
+# fastchess writes this when a tournament is interrupted
+config.json
