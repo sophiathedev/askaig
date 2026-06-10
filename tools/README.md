@@ -46,12 +46,14 @@ them with `fastchess` until the SPRT concludes. It prints a live Elo estimate an
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `TC` | `8+0.08` | time control, `seconds+increment` |
-| `HASH` | `64` | TT size (MB) per engine |
-| `CONCURRENCY` | cores−3 | parallel games |
-| `ELO0`/`ELO1` | `0`/`5` | SPRT hypothesis bounds |
+| `TC` | `5+0.05` | time control, `seconds+increment` |
+| `HASH` | `16` | TT size (MB) per engine |
+| `CONCURRENCY` | P-cores−1 | parallel games |
+| `ELO0`/`ELO1` | `0`/`10` | SPRT hypothesis bounds |
+| `ALPHA`/`BETA` | `0.1`/`0.1` | SPRT error rates |
 | `ROUNDS` | `5000` | max opening-pairs (each played with both colors) |
 | `BOOK` | `UHO_4060_v3.epd` | opening book path |
+| `ADJUDICATE` | `1` | `0` disables draw/resign adjudication (games run to mate/50-move/repetition, ~2x wall-clock) |
 
 Example — a stricter, higher-quality (slower) test:
 
@@ -61,6 +63,11 @@ TC=20+0.2 ELO0=0 ELO1=3 tools/sprt.sh HEAD~1
 
 ## Notes
 
+- **Most games end by adjudication — that is intended.** Draws need BOTH engines reporting
+  |score| ≤ 10cp for 8 straight moves after move 40; resigns need BOTH engines agreeing
+  (`twosided=true`) one side is down ≥ 700cp for 4 straight moves. These are the fishtest/OpenBench
+  thresholds: they only cut games whose outcome is no longer in doubt, roughly halving wall-clock.
+  If a verdict looks suspicious, re-run the test with `ADJUDICATE=0` as a cross-check.
 - Engines run at **`Threads=1`** so each game is reproducible given the opening; variety comes from
   the book (a book is therefore mandatory). Use a longer book / more rounds for more games.
 - Games are written to `tools/work/games.pgn` for inspection.

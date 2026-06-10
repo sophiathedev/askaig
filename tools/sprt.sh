@@ -19,7 +19,7 @@
 #     tools/sprt.sh HEAD~1
 #
 # Tunables via env: TC (5+0.05), HASH (16), CONCURRENCY (P-cores - 1), ELO0/ELO1 (0/10),
-#                   ALPHA/BETA (0.1), ROUNDS (5000), BOOK (UHO_4060_v3.epd).
+#                   ALPHA/BETA (0.1), ROUNDS (5000), BOOK (UHO_4060_v3.epd), ADJUDICATE (1).
 #
 # The defaults are the FAST regime for an engine still gaining tens of Elo per change: bounds
 # [0, 10] need ~3-4x fewer games than [0, 5] for a true gain >= 10, alpha/beta 0.1 another ~1.4x,
@@ -62,6 +62,21 @@ ROUNDS="${ROUNDS:-5000}"
 
 BASE_REF="${1:-HEAD}"
 
+# Adjudication — ends games whose outcome is no longer in doubt (the fishtest/OpenBench standard;
+# with an unbalanced UHO book MOST games end this way, which is the intended time saving, roughly
+# halving the wall-clock per game):
+#   draw:   after move 40, BOTH engines report |score| <= 10cp for 8 consecutive moves
+#   resign: BOTH engines agree (twosided=true) one side is down >= 700cp for 4 consecutive moves.
+#           twosided matters for eval patches: a one-sided resign lets a candidate with a broken
+#           (pessimistic) eval forfeit positions it could still hold, biasing the SPRT against it.
+# ADJUDICATE=0 disables both — games then run to mate / 50-move / repetition (~2x wall-clock);
+# useful as a sanity cross-check if an adjudicated result looks suspicious. The tokens contain no
+# spaces, so the unquoted expansion below splitting into words is exactly what we want.
+ADJ_ARGS=""
+if [ "${ADJUDICATE:-1}" != "0" ]; then
+  ADJ_ARGS="-draw movenumber=40 movecount=8 score=10 -resign movecount=4 score=700 twosided=true"
+fi
+
 WORK="$HERE/work"
 mkdir -p "$WORK"
 
@@ -101,8 +116,7 @@ echo
   -openings file="$BOOK" format=epd order=random \
   -games 2 -rounds "$ROUNDS" -repeat \
   -sprt elo0="$ELO0" elo1="$ELO1" alpha="$ALPHA" beta="$BETA" \
-  -draw movenumber=40 movecount=8 score=10 \
-  -resign movecount=4 score=700 \
+  $ADJ_ARGS \
   -recover \
   -concurrency "$CONCURRENCY" \
   -ratinginterval 20 \
