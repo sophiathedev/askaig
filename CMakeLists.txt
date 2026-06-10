@@ -27,6 +27,7 @@ target_link_libraries(askaig PRIVATE Threads::Threads)
 # SIMD / hardware bit-intrinsics. ARCH auto-detects from the host (override with -DARCH=...).
 option(SIMD "Enable SIMD/hardware bit intrinsics" ON)
 set(ARCH "" CACHE STRING "Target SIMD arch: AVX2 or ARM_NEON (auto-detected when empty)")
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 
 if(SIMD)
     if(ARCH STREQUAL "")
@@ -48,3 +49,7 @@ if(SIMD)
     endif()
     message(STATUS "SIMD enabled, ARCH=${ARCH}")
 endif()
+
+target_compile_options(askaig PRIVATE -flto)
+target_link_options(askaig PRIVATE -flto)
+
