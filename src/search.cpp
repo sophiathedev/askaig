@@ -402,6 +402,14 @@ namespace search {
                              Move excluded = Move{}) {
       if (stop_or_time_up())
         return 0; // stop requested / hard deadline hit: value is discarded, last completed depth kept
+
+      // Clear this node's PV row BEFORE any other return path. A row left over from a previous
+      // sibling line is a line from a DIFFERENT branch: if an early return below (draw, ply cap)
+      // scored above the parent's alpha, the parent's update_pv would memcpy that stale row and the
+      // reported PV would contain moves that are illegal in this line (seen as fastchess "Illegal
+      // PV move" warnings once repetition detection made draw returns frequent in self-play).
+      t_pv_len[ply] = 0;
+
       if (ply > t_seldepth)
         t_seldepth = ply; // track the deepest ply reached, for the reported selective depth
       if (ply >= MAX_PLY || p.ply() >= Position::MAX_HISTORY - MAX_PLY)
@@ -416,8 +424,6 @@ namespace search {
       // is what keeps the PV short (an unbounded repetition PV could otherwise flood stdout).
       if (ply > 0 && p.is_draw())
         return 0;
-
-      t_pv_len[ply] = 0; // no PV from here yet (so an early return leaves an empty line)
 
       const uint64_t key        = p.get_hash();
       const int      alpha_orig = alpha;
@@ -586,7 +592,11 @@ namespace search {
           bestMove = m;
           if (best > alpha) {
             alpha = best;
-            update_pv(ply, m); // a new best move at this node -> extend the PV
+            // PV nodes only: null-window searches (PVS scouts, the singular verification — which
+            // runs at the SAME ply as its parent and would scribble over the parent's row) don't
+            // produce lines anyone reports. Reporting-only, so the search itself is unaffected.
+            if (is_pv)
+              update_pv(ply, m); // a new best move at this node -> extend the PV
           }
         }
         if (alpha >= beta) {
