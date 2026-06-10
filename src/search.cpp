@@ -227,6 +227,8 @@ namespace search {
     [[gnu::hot]] int quiescence(Position &p, int alpha, int beta, uint64_t &nodes, int ply) {
       if (stop_or_time_up())
         return alpha; // stop / time up: the value is discarded (whole iteration thrown away)
+      if (p.ply() >= Position::MAX_HISTORY - 2)
+        return eval::evaluate(p); // absolute undo-stack backstop (see Position::MAX_HISTORY)
       if (ply > t_seldepth)
         t_seldepth = ply; // quiescence reaches beyond the nominal depth -> it sets the selective depth
       int stand_pat = eval::evaluate(p);
@@ -293,8 +295,11 @@ namespace search {
         return 0; // stop requested / hard deadline hit: value is discarded, last completed depth kept
       if (ply > t_seldepth)
         t_seldepth = ply; // track the deepest ply reached, for the reported selective depth
-      if (ply >= MAX_PLY)
-        return eval::evaluate(p); // hard ply cap: bound runaway check extensions / deep lines
+      if (ply >= MAX_PLY || p.ply() >= Position::MAX_HISTORY - MAX_PLY)
+        return eval::evaluate(p); // hard cap: bound runaway extensions, and never index history[] OOB
+                                  // (the search stacks its plies onto game_ply; in a very long game
+                                  //  that could otherwise overrun the undo stack — reserve MAX_PLY for
+                                  //  the quiescence that may still run below this node)
 
       // Draw by repetition / fifty-move rule: score it 0 immediately (never at the root, ply 0, where
       // a move must still be returned). This collapses shuffling/perpetual lines instead of searching

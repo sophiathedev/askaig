@@ -92,8 +92,16 @@ private:
   int psqt_eg_score = 0;
 
 public:
+  // Upper bound on the undo stack: it must hold the whole *game* (every ply played via `play`) PLUS
+  // the deepest search line stacked on top (the search makes its moves on the same Position, so it
+  // keeps incrementing game_ply). Surge's original 256 overflowed in long games — a ~250-ply shuffle
+  // plus a 50+-ply search wrote `history[300+]` out of bounds and corrupted memory. 1024 leaves room
+  // for any realistic game (an arbiter adjudicates long before) plus the full search/quiescence depth;
+  // the search also guards game_ply against this bound so it can never index past the array.
+  static constexpr int MAX_HISTORY = 1024;
+
   // The history of non-recoverable information
-  UndoInfo history[256];
+  UndoInfo history[MAX_HISTORY];
 
   // The bitboard of enemy pieces that are currently attacking the king, updated whenever generate_moves()
   // is called
