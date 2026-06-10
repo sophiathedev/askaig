@@ -41,7 +41,13 @@ BOOK="${BOOK:-$HERE/books/UHO_4060_v3.epd}"
 TC="${TC:-8+0.08}"
 HASH="${HASH:-64}"
 CORES="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
-CONCURRENCY="${CONCURRENCY:-$(( CORES > 4 ? CORES - 3 : 1 ))}"
+# Only "real" cores run a search at full speed; on Apple Silicon the efficiency cores are far slower.
+# Oversubscribing them starves fastchess itself — it then misses an engine's reply within its timeout
+# and aborts the whole match ("stalled / disconnected"), even though the engine answered fine. So base
+# concurrency on the *performance* cores (perflevel0 on Apple Silicon; physical cores elsewhere) and
+# leave one free for fastchess + the OS. Override with CONCURRENCY=<n> if you know your machine.
+PCORES="$(sysctl -n hw.perflevel0.logicalcpu 2>/dev/null || sysctl -n hw.physicalcpu 2>/dev/null || echo "$CORES")"
+CONCURRENCY="${CONCURRENCY:-$(( PCORES > 2 ? PCORES - 1 : 1 ))}"
 ELO0="${ELO0:-0}"
 ELO1="${ELO1:-5}"
 ROUNDS="${ROUNDS:-5000}"
@@ -92,6 +98,7 @@ echo
   -sprt elo0="$ELO0" elo1="$ELO1" alpha=0.05 beta=0.05 \
   -draw movenumber=40 movecount=8 score=10 \
   -resign movecount=4 score=700 \
+  -recover \
   -concurrency "$CONCURRENCY" \
   -ratinginterval 20 \
   -pgnout file="$WORK/games.pgn"

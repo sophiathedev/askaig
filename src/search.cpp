@@ -296,6 +296,13 @@ namespace search {
       if (ply >= MAX_PLY)
         return eval::evaluate(p); // hard ply cap: bound runaway check extensions / deep lines
 
+      // Draw by repetition / fifty-move rule: score it 0 immediately (never at the root, ply 0, where
+      // a move must still be returned). This collapses shuffling/perpetual lines instead of searching
+      // them to the depth ceiling — it both plays draws correctly (no repeating in won positions) and
+      // is what keeps the PV short (an unbounded repetition PV could otherwise flood stdout).
+      if (ply > 0 && p.is_draw())
+        return 0;
+
       t_pv_len[ply] = 0; // no PV from here yet (so an early return leaves an empty line)
 
       const uint64_t key        = p.get_hash();

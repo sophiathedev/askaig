@@ -28,6 +28,7 @@ A multi-threaded **(Lazy SMP) iterative-deepening PVS** (negamax + alpha-beta) s
 - **Transposition table** — lockless, power-of-two, depth-preferred replacement, ply-adjusted mate scores (default 2 GiB, resizable via `setoption Hash`).
 - **Move ordering** — TT move → MVV-LVA captures → killer moves → history heuristic.
 - **Quiescence** search at the horizon (capture resolution) with **delta pruning**.
+- **Draw detection** — repetition and the fifty-move rule are scored as draws in the search (via a per-ply hash + halfmove clock), so the engine claims draws when worse and never repeats away a won position.
 - **Pruning** — null-move pruning (with a zugzwang guard), reverse futility / static null move, futility pruning, late move pruning (LMP), **late move reductions (LMR)**, and mate-distance pruning.
 - **Adaptive time management** — clock-based searches scale their per-move budget by best-move stability: more time when the best move keeps changing or the score drops, less when it has settled (banking time for later moves), with a hard cap as a safety net. Also supports `movetime` and pondering.
 - **Extensions** — check, mate-threat, one-reply, recapture, passed-pawn, and **singular** extensions.

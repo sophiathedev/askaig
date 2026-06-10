@@ -114,6 +114,11 @@ void Position::set(const std::string &fen, Position &p) {
 
   if (ep.size() == 2 && ep[0] >= 'a' && ep[0] <= 'h' && ep[1] >= '1' && ep[1] <= '8')
     p.history[p.game_ply].epsq = create_square(File(ep[0] - 'a'), Rank(ep[1] - '1'));
+
+  // Seed the root position's hash (now fully built) for repetition detection; the halfmove clock
+  // starts at zero (the FEN's counter is ignored, so no pre-root reversible history is assumed).
+  p.history[p.game_ply].hash  = p.hash;
+  p.history[p.game_ply].fifty = 0;
 }
 
 

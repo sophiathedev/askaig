@@ -54,10 +54,17 @@ struct UndoInfo {
   // has double pushed on the previous move
   Square epsq;
 
-  constexpr UndoInfo() : entry(0), captured(NO_PIECE), epsq(NO_SQUARE) {}
+  // The Zobrist hash of the position reached AFTER this ply (set by play/play_null/set), so the
+  // search can scan back for repetitions. And the halfmove clock: plies since the last irreversible
+  // move (pawn move / capture / castle / promotion); it bounds the repetition scan and drives the
+  // fifty-move rule. Both are recovered automatically on undo (which just rolls game_ply back).
+  uint64_t hash;
+  int      fifty;
 
-  // This preserves the entry bitboard across moves
-  UndoInfo(const UndoInfo &prev) : entry(prev.entry), captured(NO_PIECE), epsq(NO_SQUARE) {}
+  constexpr UndoInfo() : entry(0), captured(NO_PIECE), epsq(NO_SQUARE), hash(0), fifty(0) {}
+
+  // This preserves the entry bitboard and halfmove clock across moves (play() overrides hash/fifty).
+  UndoInfo(const UndoInfo &prev) : entry(prev.entry), captured(NO_PIECE), epsq(NO_SQUARE), hash(0), fifty(prev.fifty) {}
 };
 
 class Position {
@@ -144,6 +151,22 @@ public:
   [[nodiscard]] inline int      psqt_mg() const { return psqt_mg_score; } // incremental material+PST, MG table
   [[nodiscard]] inline int      psqt_eg() const { return psqt_eg_score; } // incremental material+PST, EG table
 
+  // True if the current position is a draw by repetition or the fifty-move rule. The repetition
+  // scan steps back two plies at a time (same side to move) and is bounded by the halfmove clock:
+  // positions before the last irreversible move (pawn move / capture / castle / promotion) had a
+  // different pawn structure or material and cannot recur. A single earlier occurrence is enough —
+  // in a search line either side can force the threefold, so it is treated as a draw immediately.
+  [[gnu::hot, nodiscard]] inline bool is_draw() const {
+    const int f = history[game_ply].fifty;
+    if (f >= 100)
+      return true; // fifty-move rule (100 halfmoves)
+    const int end = game_ply - f; // nothing before the last irreversible move can match
+    for (int i = game_ply - 4; i >= end && i >= 0; i -= 2)
+      if (history[i].hash == hash)
+        return true;
+    return false;
+  }
+
   template<Color C>
   [[nodiscard]] inline Bitboard diagonal_sliders() const;
   template<Color C>
@@ -169,7 +192,9 @@ public:
     side_to_play = ~side_to_play;
     hash ^= zobrist::zobrist_side;
     ++game_ply;
-    history[game_ply] = UndoInfo(history[game_ply - 1]); // preserves castling rights, clears epsq
+    history[game_ply]       = UndoInfo(history[game_ply - 1]); // preserves castling rights, clears epsq
+    history[game_ply].hash  = hash;
+    history[game_ply].fifty = history[game_ply - 1].fifty + 1; // a pass changes nothing irreversibly
   }
   inline void undo_null() {
     side_to_play = ~side_to_play;
@@ -346,6 +371,12 @@ template<Color C>
 
       break;
   }
+
+  // Record this position's hash for repetition detection, and advance the halfmove clock — reset to
+  // zero on an irreversible move (any non-quiet flag, or a quiet pawn push), else +1. `type != QUIET`
+  // short-circuits, so board[m.to()] (the moved/promoted/capturing piece) is only read for quiets.
+  history[game_ply].hash  = hash;
+  history[game_ply].fifty = (type != QUIET || type_of(board[m.to()]) == PAWN) ? 0 : history[game_ply - 1].fifty + 1;
 }
 
 // Undos a move in the current position, rolling it back to the previous position
