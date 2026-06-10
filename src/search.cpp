@@ -231,6 +231,88 @@ namespace search {
       return t_history[pos.turn()][m.from()][m.to()];
     }
 
+    // --- Static exchange evaluation (SEE) ---------------------------------------------------
+    // Piece values for the exchange swap (psqt::VALUE, except the king: it must never be counted
+    // as winnable material, so it gets a sentinel no exchange sequence can profit from).
+    constexpr int SEE_VALUE[NPIECE_TYPES] = {psqt::VALUE[PAWN], psqt::VALUE[KNIGHT], psqt::VALUE[BISHOP],
+                                             psqt::VALUE[ROOK], psqt::VALUE[QUEEN],  20000};
+
+    // True if the exchange sequence started by the capture `m` wins at least `threshold` cp for the
+    // mover, assuming both sides keep capturing on m.to() with their least valuable attacker (the
+    // classic swap algorithm). X-ray attackers are revealed as pieces are removed from `occ` (the
+    // static `diag`/`orth` masks may re-add an already-used slider, but `attackers &= occ` at the
+    // top of each round filters it before use). The king may only "recapture" if the opponent has
+    // no attacker left to answer. Non-plain captures (en passant, promotions — material swings the
+    // plain swap doesn't model) and quiets are treated optimistically (never reported as losing).
+    [[gnu::hot]] bool see_ge(const Position &p, Move m, int threshold) noexcept {
+      if (m.flags() != CAPTURE)
+        return 0 >= threshold;
+      const Square from = m.from();
+      const Square to   = m.to();
+
+      int swap = SEE_VALUE[type_of(p.at(to))] - threshold;
+      if (swap < 0)
+        return false; // taking the victim even for free is below the threshold
+      swap = SEE_VALUE[type_of(p.at(from))] - swap;
+      if (swap <= 0)
+        return true; // losing the capturing piece outright still meets the threshold
+
+      const Bitboard diag  = p.bitboard_of(WHITE, BISHOP) | p.bitboard_of(BLACK, BISHOP) | p.bitboard_of(WHITE, QUEEN) |
+                             p.bitboard_of(BLACK, QUEEN);
+      const Bitboard orth  = p.bitboard_of(WHITE, ROOK) | p.bitboard_of(BLACK, ROOK) | p.bitboard_of(WHITE, QUEEN) |
+                             p.bitboard_of(BLACK, QUEEN);
+      const Bitboard kings = p.bitboard_of(WHITE, KING) | p.bitboard_of(BLACK, KING);
+      const Bitboard side_bb[NCOLORS] = {p.all_pieces<WHITE>(), p.all_pieces<BLACK>()};
+
+      // The mover leaves `from` and stands on `to` (replacing the victim); it is deliberately NOT
+      // in `occ` — a piece on the contested square cannot block sliders aimed at that square.
+      Bitboard occ = (side_bb[WHITE] | side_bb[BLACK]) ^ SQUARE_BB[from] ^ SQUARE_BB[to];
+      Color    stm = color_of(p.at(from));
+      // attackers_from omits kings (it serves in_check, where a king never gives check) -> OR them.
+      Bitboard attackers =
+              p.attackers_from<WHITE>(to, occ) | p.attackers_from<BLACK>(to, occ) | (attacks<KING>(to, occ) & kings);
+
+      int res = 1; // 1 = the ORIGINAL mover is winning the exchange so far (flips each round)
+      while (true) {
+        stm = ~stm;
+        attackers &= occ; // drop used attackers (and any stale x-ray re-adds from last round)
+        const Bitboard mine = attackers & side_bb[stm];
+        if (!mine)
+          break; // no attacker left: the side to move loses the race
+        res ^= 1;
+        Bitboard bb;
+        if ((bb = mine & (p.bitboard_of(WHITE, PAWN) | p.bitboard_of(BLACK, PAWN)))) {
+          if ((swap = SEE_VALUE[PAWN] - swap) < res)
+            break;
+          occ ^= SQUARE_BB[bsf(bb)];
+          attackers |= attacks<BISHOP>(to, occ) & diag; // a pawn leaving may reveal a diagonal x-ray
+        } else if ((bb = mine & (p.bitboard_of(WHITE, KNIGHT) | p.bitboard_of(BLACK, KNIGHT)))) {
+          if ((swap = SEE_VALUE[KNIGHT] - swap) < res)
+            break;
+          occ ^= SQUARE_BB[bsf(bb)]; // knights reveal no x-rays
+        } else if ((bb = mine & (p.bitboard_of(WHITE, BISHOP) | p.bitboard_of(BLACK, BISHOP)))) {
+          if ((swap = SEE_VALUE[BISHOP] - swap) < res)
+            break;
+          occ ^= SQUARE_BB[bsf(bb)];
+          attackers |= attacks<BISHOP>(to, occ) & diag;
+        } else if ((bb = mine & (p.bitboard_of(WHITE, ROOK) | p.bitboard_of(BLACK, ROOK)))) {
+          if ((swap = SEE_VALUE[ROOK] - swap) < res)
+            break;
+          occ ^= SQUARE_BB[bsf(bb)];
+          attackers |= attacks<ROOK>(to, occ) & orth;
+        } else if ((bb = mine & (p.bitboard_of(WHITE, QUEEN) | p.bitboard_of(BLACK, QUEEN)))) {
+          if ((swap = SEE_VALUE[QUEEN] - swap) < res)
+            break;
+          occ ^= SQUARE_BB[bsf(bb)];
+          attackers |= (attacks<BISHOP>(to, occ) & diag) | (attacks<ROOK>(to, occ) & orth);
+        } else {
+          // King: it may only recapture if the opponent has no attacker waiting behind it.
+          return (attackers & ~side_bb[stm]) ? (res ^ 1) != 0 : res != 0;
+        }
+      }
+      return res != 0;
+    }
+
     // Selection-sort step: bring the highest-scoring entry in [i, n) to index i. Done lazily inside
     // the move loop so that, on a cut-off, only the moves actually tried are ever sorted.
     [[gnu::hot]] void pick(Move *moves, int *scores, int i, int n) noexcept {
@@ -283,6 +365,10 @@ namespace search {
           const Piece victim = p.at(m.to()); // NO_PIECE for en passant -> the victim is a pawn
           const int   gain   = victim == NO_PIECE ? psqt::VALUE[PAWN] : psqt::VALUE[type_of(victim)];
           if (stand_pat + gain + DELTA_MARGIN <= alpha)
+            continue;
+          // SEE pruning: a capture that loses material in the full exchange sequence cannot rescue
+          // the stand-pat (resolving captures is the only job here — losing ones don't resolve up).
+          if (!see_ge(p, m, 0))
             continue;
         }
 
