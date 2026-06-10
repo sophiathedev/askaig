@@ -26,12 +26,12 @@ A multi-threaded **(Lazy SMP) iterative-deepening PVS** (negamax + alpha-beta) s
 - **Aspiration windows** around the previous iteration's score.
 - **Principal Variation Search** (full window on the first move, null-window scout on the rest).
 - **Transposition table** — lockless, power-of-two, depth-preferred replacement, ply-adjusted mate scores (default 2 GiB, resizable via `setoption Hash`).
-- **Move ordering** — TT move → MVV-LVA captures → killer moves → history heuristic.
+- **Move ordering** — TT move → MVV-LVA captures → killer moves → **signed history** (gravity bonus on quiet cut-offs, malus for the quiets refuted before them).
 - **Quiescence** search at the horizon (capture resolution) with **delta pruning**.
 - **Draw detection** — repetition and the fifty-move rule are scored as draws in the search (via a per-ply hash + halfmove clock), so the engine claims draws when worse and never repeats away a won position.
-- **Pruning** — null-move pruning (with a zugzwang guard), reverse futility / static null move, futility pruning, late move pruning (LMP), **late move reductions (LMR)**, and mate-distance pruning.
+- **Pruning** — null-move pruning (with a zugzwang guard), reverse futility / static null move, futility pruning, late move pruning (LMP), **log-table late move reductions (LMR)** adjusted by the signed history score, **SEE pruning of losing captures** in quiescence, and mate-distance pruning.
 - **Adaptive time management** — clock-based searches scale their per-move budget by best-move stability: more time when the best move keeps changing or the score drops, less when it has settled (banking time for later moves), with a hard cap as a safety net. Also supports `movetime` and pondering.
-- **Extensions** — check, mate-threat, one-reply, recapture, passed-pawn, and **singular** extensions.
+- **Extensions** — check, mate-threat, one-reply, passed-pawn, and **singular** extensions.
 - The exact **principal variation** is collected via a triangular PV table and reported on each `info` line.
 
 Together these cut the searched node count by **~95%+** on quiet positions versus plain alpha-beta, letting the engine reach much greater depth in the same time. With `Threads 1` the search is fully deterministic.
