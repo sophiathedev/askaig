@@ -364,29 +364,18 @@ namespace eval {
       return mob + thr;
     }
 
-    // Per-thread cache of the static evaluation, keyed by the full Zobrist hash. The evaluation is
-    // a pure function of the position, so entries never go stale and need no clearing; collisions
-    // are resolved by the full-key check. thread_local => no locking under Lazy SMP.
-    constexpr size_t EVAL_CACHE_SIZE = 1U << 17; // 131072 entries (~2 MiB per thread)
-    constexpr size_t EVAL_CACHE_MASK = EVAL_CACHE_SIZE - 1;
-    struct EvalEntry {
-      uint64_t key;
-      int      eval;
-    };
-    thread_local EvalEntry eval_cache[EVAL_CACHE_SIZE];
-
   } // namespace
 
   [[gnu::pure]] bool is_passed_pawn(const Position &pos, Color c, Square sq) noexcept {
     return !(pos.bitboard_of(~c, PAWN) & PM.passed[c][sq]);
   }
 
+  // A full static evaluation. NOTE: there used to be a thread_local Zobrist-keyed cache of this whole
+  // result, but with the incremental material+PST and the (now single-pass) attack maps the eval is
+  // cheap enough that the 2 MiB/thread cache cost more (CPU-cache pressure + per-call lookup/store)
+  // than its ~5% hit rate saved — removing it measured +6-8% nps with identical node counts. So the
+  // eval is recomputed every call.
   [[gnu::hot]] int evaluate(const Position &pos) noexcept {
-    const uint64_t key = pos.get_hash();
-    EvalEntry     &e   = eval_cache[key & EVAL_CACHE_MASK];
-    if (e.key == key)
-      return e.eval; // cache hit
-
     // Taper the (incremental) material + piece-square score between the middlegame and endgame
     // tables by the game phase (full board -> middlegame, few pieces -> endgame).
     int phase = pop_count(pos.bitboard_of(WHITE, KNIGHT) | pos.bitboard_of(BLACK, KNIGHT)) +
@@ -403,10 +392,7 @@ namespace eval {
     s += pin_penalty(pos);
     s += piece_bonuses(pos, phase);
 
-    const int result = pos.turn() == WHITE ? s : -s;
-    e.key            = key;
-    e.eval           = result;
-    return result;
+    return pos.turn() == WHITE ? s : -s;
   }
 
 } // namespace eval
