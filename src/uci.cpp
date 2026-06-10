@@ -457,6 +457,7 @@ void uci::loop() {
       pos.emplace();
       Position::set(DEFAULT_FEN, *pos);
       tt::clear();
+      search::new_game(); // the move-ordering statistics persist across "go"s, but not across games
     } else if (cmd == "position") {
       stop_search();
       position_cmd(pos, is);

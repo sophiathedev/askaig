@@ -52,6 +52,10 @@ namespace search {
   // call from another thread; cleared automatically at the start of the next `think()`.
   void request_stop();
 
+  // Clears the per-thread move-ordering statistics (killers/history/continuation history), which
+  // otherwise persist from move to move within a game. Call on "ucinewgame", never mid-search.
+  void new_game();
+
   // The UCI "ponderhit": the predicted move was actually played, so a pondering `think()` should
   // leave ponder mode and start enforcing the time control (`soft_ms`/`hard_ms`) from now. Safe to
   // call from another thread; a no-op if the search is not pondering.

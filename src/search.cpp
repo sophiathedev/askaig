@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -99,23 +100,37 @@ namespace search {
 
     bool aborted() noexcept { return t_stop != nullptr && t_stop->load(std::memory_order_relaxed); }
 
-    // Per-thread move-ordering heuristics (Lazy-SMP threads keep their own, so no locking):
+    // Per-thread move-ordering heuristics (each Lazy-SMP thread has its own slot, so no locking):
     //  - killers: quiet moves that caused a beta cut-off at a given ply in a sibling node
     //  - history: how often a quiet (color, from, to) move has caused a cut-off
-    thread_local Move t_killers[MAX_PLY][2];
-    thread_local int  t_history[NCOLORS][NSQUARES][NSQUARES];
+    //  - cont:    continuation history — quiet-move history conditioned on a PREVIOUS move of the
+    //             current line. cont[0] is keyed by the move 1 ply back (countermove history:
+    //             "after they played that, this reply cuts"), cont[1] by our own move 2 plies back
+    //             (follow-up history). Both moves are flattened to a (piece, to-square) index —
+    //             piece identity matters more than the from-square (the standard formulation), and
+    //             the piece encodes its color, so colors never collide. int16_t (own cap CONT_MAX)
+    //             halves the table's cache footprint vs int — ~3.5 MiB per thread.
+    //
+    // The slots are PERSISTENT across searches and live in g_heur, NOT in thread_locals: uci.cpp
+    // spawns a fresh thread per "go", so a thread_local table would start empty every move — at a
+    // fast time control a single ~100ms search is far too short to accumulate statistics (the
+    // sparse continuation tables especially would be read almost entirely as zeros while their
+    // cache cost is paid on every quiet scored). Instead the tables carry over from move to move
+    // within a game — the gravity update self-ages stale entries — and are cleared only by
+    // new_game() ("ucinewgame"). Slots are allocated in think() BEFORE any helper spawns (the
+    // vector never grows while threads run); each search thread then points t_heur at its slot.
+    constexpr int CONT_PLIES = 2; // 1 ply back (countermove) and 2 plies back (follow-up)
+    constexpr int NPIECE_TO  = static_cast<int>(NPIECES) * static_cast<int>(NSQUARES);
+    constexpr int CONT_MAX   = 30'000; // gravity cap for the int16_t continuation entries
 
-    // Continuation history: quiet-move history conditioned on a PREVIOUS move of the current line.
-    // t_cont_hist[0] is keyed by the move 1 ply back (countermove history: "after they played that,
-    // this reply cuts"), t_cont_hist[1] by our own move 2 plies back (follow-up history). Both moves
-    // are flattened to a (piece, to-square) index — piece identity matters more than the from-square
-    // (the standard formulation). Updated with the same gravity formula and bonus/malus as t_history
-    // and added into the quiet ordering score and the LMR history adjustment. Color needs no separate
-    // axis: the conditioning piece's color implies it. -1 in the line stack means "no conditioning
-    // move" (root, or a null move — passing carries no piece/square to condition on).
-    constexpr int    CONT_PLIES = 2; // 1 ply back (countermove) and 2 plies back (follow-up)
-    constexpr int    NPIECE_TO  = static_cast<int>(NPIECES) * static_cast<int>(NSQUARES);
-    thread_local int t_cont_hist[CONT_PLIES][NPIECE_TO][NPIECE_TO];
+    struct Heuristics {
+      Move    killers[MAX_PLY][2];
+      int     history[NCOLORS][NSQUARES][NSQUARES];
+      int16_t cont[CONT_PLIES][NPIECE_TO][NPIECE_TO];
+    };
+    std::vector<std::unique_ptr<Heuristics>> g_heur; // slot per thread index, persists across searches
+    thread_local Heuristics                 *t_heur = nullptr; // this thread's slot, set per search
+
     thread_local int t_move_stack[MAX_PLY + 1]; // (piece,to) played at each ply of the current line
 
     // Flattened (piece, to-square) index of a move; must be taken BEFORE the move is played (the
@@ -127,11 +142,11 @@ namespace search {
     // Combined quiet-move statistic: butterfly history plus the continuation histories against the
     // moves 1 and 2 plies back. `pt_idx` is piece_to_index() of the move being scored.
     [[gnu::hot]] inline int quiet_stat(Color c, Move m, int pt_idx, int ply) noexcept {
-      int s = t_history[c][m.from()][m.to()];
+      int s = t_heur->history[c][m.from()][m.to()];
       if (ply >= 1 && t_move_stack[ply - 1] >= 0)
-        s += t_cont_hist[0][t_move_stack[ply - 1]][pt_idx];
+        s += t_heur->cont[0][t_move_stack[ply - 1]][pt_idx];
       if (ply >= 2 && t_move_stack[ply - 2] >= 0)
-        s += t_cont_hist[1][t_move_stack[ply - 2]][pt_idx];
+        s += t_heur->cont[1][t_move_stack[ply - 2]][pt_idx];
       return s;
     }
 
@@ -170,13 +185,6 @@ namespace search {
       t_pv_len[ply] = t_pv_len[ply + 1] + 1;
     }
 
-    void clear_heuristics() noexcept {
-      std::memset(static_cast<void *>(t_killers), 0, sizeof(t_killers));
-      std::memset(t_history, 0, sizeof(t_history));
-      std::memset(t_cont_hist, 0, sizeof(t_cont_hist));
-      std::memset(t_move_stack, 0, sizeof(t_move_stack));
-    }
-
     // A quiet move is a non-capture, non-promotion move (only these use killer/history ordering).
     [[gnu::const]] bool is_quiet(Move m) noexcept {
       if (m.is_capture())
@@ -191,6 +199,11 @@ namespace search {
     [[gnu::always_inline]] inline void history_update(int &h, int bonus) noexcept {
       h += bonus - h * (bonus < 0 ? -bonus : bonus) / HISTORY_MAX;
     }
+    // Same gravity formula for the int16_t continuation entries (own cap CONT_MAX; the arithmetic
+    // promotes to int, and the result is bounded by ±CONT_MAX so it always fits back).
+    [[gnu::always_inline]] inline void cont_update(int16_t &h, int bonus) noexcept {
+      h = static_cast<int16_t>(h + bonus - h * (bonus < 0 ? -bonus : bonus) / CONT_MAX);
+    }
 
     // On a beta cut-off by a quiet move: store it as a killer for this ply, reward its history by
     // ~depth^2 — and penalise (malus) the quiet moves ALREADY TRIED at this node that failed to cut
@@ -202,20 +215,20 @@ namespace search {
                            int n_tried) noexcept {
       if (!is_quiet(m))
         return;
-      if (ply < MAX_PLY && !(m == t_killers[ply][0])) {
-        t_killers[ply][1] = t_killers[ply][0];
-        t_killers[ply][0] = m;
+      if (ply < MAX_PLY && !(m == t_heur->killers[ply][0])) {
+        t_heur->killers[ply][1] = t_heur->killers[ply][0];
+        t_heur->killers[ply][0] = m;
       }
       const int  bonus = depth * depth;
       const int  prev1 = ply >= 1 ? t_move_stack[ply - 1] : -1;
       const int  prev2 = ply >= 2 ? t_move_stack[ply - 2] : -1;
       const auto bump  = [&](Move q, int b) noexcept {
-        history_update(t_history[c][q.from()][q.to()], b);
+        history_update(t_heur->history[c][q.from()][q.to()], b);
         const int idx = piece_to_index(p.at(q.from()), q.to());
         if (prev1 >= 0)
-          history_update(t_cont_hist[0][prev1][idx], b);
+          cont_update(t_heur->cont[0][prev1][idx], b);
         if (prev2 >= 0)
-          history_update(t_cont_hist[1][prev2][idx], b);
+          cont_update(t_heur->cont[1][prev2][idx], b);
       };
       bump(m, bonus);
       for (int j = 0; j < n_tried; ++j)
@@ -269,9 +282,9 @@ namespace search {
       // Quiet move: killers for this ply, then the combined history statistic (butterfly +
       // continuation). Its magnitude is bounded by 3*HISTORY_MAX = 300'000, safely below the killers.
       if (ply < MAX_PLY) {
-        if (m == t_killers[ply][0])
+        if (m == t_heur->killers[ply][0])
           return KILLER1_SCORE;
-        if (m == t_killers[ply][1])
+        if (m == t_heur->killers[ply][1])
           return KILLER2_SCORE;
       }
       return quiet_stat(pos.turn(), m, piece_to_index(pos.at(m.from()), m.to()), ply);
@@ -620,10 +633,12 @@ namespace search {
             reduction = LMR_TABLE[depth < 63 ? depth : 63][i < 63 ? i : 63];
             if (is_pv)
               --reduction;
-            // History-informed adjustment: quiets with a strong (signed) record are reduced less,
-            // persistent fail-lows more. Uses the combined statistic (butterfly + continuation,
-            // range ±3*HISTORY_MAX) — hence the divisor is scaled up from the butterfly-only 8'192.
-            reduction -= std::clamp(quiet_stat(Us, m, pt_idx, ply) / 16'384, -2, 2);
+            // History-informed adjustment: quiets with a strong (signed) history record are reduced
+            // less, persistent fail-lows more. Deliberately the butterfly history ONLY: feeding the
+            // combined stat (with a rescaled divisor) in here was SPRT-tested together with the
+            // continuation-history ordering and trended ~-30 Elo — early in a search the sparse
+            // continuation tables dilute a proven signal. Re-couple only with SPRT evidence.
+            reduction -= std::clamp(t_heur->history[Us][m.from()][m.to()] / 8'192, -2, 2);
             reduction = std::clamp(reduction, 0, nd);
           }
           // PVS scout at the (possibly reduced) depth with a null window.
@@ -811,6 +826,14 @@ namespace search {
 
   void request_stop() { g_stop.store(true, std::memory_order_relaxed); }
 
+  void new_game() {
+    // Forget the previous game's move-ordering statistics (the tables persist across "go"s within
+    // a game — see Heuristics). Called from "ucinewgame", i.e. never while a search runs.
+    for (auto &h: g_heur)
+      if (h)
+        std::memset(static_cast<void *>(h.get()), 0, sizeof(Heuristics));
+  }
+
   void request_ponderhit(int64_t soft_ms, int64_t hard_ms) {
     // The predicted move was actually played, so our clock starts now: arm the time control relative
     // to this moment and leave ponder mode. The in-progress search then runs as a normal timed one.
@@ -842,6 +865,16 @@ namespace search {
     } else
       arm_time(t0, soft_ms, hard_ms);
 
+    // Persistent per-thread heuristics: make sure a slot exists for every thread index. Done before
+    // any helper spawns (and "go" is serialised by uci.cpp), so the vector never grows while a
+    // search thread might read it. The tables deliberately carry over from the previous searches of
+    // this game; new_game() ("ucinewgame") is what clears them.
+    if (g_heur.size() < static_cast<size_t>(threads))
+      g_heur.resize(static_cast<size_t>(threads));
+    for (int t = 0; t < threads; ++t)
+      if (!g_heur[static_cast<size_t>(t)])
+        g_heur[static_cast<size_t>(t)] = std::make_unique<Heuristics>(); // value-init -> zeroed
+
     // Lazy SMP: helper threads search the same root on their own board copies, all sharing the
     // (lockless) transposition table. Their work fills the TT, giving the main thread extra
     // cut-offs. Every thread aborts when g_stop is set.
@@ -851,6 +884,7 @@ namespace search {
     for (int t = 1; t < threads; ++t)
       helpers.emplace_back([&pos, max_depth, t, &total_nodes]() {
         t_stop          = &g_stop; // abort promptly when a stop is requested
+        t_heur          = g_heur[static_cast<size_t>(t)].get(); // this thread's persistent slot
         Position  local = clone(pos);
         const int start = 1 + (t % 2); // stagger start depth so helpers don't march in lockstep
         while (!g_stop.load(std::memory_order_relaxed))
@@ -858,10 +892,9 @@ namespace search {
             total_nodes.fetch_add(search_to_depth(local, d, -INF, INF).nodes, std::memory_order_relaxed);
       });
 
-    // Main thread: iterative deepening, reporting each completed depth. (Helper threads are freshly
-    // spawned, so their thread_local killer/history tables are already zero-initialised.)
-    t_stop = &g_stop; // the main search thread is interruptible too
-    clear_heuristics();
+    // Main thread: iterative deepening, reporting each completed depth.
+    t_stop              = &g_stop; // the main search thread is interruptible too
+    t_heur              = g_heur[0].get();
     Position main_pos   = clone(pos);
     int      prev_score = 0;
     Result   best{};
