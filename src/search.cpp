@@ -153,19 +153,29 @@ namespace search {
       return !(f >= PR_KNIGHT && f <= PR_QUEEN);
     }
 
-    // On a beta cut-off by a quiet move, reward it: store it as a killer for this ply and bump its
-    // history score by depth^2 (capped, so it stays below the killer/capture tiers).
-    void update_heuristics(Color c, int ply, Move m, int depth) noexcept {
+    // History "gravity" update: pull the score toward +/-HISTORY_MAX in proportion to how far it
+    // still is from that bound. Self-limiting (|h| can never exceed HISTORY_MAX, no manual cap) and
+    // self-aging: a big stale score moves quickly once the evidence turns against it.
+    [[gnu::always_inline]] inline void history_update(int &h, int bonus) noexcept {
+      h += bonus - h * (bonus < 0 ? -bonus : bonus) / HISTORY_MAX;
+    }
+
+    // On a beta cut-off by a quiet move: store it as a killer for this ply, reward its history by
+    // ~depth^2 — and penalise (malus) the quiet moves ALREADY TRIED at this node that failed to cut
+    // (they were refuted where this move wasn't, so they should sort later next time). Only moves
+    // actually searched are punished; quiets skipped by LMP/futility were never refuted.
+    void update_heuristics(Color c, int ply, Move m, int depth, const Move *tried, int n_tried) noexcept {
       if (!is_quiet(m))
         return;
       if (ply < MAX_PLY && !(m == t_killers[ply][0])) {
         t_killers[ply][1] = t_killers[ply][0];
         t_killers[ply][0] = m;
       }
-      int &h = t_history[c][m.from()][m.to()];
-      h += depth * depth;
-      if (h > HISTORY_MAX)
-        h = HISTORY_MAX;
+      const int bonus = depth * depth;
+      history_update(t_history[c][m.from()][m.to()], bonus);
+      for (int j = 0; j < n_tried; ++j)
+        if (!(tried[j] == m))
+          history_update(t_history[c][tried[j].from()][tried[j].to()], -bonus);
     }
 
     // Mate scores are stored in the TT relative to the node (not the root): a forced mate is
@@ -406,6 +416,8 @@ namespace search {
 
       int  best     = -INF;
       Move bestMove = Move{};
+      Move quiets_tried[MAX_MOVES]; // quiets actually searched at this node (for the history malus)
+      int  nq = 0;
       for (int i = 0; i < n; ++i) {
         pick(moves, scores, i, n);
         Move m = moves[i];
@@ -477,6 +489,9 @@ namespace search {
         }
         p.undo<Us>(m);
 
+        if (is_quiet(m))
+          quiets_tried[nq++] = m; // searched (not pruned away) -> eligible for the malus
+
         if (score > best) {
           best     = score;
           bestMove = m;
@@ -486,7 +501,8 @@ namespace search {
           }
         }
         if (alpha >= beta) {
-          update_heuristics(Us, ply, m, depth); // reward the quiet move that caused the cut-off
+          // Reward the quiet cut-off move; penalise the quiets tried before it (history malus).
+          update_heuristics(Us, ply, m, depth, quiets_tried, nq);
           break;
         }
       }
@@ -551,7 +567,7 @@ namespace search {
           }
         }
         if (alpha >= beta) {
-          update_heuristics(Us, 0, m, depth);
+          update_heuristics(Us, 0, m, depth, nullptr, 0); // root fail-high: no malus (aspiration artifact)
           break; // fail-high: the caller re-searches with a wider window
         }
       }
