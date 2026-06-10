@@ -17,10 +17,16 @@ namespace eval {
     constexpr int ISOLATED_PENALTY = 15;
     // Passed-pawn bonus, indexed by rank of advancement, tapered: passers are worth far more in the
     // endgame (often decisive) than the middlegame (where pieces blockade/round them up).
-    constexpr int PASSED_MG[8]   = {0, 5, 10, 15, 25, 40, 60, 0};
-    constexpr int PASSED_EG[8]   = {0, 15, 25, 40, 65, 100, 150, 0};
-    constexpr int CENTERED_BONUS = 10; // pawn on a central square (d4/e4/d5/e5)
-    constexpr int OUTPOST_BONUS  = 25; // knight on a hole, defended by a pawn, in advanced ranks
+    constexpr int PASSED_MG[8] = {0, 5, 10, 15, 25, 40, 60, 0};
+    constexpr int PASSED_EG[8] = {0, 15, 25, 40, 65, 100, 150, 0};
+    // Passed-pawn refinements: a blockaded passer (any piece on its stop square) keeps only 2/3 of
+    // the bonus, and in the endgame the kings join the race — per square of Chebyshev distance from
+    // the stop square, the ENEMY king being far is worth +5 eg and our own king being far costs -2
+    // eg, weighted by how advanced the passer is (irrelevant for a pawn still at home, decisive on
+    // the 7th). Starting values for SPRT tuning.
+    constexpr int PASSED_KDIST_W[8] = {0, 0, 0, 1, 2, 3, 5, 0}; // by rank of advancement
+    constexpr int CENTERED_BONUS    = 10; // pawn on a central square (d4/e4/d5/e5)
+    constexpr int OUTPOST_BONUS     = 25; // knight on a hole, defended by a pawn, in advanced ranks
 
     // King safety: penalty per missing pawn-shield file and per open/semi-open file by the king,
     // scaled by the opponent's attacking material (KS_MAX_POWER = full middlegame) so it fades out
@@ -119,6 +125,17 @@ namespace eval {
     };
     constexpr PawnMasks PM;
 
+    // Chebyshev (king-move) distance between two squares.
+    [[gnu::const, gnu::always_inline]] inline int cheb(Square a, Square b) noexcept {
+      int df = static_cast<int>(file_of(a)) - static_cast<int>(file_of(b));
+      int dr = static_cast<int>(rank_of(a)) - static_cast<int>(rank_of(b));
+      if (df < 0)
+        df = -df;
+      if (dr < 0)
+        dr = -dr;
+      return df > dr ? df : dr;
+    }
+
     // Evaluates pawn structure (doubled, isolated, passed) from White's perspective. The passed-pawn
     // bonus is tapered by `phase`; the other terms are phase-independent.
     [[gnu::pure, gnu::hot]] int pawn_structure(const Position &pos, int phase) noexcept {
@@ -139,20 +156,36 @@ namespace eval {
           s += ISOLATED_PENALTY * bc;
       }
 
+      // Passed pawns: the rank-scaled base bonus, reduced when the stop square is blocked, with an
+      // endgame king-race adjustment (see PASSED_KDIST_W above).
+      const Bitboard occ = pos.all_pieces<WHITE>() | pos.all_pieces<BLACK>();
+      const Square   wk  = bsf(pos.bitboard_of(WHITE, KING));
+      const Square   bk  = bsf(pos.bitboard_of(BLACK, KING));
+
       Bitboard w = wp;
       while (w) {
         Square sq = pop_lsb(&w);
         if (!(bp & PM.passed[WHITE][sq])) {
-          int r = rank_of(sq);
-          s += taper({PASSED_MG[r], PASSED_EG[r]}, phase);
+          const int    r    = rank_of(sq);
+          const Square stop = sq + NORTH;
+          Score        ps{PASSED_MG[r], PASSED_EG[r]};
+          if (occ & SQUARE_BB[stop])
+            ps.mg = ps.mg * 2 / 3, ps.eg = ps.eg * 2 / 3; // blockaded: it cannot advance
+          ps.eg += (5 * cheb(bk, stop) - 2 * cheb(wk, stop)) * PASSED_KDIST_W[r];
+          s += taper(ps, phase);
         }
       }
       Bitboard b = bp;
       while (b) {
         Square sq = pop_lsb(&b);
         if (!(wp & PM.passed[BLACK][sq])) {
-          int r = 7 - rank_of(sq);
-          s -= taper({PASSED_MG[r], PASSED_EG[r]}, phase);
+          const int    r    = 7 - rank_of(sq);
+          const Square stop = sq + SOUTH;
+          Score        ps{PASSED_MG[r], PASSED_EG[r]};
+          if (occ & SQUARE_BB[stop])
+            ps.mg = ps.mg * 2 / 3, ps.eg = ps.eg * 2 / 3;
+          ps.eg += (5 * cheb(wk, stop) - 2 * cheb(bk, stop)) * PASSED_KDIST_W[r];
+          s -= taper(ps, phase);
         }
       }
 
