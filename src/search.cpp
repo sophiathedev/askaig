@@ -290,7 +290,7 @@ namespace search {
     // fastest mate (and, when losing, drags the mate out as long as possible).
     template<Color Us>
     [[gnu::hot]] int negamax(Position &p, int depth, int ply, int alpha, int beta, uint64_t &nodes, bool null_ok,
-                             Square recap_sq = NO_SQUARE, Move excluded = Move{}) {
+                             Move excluded = Move{}) {
       if (stop_or_time_up())
         return 0; // stop requested / hard deadline hit: value is discarded, last completed depth kept
       if (ply > t_seldepth)
@@ -372,7 +372,7 @@ namespace search {
           has_non_pawn_material(p, Us)) {
         const int R = 2 + depth / 6;
         p.play_null();
-        int score = -negamax<~Us>(p, depth - 1 - R, ply + 1, -beta, -beta + 1, nodes, false, NO_SQUARE, Move{});
+        int score = -negamax<~Us>(p, depth - 1 - R, ply + 1, -beta, -beta + 1, nodes, false, Move{});
         p.undo_null();
         if (score >= beta)
           return beta; // fail-high: prune this node
@@ -411,8 +411,9 @@ namespace search {
             continue;
         }
 
-        // Per-move extension (capped at one ply): node-level (check / mate threat), singular TT
-        // move, or a recapture on the square the previous move captured on.
+        // Per-move extension (capped at one ply): node-level (check / mate threat) or singular TT
+        // move. (A recapture extension was tried and removed: it cost ~+40% nodes while quiescence
+        // and the check extension already cover exchange resolution — SPRT preferred it gone.)
         int ext = node_ext;
         if (!ext && depth >= SINGULAR_MIN_DEPTH && m == ttMove && excluded == Move{} && tt_hit &&
             tte->depth >= depth - 3 && tte->bound != tt::UPPER && ttScore > -(MATE - MAX_MATE_PLY) &&
@@ -421,19 +422,16 @@ namespace search {
           // window just below the TT score. If none reaches it, the TT move is singular -> extend.
           const int sBeta  = ttScore - SINGULAR_MARGIN * depth;
           const int sDepth = (depth - 1) / 2;
-          const int v      = negamax<Us>(p, sDepth, ply, sBeta - 1, sBeta, nodes, false, NO_SQUARE, m);
+          const int v      = negamax<Us>(p, sDepth, ply, sBeta - 1, sBeta, nodes, false, m);
           if (v < sBeta)
             ext = 1;
         }
-        if (!ext && recap_sq != NO_SQUARE && m.is_capture() && m.to() == recap_sq)
-          ext = 1; // recapture on the previous capture square -> resolve the exchange one ply deeper
         if (!ext && type_of(p.at(m.from())) == PAWN &&
             ((Us == WHITE && rank_of(m.to()) == RANK7) || (Us == BLACK && rank_of(m.to()) == RANK2)) &&
             eval::is_passed_pawn(p, Us, m.to()))
           ext = 1; // passed pawn pushed to the 7th rank (one from promotion) -> search deeper
 
-        const int    nd          = depth - 1 + ext;
-        const Square child_recap = m.is_capture() ? m.to() : NO_SQUARE;
+        const int nd = depth - 1 + ext;
 
         p.play<Us>(m);
         ++nodes;
@@ -441,7 +439,7 @@ namespace search {
         int score;
         if (i == 0) {
           // Principal variation: search the (well-ordered) first move with the full window.
-          score = -negamax<~Us>(p, nd, ply + 1, -beta, -alpha, nodes, true, child_recap, Move{});
+          score = -negamax<~Us>(p, nd, ply + 1, -beta, -alpha, nodes, true, Move{});
         } else {
           // Late move reductions: a late, quiet move is unlikely to beat alpha, so scout it at a
           // reduced depth first; only re-search at full depth if that surprises us (beats alpha).
@@ -453,13 +451,13 @@ namespace search {
               reduction = nd;
           }
           // PVS scout at the (possibly reduced) depth with a null window.
-          score = -negamax<~Us>(p, nd - reduction, ply + 1, -alpha - 1, -alpha, nodes, true, child_recap, Move{});
+          score = -negamax<~Us>(p, nd - reduction, ply + 1, -alpha - 1, -alpha, nodes, true, Move{});
           // Reduced scout beat alpha: re-search at full depth (still a null window).
           if (reduction > 0 && score > alpha)
-            score = -negamax<~Us>(p, nd, ply + 1, -alpha - 1, -alpha, nodes, true, child_recap, Move{});
+            score = -negamax<~Us>(p, nd, ply + 1, -alpha - 1, -alpha, nodes, true, Move{});
           // PVS: inside the window -> re-search with the full window.
           if (score > alpha && score < beta)
-            score = -negamax<~Us>(p, nd, ply + 1, -beta, -alpha, nodes, true, child_recap, Move{});
+            score = -negamax<~Us>(p, nd, ply + 1, -beta, -alpha, nodes, true, Move{});
         }
         p.undo<Us>(m);
 
@@ -514,18 +512,17 @@ namespace search {
         pick(moves, scores, i, n);
         if (aborted())
           return r; // helper thread is stopping; result is discarded, don't store
-        Move         m           = moves[i];
-        const Square child_recap = m.is_capture() ? m.to() : NO_SQUARE; // enable recapture extension
+        Move m = moves[i];
         p.play<Us>(m);
         ++r.nodes;
 
         int score;
         if (i == 0) {
-          score = -negamax<~Us>(p, new_depth, 1, -beta, -alpha, r.nodes, true, child_recap, Move{});
+          score = -negamax<~Us>(p, new_depth, 1, -beta, -alpha, r.nodes, true, Move{});
         } else {
-          score = -negamax<~Us>(p, new_depth, 1, -alpha - 1, -alpha, r.nodes, true, child_recap, Move{}); // PVS scout
+          score = -negamax<~Us>(p, new_depth, 1, -alpha - 1, -alpha, r.nodes, true, Move{}); // PVS scout
           if (score > alpha && score < beta)
-            score = -negamax<~Us>(p, new_depth, 1, -beta, -alpha, r.nodes, true, child_recap, Move{}); // re-search
+            score = -negamax<~Us>(p, new_depth, 1, -beta, -alpha, r.nodes, true, Move{}); // re-search
         }
         p.undo<Us>(m);
 
