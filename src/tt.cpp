@@ -10,12 +10,18 @@ namespace tt {
 
   namespace {
 
-    Entry *g_table = nullptr;
-    size_t g_count = 0; // number of slots (a power of two)
-    size_t g_mask  = 0; // g_count - 1
+    Entry  *g_table       = nullptr;
+    size_t  g_count       = 0; // number of entries (a power of two, multiple of BUCKET_SIZE)
+    size_t  g_bucket_mask = 0; // (g_count / BUCKET_SIZE) - 1
+    uint8_t g_gen         = 0; // current generation (6 bits, wraps)
 
-    // Returned by probe() when no table is allocated, so callers never dereference null.
-    Entry g_empty{};
+    [[gnu::const]] inline uint8_t pack(uint8_t gen, Bound b) noexcept { return static_cast<uint8_t>(gen << 2 | b); }
+    // Age of an entry in generations, robust to the 6-bit wrap.
+    [[gnu::pure]] inline int rel_age(const Entry &e) noexcept { return (64 + g_gen - (e.genbound >> 2)) & 63; }
+
+    [[gnu::pure, gnu::hot]] inline Entry *bucket_of(uint64_t key) noexcept {
+      return &g_table[(key & g_bucket_mask) * BUCKET_SIZE];
+    }
 
     // The table is allocated with mmap/munmap rather than new[]/delete[]: macOS's malloc keeps a
     // freed multi-GiB block in its per-process large-entry cache for reuse, so it never returns to
@@ -24,7 +30,8 @@ namespace tt {
     // still showed ~2.1 GiB). munmap unconditionally removes the region from the footprint. Bonus:
     // anonymous mmap pages are zero-filled and faulted lazily, so a fresh table costs no physical
     // memory until slots are actually written (a zero slot reads as bound == NONE). Windows keeps
-    // the plain allocator (no malloc large-cache issue to work around there).
+    // the plain allocator (no malloc large-cache issue to work around there). mmap also returns
+    // page-aligned memory, so the 64-byte buckets never straddle a cache line.
     Entry *table_alloc(size_t bytes) noexcept {
 #if defined(_WIN32)
       return static_cast<Entry *>(operator new(bytes, std::nothrow));
@@ -49,9 +56,9 @@ namespace tt {
 
   void resize(size_t mb) {
     table_free(g_table, g_count * sizeof(Entry));
-    g_table = nullptr;
-    g_count = 0;
-    g_mask  = 0;
+    g_table       = nullptr;
+    g_count       = 0;
+    g_bucket_mask = 0;
     if (mb == 0)
       return;
 
@@ -70,8 +77,8 @@ namespace tt {
     if (g_table == nullptr)
       return;
 
-    g_count = n;
-    g_mask  = n - 1;
+    g_count       = n; // a power of two >= 1024, hence a multiple of BUCKET_SIZE
+    g_bucket_mask = n / BUCKET_SIZE - 1;
 #if defined(_WIN32)
     clear(); // mmap pages arrive zeroed; operator new's do not
 #endif
@@ -91,27 +98,59 @@ namespace tt {
 #endif
   }
 
+  void new_search() noexcept { g_gen = (g_gen + 1) & 63; }
+
   [[gnu::hot]] Entry *probe(uint64_t key) noexcept {
     if (g_table == nullptr)
-      return &g_empty;
-    return &g_table[key & g_mask];
+      return nullptr;
+    Entry *b = bucket_of(key);
+    for (int i = 0; i < BUCKET_SIZE; ++i)
+      if (b[i].bound() != NONE && b[i].key == key) {
+        b[i].genbound = pack(g_gen, b[i].bound()); // hit -> mark young so it survives replacement
+        return &b[i];
+      }
+    return nullptr;
   }
 
-  [[gnu::hot]] void store(uint64_t key, Move move, int score, int depth, Bound bound) noexcept {
+  [[gnu::hot]] void store(uint64_t key, Move move, int score, int depth, Bound bound, int eval) noexcept {
     if (g_table == nullptr)
       return;
-    Entry &e = g_table[key & g_mask];
+    Entry *b = bucket_of(key);
 
-    // Depth-preferred replacement: keep a deeper analysis of the *same* position; otherwise (empty
-    // slot, collision, or shallower entry) overwrite with the fresh result.
-    if (e.bound != NONE && e.key == key && e.depth > depth)
-      return;
+    // Same position already stored: depth-preferred — keep the deeper analysis (refreshed so aging
+    // doesn't evict it), otherwise overwrite it in place below.
+    Entry *e = nullptr;
+    for (int i = 0; i < BUCKET_SIZE; ++i)
+      if (b[i].bound() != NONE && b[i].key == key) {
+        if (b[i].depth > depth) {
+          b[i].genbound = pack(g_gen, b[i].bound());
+          return;
+        }
+        e = &b[i];
+        break;
+      }
 
-    e.key   = key;
-    e.move  = static_cast<uint16_t>(move.to_from());
-    e.score = static_cast<int16_t>(score);
-    e.depth = static_cast<int16_t>(depth);
-    e.bound = bound;
+    // Otherwise evict the bucket's least valuable entry: an empty slot if any, else the lowest
+    // depth - 8*age (a deep entry is worth keeping, but each generation it survives unused costs
+    // it 8 plies of "depth" — stale analysis from old searches ages out instead of squatting).
+    if (e == nullptr) {
+      e         = &b[0];
+      int worst = e->bound() == NONE ? INT32_MIN : e->depth - 8 * rel_age(*e);
+      for (int i = 1; i < BUCKET_SIZE && worst != INT32_MIN; ++i) {
+        const int v = b[i].bound() == NONE ? INT32_MIN : b[i].depth - 8 * rel_age(b[i]);
+        if (v < worst) {
+          e     = &b[i];
+          worst = v;
+        }
+      }
+    }
+
+    e->key      = key;
+    e->move     = static_cast<uint16_t>(move.to_from());
+    e->score    = static_cast<int16_t>(score);
+    e->eval     = static_cast<int16_t>(eval);
+    e->depth    = static_cast<uint8_t>(depth);
+    e->genbound = pack(g_gen, bound);
   }
 
   size_t size_mb() { return g_count * sizeof(Entry) / (1024 * 1024); }

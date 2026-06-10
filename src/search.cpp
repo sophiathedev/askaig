@@ -512,18 +512,28 @@ namespace search {
         return alpha;
 
       // Transposition-table probe: reuse a deep-enough stored result, and remember its move/score.
+      // Every needed field is COPIED out here: the table is lockless, so the slot can be
+      // overwritten by descendant/helper-thread stores while this node runs (the singular check
+      // reads these deep inside the move loop — re-reading the entry there could mix in fields
+      // from a completely different position).
       tt::Entry *tte     = tt::probe(key);
+      const bool tt_hit  = tte != nullptr;
       Move       ttMove  = Move{};
       int        ttScore = 0;
-      const bool tt_hit  = tte->key == key && tte->bound != tt::NONE;
+      int        ttDepth = 0;
+      int        ttEval  = tt::EVAL_NONE;
+      tt::Bound  ttBound = tt::NONE;
       if (tt_hit) {
         ttMove  = Move(tte->move);
         ttScore = score_from_tt(tte->score, ply);
+        ttDepth = tte->depth;
+        ttEval  = tte->eval;
+        ttBound = tte->bound();
         // During a singular verification search (excluded set) the stored result is for the full
         // move set, so it must not cut this (reduced) search off.
-        if (excluded == Move{} && tte->depth >= depth) {
-          if (tte->bound == tt::EXACT || (tte->bound == tt::LOWER && ttScore >= beta) ||
-              (tte->bound == tt::UPPER && ttScore <= alpha))
+        if (excluded == Move{} && ttDepth >= depth) {
+          if (ttBound == tt::EXACT || (ttBound == tt::LOWER && ttScore >= beta) ||
+              (ttBound == tt::UPPER && ttScore <= alpha))
             return ttScore;
         }
       }
@@ -544,7 +554,11 @@ namespace search {
       int        static_eval = INF;
       const bool can_prune   = !is_pv && !in_check && beta < MATE - MAX_MATE_PLY && beta > -(MATE - MAX_MATE_PLY);
       if (can_prune && depth <= RFP_MAX_DEPTH) {
-        static_eval = eval::evaluate(p);
+        // Reuse the static eval stored in the TT when the position was seen before — evaluate()
+        // is the dominant cost at these shallow nodes. (The stored eval may have been computed at
+        // a different halfmove clock — the hash omits it — so the fifty-move damping can be
+        // slightly off; the same staleness is already accepted for stored scores.)
+        static_eval = ttEval != tt::EVAL_NONE ? ttEval : eval::evaluate(p);
         // Reverse futility pruning (static null move): a depth-scaled margin above beta -> prune.
         if (static_eval - RFP_MARGIN * depth >= beta)
           return static_eval;
@@ -613,7 +627,7 @@ namespace search {
         // and the check extension already cover exchange resolution — SPRT preferred it gone.)
         int ext = node_ext;
         if (!ext && depth >= SINGULAR_MIN_DEPTH && m == ttMove && excluded == Move{} && tt_hit &&
-            tte->depth >= depth - 3 && tte->bound != tt::UPPER && ttScore > -(MATE - MAX_MATE_PLY) &&
+            ttDepth >= depth - 3 && ttBound != tt::UPPER && ttScore > -(MATE - MAX_MATE_PLY) &&
             ttScore < MATE - MAX_MATE_PLY) {
           // Singular extension: search every move *except* the TT move at reduced depth with a
           // window just below the TT score. If none reaches it, the TT move is singular -> extend.
@@ -696,7 +710,8 @@ namespace search {
 
       if (!aborted() && excluded == Move{}) { // don't store a partial (aborted) or singular result
         tt::Bound bound = best <= alpha_orig ? tt::UPPER : (best >= beta ? tt::LOWER : tt::EXACT);
-        tt::store(key, bestMove, score_to_tt(best, ply), depth, bound);
+        tt::store(key, bestMove, score_to_tt(best, ply), depth, bound,
+                  static_eval == INF ? tt::EVAL_NONE : static_eval);
       }
       return best;
     }
@@ -718,7 +733,7 @@ namespace search {
 
       const uint64_t key    = p.get_hash();
       tt::Entry     *tte    = tt::probe(key);
-      Move           ttMove = tte->key == key && tte->bound != tt::NONE ? Move(tte->move) : Move{};
+      Move           ttMove = tte != nullptr ? Move(tte->move) : Move{};
 
       Move moves[MAX_MOVES];
       int  scores[MAX_MOVES];
@@ -762,7 +777,7 @@ namespace search {
 
       if (!aborted()) {
         tt::Bound bound = r.score <= alpha_orig ? tt::UPPER : (r.score >= beta ? tt::LOWER : tt::EXACT);
-        tt::store(key, r.best, score_to_tt(r.score, 0), depth, bound);
+        tt::store(key, r.best, score_to_tt(r.score, 0), depth, bound, tt::EVAL_NONE);
       }
 
       // Export the collected principal variation (fall back to just the best move if none was set).
@@ -873,6 +888,7 @@ namespace search {
       threads = 1;
 
     g_stop.store(false, std::memory_order_relaxed); // fresh search: clear any leftover stop request
+    tt::new_search(); // age the table: this search's entries outrank earlier moves' leftovers
 
     // Arm the time control before any thread starts (so all threads see the flags/deadlines). While
     // pondering we run unbounded (like "infinite"); request_ponderhit() arms the clock later. The
