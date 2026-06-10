@@ -208,40 +208,8 @@ namespace eval {
       return s;
     }
 
-    // Mobility of one side's minor/major pieces over `targets` (squares not occupied by own pieces
-    // and not attacked by enemy pawns).
-    template<Color C>
-    [[gnu::pure]] Score side_mobility(const Position &pos, Bitboard occ, Bitboard targets) noexcept {
-      Score s;
-      for (Bitboard b = pos.bitboard_of(C, KNIGHT); b;) {
-        int c = pop_count(attacks<KNIGHT>(pop_lsb(&b), occ) & targets);
-        s.mg += MOB_MG[KNIGHT] * c, s.eg += MOB_EG[KNIGHT] * c;
-      }
-      for (Bitboard b = pos.bitboard_of(C, BISHOP); b;) {
-        int c = pop_count(attacks<BISHOP>(pop_lsb(&b), occ) & targets);
-        s.mg += MOB_MG[BISHOP] * c, s.eg += MOB_EG[BISHOP] * c;
-      }
-      for (Bitboard b = pos.bitboard_of(C, ROOK); b;) {
-        int c = pop_count(attacks<ROOK>(pop_lsb(&b), occ) & targets);
-        s.mg += MOB_MG[ROOK] * c, s.eg += MOB_EG[ROOK] * c;
-      }
-      for (Bitboard b = pos.bitboard_of(C, QUEEN); b;) {
-        int c = pop_count(attacks<QUEEN>(pop_lsb(&b), occ) & targets);
-        s.mg += MOB_MG[QUEEN] * c, s.eg += MOB_EG[QUEEN] * c;
-      }
-      return s;
-    }
-
-    [[gnu::pure, gnu::hot]] int mobility(const Position &pos, int phase) noexcept {
-      const Bitboard wpieces  = pos.all_pieces<WHITE>();
-      const Bitboard bpieces  = pos.all_pieces<BLACK>();
-      const Bitboard occ      = wpieces | bpieces;
-      const Bitboard wPawnAtt = pawn_attacks<WHITE>(pos.bitboard_of(WHITE, PAWN));
-      const Bitboard bPawnAtt = pawn_attacks<BLACK>(pos.bitboard_of(BLACK, PAWN));
-      const Score    w        = side_mobility<WHITE>(pos, occ, ~wpieces & ~bPawnAtt);
-      const Score    b        = side_mobility<BLACK>(pos, occ, ~bpieces & ~wPawnAtt);
-      return taper({w.mg - b.mg, w.eg - b.eg}, phase);
-    }
+    // (Mobility is computed together with the threat attack-maps in one shared pass over the pieces —
+    // see `mobility_threats` below — so each piece's attack set is looked up only once.)
 
     // The bitboard of `C`'s pieces pinned against their own king by an enemy slider.
     template<Color C>
@@ -307,21 +275,41 @@ namespace eval {
       Bitboard all   = 0; // every attacker, including queens and the king
     };
 
+    // One pass over side C's pieces, shared by mobility AND the threat attack-map: every knight /
+    // bishop / rook / queen attack set (the magic-bitboard lookups — the dominant eval cost) is looked
+    // up ONCE, then used both to count mobility over `targets` and to OR into the tiered attack map.
+    // `ownPawnAtt` is C's pawn attacks (the map's pawn tier). Previously mobility() and attack_maps()
+    // each ran this loop independently, doubling the slider lookups per eval.
     template<Color C>
-    [[gnu::pure, gnu::hot]] AttackMap attack_maps(const Position &pos, Bitboard occ) noexcept {
-      AttackMap m;
-      m.pawn = pawn_attacks<C>(pos.bitboard_of(C, PAWN));
-      for (Bitboard b = pos.bitboard_of(C, KNIGHT); b;)
-        m.minor |= attacks<KNIGHT>(pop_lsb(&b), occ);
-      for (Bitboard b = pos.bitboard_of(C, BISHOP); b;)
-        m.minor |= attacks<BISHOP>(pop_lsb(&b), occ);
-      for (Bitboard b = pos.bitboard_of(C, ROOK); b;)
-        m.rook |= attacks<ROOK>(pop_lsb(&b), occ);
+    [[gnu::hot]] void side_mob_att(const Position &pos, Bitboard occ, Bitboard targets, Bitboard ownPawnAtt, Score &mob,
+                                   AttackMap &m) noexcept {
+      m.pawn = ownPawnAtt;
+      for (Bitboard b = pos.bitboard_of(C, KNIGHT); b;) {
+        Bitboard a = attacks<KNIGHT>(pop_lsb(&b), occ);
+        m.minor |= a;
+        int c = pop_count(a & targets);
+        mob.mg += MOB_MG[KNIGHT] * c, mob.eg += MOB_EG[KNIGHT] * c;
+      }
+      for (Bitboard b = pos.bitboard_of(C, BISHOP); b;) {
+        Bitboard a = attacks<BISHOP>(pop_lsb(&b), occ);
+        m.minor |= a;
+        int c = pop_count(a & targets);
+        mob.mg += MOB_MG[BISHOP] * c, mob.eg += MOB_EG[BISHOP] * c;
+      }
+      for (Bitboard b = pos.bitboard_of(C, ROOK); b;) {
+        Bitboard a = attacks<ROOK>(pop_lsb(&b), occ);
+        m.rook |= a;
+        int c = pop_count(a & targets);
+        mob.mg += MOB_MG[ROOK] * c, mob.eg += MOB_EG[ROOK] * c;
+      }
       Bitboard queens = 0;
-      for (Bitboard b = pos.bitboard_of(C, QUEEN); b;)
-        queens |= attacks<QUEEN>(pop_lsb(&b), occ);
+      for (Bitboard b = pos.bitboard_of(C, QUEEN); b;) {
+        Bitboard a = attacks<QUEEN>(pop_lsb(&b), occ);
+        queens |= a;
+        int c = pop_count(a & targets);
+        mob.mg += MOB_MG[QUEEN] * c, mob.eg += MOB_EG[QUEEN] * c;
+      }
       m.all = m.pawn | m.minor | m.rook | queens | attacks<KING>(bsf(pos.bitboard_of(C, KING)), occ);
-      return m;
     }
 
     // Threat bonus for side C against ~C: pieces of ~C attacked by our pawns / minors / rooks, plus
@@ -354,14 +342,26 @@ namespace eval {
       return s;
     }
 
-    // Threats from White's perspective, tapered by game phase.
-    [[gnu::pure, gnu::hot]] int threats(const Position &pos, int phase) noexcept {
-      const Bitboard  occ = pos.all_pieces<WHITE>() | pos.all_pieces<BLACK>();
-      const AttackMap w   = attack_maps<WHITE>(pos, occ);
-      const AttackMap b   = attack_maps<BLACK>(pos, occ);
-      const Score     sw  = side_threats<WHITE>(pos, w, b.all);
-      const Score     sb  = side_threats<BLACK>(pos, b, w.all);
-      return taper({sw.mg - sb.mg, sw.eg - sb.eg}, phase);
+    // Mobility + threats combined, White's perspective, tapered by game phase. The two terms share a
+    // single pass over the pieces (see `side_mob_att`), so the per-piece attack lookups happen once
+    // instead of twice. Numerically identical to the old separate mobility() + threats() (their sum).
+    [[gnu::hot]] int mobility_threats(const Position &pos, int phase) noexcept {
+      const Bitboard wpieces  = pos.all_pieces<WHITE>();
+      const Bitboard bpieces  = pos.all_pieces<BLACK>();
+      const Bitboard occ      = wpieces | bpieces;
+      const Bitboard wPawnAtt = pawn_attacks<WHITE>(pos.bitboard_of(WHITE, PAWN));
+      const Bitboard bPawnAtt = pawn_attacks<BLACK>(pos.bitboard_of(BLACK, PAWN));
+
+      Score     wmob, bmob;
+      AttackMap wm, bm;
+      side_mob_att<WHITE>(pos, occ, ~wpieces & ~bPawnAtt, wPawnAtt, wmob, wm);
+      side_mob_att<BLACK>(pos, occ, ~bpieces & ~wPawnAtt, bPawnAtt, bmob, bm);
+
+      const int   mob = taper({wmob.mg - bmob.mg, wmob.eg - bmob.eg}, phase);
+      const Score sw  = side_threats<WHITE>(pos, wm, bm.all);
+      const Score sb  = side_threats<BLACK>(pos, bm, wm.all);
+      const int   thr = taper({sw.mg - sb.mg, sw.eg - sb.eg}, phase);
+      return mob + thr;
     }
 
     // Per-thread cache of the static evaluation, keyed by the full Zobrist hash. The evaluation is
@@ -399,10 +399,9 @@ namespace eval {
     int s = (pos.psqt_mg() * phase + pos.psqt_eg() * (psqt::PHASE_MAX - phase)) / psqt::PHASE_MAX;
     s += pawn_structure(pos, phase);
     s += king_safety(pos);
-    s += mobility(pos, phase);
+    s += mobility_threats(pos, phase); // mobility + threats, sharing one attack-map pass
     s += pin_penalty(pos);
     s += piece_bonuses(pos, phase);
-    s += threats(pos, phase);
 
     const int result = pos.turn() == WHITE ? s : -s;
     e.key            = key;
