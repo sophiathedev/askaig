@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <thread>
 #include <utility>
@@ -38,6 +39,18 @@ namespace search {
     constexpr int SINGULAR_MARGIN    = 2;
 
     constexpr int DELTA_MARGIN = 200; // qsearch delta pruning: safety margin above the captured value
+
+    // Log-based LMR reduction table, indexed by [depth][move index]: late moves at deep nodes are
+    // reduced progressively more (log*log growth) instead of the old flat 1-3 steps. Filled once by
+    // a static initializer (runs before main(), hence before any search thread spawns) and read-only
+    // afterwards, so it is shared across Lazy-SMP threads without locking.
+    int        LMR_TABLE[64][64];
+    const bool LMR_TABLE_INIT = [] {
+      for (int d = 1; d < 64; ++d)
+        for (int i = 1; i < 64; ++i)
+          LMR_TABLE[d][i] = static_cast<int>(1.00 + std::log(d) * std::log(i) / 1.50);
+      return true;
+    }();
 
     // Global stop flag, set by request_stop() (the UCI "stop" command) and cleared at the start of
     // each think(). Every search thread (main + helpers) points its t_stop at this.
@@ -443,12 +456,15 @@ namespace search {
         } else {
           // Late move reductions: a late, quiet move is unlikely to beat alpha, so scout it at a
           // reduced depth first; only re-search at full depth if that surprises us (beats alpha).
-          // Tactical moves (captures/promotions), shallow nodes, and in-check nodes aren't reduced.
+          // Tactical moves (captures/promotions), shallow nodes, and in-check nodes aren't reduced;
+          // PV nodes are reduced one step less. The clamp to [0, nd] is load-bearing: a negative
+          // child depth would skip the `depth == 0` quiescence dispatch and recurse to the ply cap.
           int reduction = 0;
           if (depth >= 3 && i >= 3 && !in_check && is_quiet(m)) {
-            reduction = 1 + (depth >= 6 ? 1 : 0) + (i >= 6 ? 1 : 0);
-            if (reduction > nd)
-              reduction = nd;
+            reduction = LMR_TABLE[depth < 63 ? depth : 63][i < 63 ? i : 63];
+            if (is_pv)
+              --reduction;
+            reduction = std::clamp(reduction, 0, nd);
           }
           // PVS scout at the (possibly reduced) depth with a null window.
           score = -negamax<~Us>(p, nd - reduction, ply + 1, -alpha - 1, -alpha, nodes, true, Move{});
