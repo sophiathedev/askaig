@@ -73,16 +73,22 @@ BASE_REF="${1:-HEAD}"
 # Adjudication — ends games whose outcome is no longer in doubt (the fishtest/OpenBench standard;
 # with an unbalanced UHO book MOST games end this way, which is the intended time saving, roughly
 # halving the wall-clock per game):
-#   draw:   after move 40, BOTH engines report |score| <= 10cp for 8 consecutive moves
+#   draw:   after move 34, BOTH engines report |score| <= 20cp for 8 consecutive moves. The window
+#           must clear the engine's TEMPO bonus ({18,10} mg/eg): the side to move always reports
+#           at least ~+10cp, so a 10cp window NEVER caught a dead-drawn shuffle — measured over
+#           ~2900 games, 82% of draws ran to an actual 3-fold/50-move (median draw 112 plies, max
+#           520). 20cp (the OpenBench default, like movenumber 34) is above the endgame tempo.
 #   resign: BOTH engines agree (twosided=true) one side is down >= 700cp for 4 consecutive moves.
 #           twosided matters for eval patches: a one-sided resign lets a candidate with a broken
 #           (pessimistic) eval forfeit positions it could still hold, biasing the SPRT against it.
-# ADJUDICATE=0 disables both — games then run to mate / 50-move / repetition (~2x wall-clock);
-# useful as a sanity cross-check if an adjudicated result looks suspicious. The tokens contain no
-# spaces, so the unquoted expansion below splitting into words is exactly what we want.
+#   maxmoves 200: hard backstop for shuffles the draw window still misses (middlegame tempo 18cp
+#           sits just under the 20cp window) — a 400-ply game costs ~12 normal games of wall-clock.
+# ADJUDICATE=0 disables all three — games then run to mate / 50-move / repetition; useful as a
+# sanity cross-check if an adjudicated result looks suspicious. The tokens contain no spaces, so
+# the unquoted expansion below splitting into words is exactly what we want.
 ADJ_ARGS=""
 if [ "${ADJUDICATE:-1}" != "0" ]; then
-  ADJ_ARGS="-draw movenumber=40 movecount=8 score=10 -resign movecount=4 score=700 twosided=true"
+  ADJ_ARGS="-draw movenumber=34 movecount=8 score=20 -resign movecount=4 score=700 twosided=true -maxmoves 200"
 fi
 
 WORK="$HERE/work"
