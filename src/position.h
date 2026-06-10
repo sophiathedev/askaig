@@ -556,8 +556,21 @@ template<Color Us>
           // If the checker is either a pawn or a knight, the only legal moves are to capture
           // the checker. Only non-pinned pieces can capture it
           b1 = attackers_from<Us>(checker_square, all) & not_pinned;
-          while (b1)
-            *list++ = Move(pop_lsb(&b1), checker_square, CAPTURE);
+          while (b1) {
+            s = pop_lsb(&b1);
+            // A pawn capturing the checker on its promotion rank must promote. Upstream surge
+            // emitted a plain CAPTURE here, which both prints an illegal UCI move (no promotion
+            // suffix -> forfeits the game) and, when played internally, leaves an unpromoted pawn
+            // on the last rank. Only a knight checker is capturable there (an enemy pawn never
+            // stands on our 8th rank), and only a pawn promotes.
+            if (board[s] == make_piece(Us, PAWN) && rank_of(checker_square) == relative_rank<Us>(RANK8)) {
+              *list++ = Move(s, checker_square, PC_KNIGHT);
+              *list++ = Move(s, checker_square, PC_BISHOP);
+              *list++ = Move(s, checker_square, PC_ROOK);
+              *list++ = Move(s, checker_square, PC_QUEEN);
+            } else
+              *list++ = Move(s, checker_square, CAPTURE);
+          }
 
           return list;
         default:
