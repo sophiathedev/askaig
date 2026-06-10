@@ -61,6 +61,16 @@ namespace eval {
     constexpr Score THREAT_BY_ROOK[NPIECE_TYPES]  = {{0, 0},  {20, 40}, {22, 40},
                                                      {0, 20}, {40, 40}, {0, 0}}; // rooks chiefly threaten R/Q
     constexpr Score HANGING                       = {28, 22}; // per undefended enemy piece we attack
+
+    // King-zone attacks: each knight/bishop/rook/queen attack into the ring around the enemy king
+    // (the king's square + its 8 neighbours) earns weight units; the total is then scaled by the
+    // NUMBER of distinct attacking pieces — one piece alone cannot mate, so danger grows steeply as
+    // attackers join (0% for <2 attackers). Score = units * scale% * KING_ATT_UNIT cp, mostly a
+    // middlegame term (quartered in the endgame). Starting values — to be SPRT-tuned like threats.
+    constexpr int KING_ATT_WEIGHT[NPIECE_TYPES] = {0, 2, 2, 3, 5, 0}; // P N B R Q K (per zone square)
+    constexpr int KING_ATT_SCALE[8]             = {0, 0, 50, 75, 88, 94, 97, 99}; // % by attacker count
+    constexpr int KING_ATT_UNIT                 = 7; // cp per weighted unit (after the % scale)
+
     [[gnu::const, gnu::always_inline]] inline int taper(Score s, int phase) noexcept {
       return (s.mg * phase + s.eg * (psqt::PHASE_MAX - phase)) / psqt::PHASE_MAX;
     }
@@ -275,32 +285,47 @@ namespace eval {
       Bitboard all   = 0; // every attacker, including queens and the king
     };
 
-    // One pass over side C's pieces, shared by mobility AND the threat attack-map: every knight /
-    // bishop / rook / queen attack set (the magic-bitboard lookups — the dominant eval cost) is looked
-    // up ONCE, then used both to count mobility over `targets` and to OR into the tiered attack map.
-    // `ownPawnAtt` is C's pawn attacks (the map's pawn tier). Previously mobility() and attack_maps()
-    // each ran this loop independently, doubling the slider lookups per eval.
+    // One pass over side C's pieces, shared by mobility, the threat attack-map AND the king-zone
+    // attack count: every knight / bishop / rook / queen attack set (the magic-bitboard lookups —
+    // the dominant eval cost) is looked up ONCE, then used to (1) count mobility over `targets`,
+    // (2) OR into the tiered attack map, and (3) count attacks into `kingZone` (the ring around the
+    // ENEMY king) for the king-attack term. `ownPawnAtt` is C's pawn attacks (the map's pawn tier).
+    // Previously mobility() and attack_maps() each ran this loop independently, doubling the slider
+    // lookups per eval.
     template<Color C>
-    [[gnu::hot]] void side_mob_att(const Position &pos, Bitboard occ, Bitboard targets, Bitboard ownPawnAtt, Score &mob,
-                                   AttackMap &m) noexcept {
+    [[gnu::hot]] void side_mob_att(const Position &pos, Bitboard occ, Bitboard targets, Bitboard ownPawnAtt,
+                                   Bitboard kingZone, Score &mob, AttackMap &m, int &kzUnits,
+                                   int &kzAttackers) noexcept {
       m.pawn = ownPawnAtt;
       for (Bitboard b = pos.bitboard_of(C, KNIGHT); b;) {
         Bitboard a = attacks<KNIGHT>(pop_lsb(&b), occ);
         m.minor |= a;
         int c = pop_count(a & targets);
         mob.mg += MOB_MG[KNIGHT] * c, mob.eg += MOB_EG[KNIGHT] * c;
+        if (Bitboard z = a & kingZone) {
+          kzUnits += KING_ATT_WEIGHT[KNIGHT] * pop_count(z);
+          ++kzAttackers;
+        }
       }
       for (Bitboard b = pos.bitboard_of(C, BISHOP); b;) {
         Bitboard a = attacks<BISHOP>(pop_lsb(&b), occ);
         m.minor |= a;
         int c = pop_count(a & targets);
         mob.mg += MOB_MG[BISHOP] * c, mob.eg += MOB_EG[BISHOP] * c;
+        if (Bitboard z = a & kingZone) {
+          kzUnits += KING_ATT_WEIGHT[BISHOP] * pop_count(z);
+          ++kzAttackers;
+        }
       }
       for (Bitboard b = pos.bitboard_of(C, ROOK); b;) {
         Bitboard a = attacks<ROOK>(pop_lsb(&b), occ);
         m.rook |= a;
         int c = pop_count(a & targets);
         mob.mg += MOB_MG[ROOK] * c, mob.eg += MOB_EG[ROOK] * c;
+        if (Bitboard z = a & kingZone) {
+          kzUnits += KING_ATT_WEIGHT[ROOK] * pop_count(z);
+          ++kzAttackers;
+        }
       }
       Bitboard queens = 0;
       for (Bitboard b = pos.bitboard_of(C, QUEEN); b;) {
@@ -308,6 +333,10 @@ namespace eval {
         queens |= a;
         int c = pop_count(a & targets);
         mob.mg += MOB_MG[QUEEN] * c, mob.eg += MOB_EG[QUEEN] * c;
+        if (Bitboard z = a & kingZone) {
+          kzUnits += KING_ATT_WEIGHT[QUEEN] * pop_count(z);
+          ++kzAttackers;
+        }
       }
       m.all = m.pawn | m.minor | m.rook | queens | attacks<KING>(bsf(pos.bitboard_of(C, KING)), occ);
     }
@@ -342,26 +371,41 @@ namespace eval {
       return s;
     }
 
-    // Mobility + threats combined, White's perspective, tapered by game phase. The two terms share a
-    // single pass over the pieces (see `side_mob_att`), so the per-piece attack lookups happen once
-    // instead of twice. Numerically identical to the old separate mobility() + threats() (their sum).
-    [[gnu::hot]] int mobility_threats(const Position &pos, int phase) noexcept {
+    // Mobility + threats + king-zone attacks combined, White's perspective, tapered by game phase.
+    // The three terms share a single pass over the pieces (see `side_mob_att`), so the per-piece
+    // attack lookups happen once.
+    [[gnu::hot]] int piece_activity(const Position &pos, int phase) noexcept {
       const Bitboard wpieces  = pos.all_pieces<WHITE>();
       const Bitboard bpieces  = pos.all_pieces<BLACK>();
       const Bitboard occ      = wpieces | bpieces;
       const Bitboard wPawnAtt = pawn_attacks<WHITE>(pos.bitboard_of(WHITE, PAWN));
       const Bitboard bPawnAtt = pawn_attacks<BLACK>(pos.bitboard_of(BLACK, PAWN));
 
+      // King zones: the king's square plus its 8 neighbours (the king attack table is occupancy-
+      // independent). White's pieces are scored against BLACK's zone and vice versa.
+      const Square   wk     = bsf(pos.bitboard_of(WHITE, KING));
+      const Square   bk     = bsf(pos.bitboard_of(BLACK, KING));
+      const Bitboard wkZone = attacks<KING>(wk, occ) | SQUARE_BB[wk];
+      const Bitboard bkZone = attacks<KING>(bk, occ) | SQUARE_BB[bk];
+
       Score     wmob, bmob;
       AttackMap wm, bm;
-      side_mob_att<WHITE>(pos, occ, ~wpieces & ~bPawnAtt, wPawnAtt, wmob, wm);
-      side_mob_att<BLACK>(pos, occ, ~bpieces & ~wPawnAtt, bPawnAtt, bmob, bm);
+      int       wU = 0, wC = 0, bU = 0, bC = 0; // king-zone units / distinct attackers, per side
+      side_mob_att<WHITE>(pos, occ, ~wpieces & ~bPawnAtt, wPawnAtt, bkZone, wmob, wm, wU, wC);
+      side_mob_att<BLACK>(pos, occ, ~bpieces & ~wPawnAtt, bPawnAtt, wkZone, bmob, bm, bU, bC);
 
       const int   mob = taper({wmob.mg - bmob.mg, wmob.eg - bmob.eg}, phase);
       const Score sw  = side_threats<WHITE>(pos, wm, bm.all);
       const Score sb  = side_threats<BLACK>(pos, bm, wm.all);
       const int   thr = taper({sw.mg - sb.mg, sw.eg - sb.eg}, phase);
-      return mob + thr;
+
+      // King-zone attack score: weighted units, gated/scaled by the attacker count (a lone attacker
+      // scores nothing), in centipawns. Mostly middlegame — quartered in the endgame.
+      const int katt_w = wU * KING_ATT_SCALE[wC < 7 ? wC : 7] / 100 * KING_ATT_UNIT;
+      const int katt_b = bU * KING_ATT_SCALE[bC < 7 ? bC : 7] / 100 * KING_ATT_UNIT;
+      const int katt   = taper({katt_w - katt_b, (katt_w - katt_b) / 4}, phase);
+
+      return mob + thr + katt;
     }
 
   } // namespace
@@ -388,7 +432,7 @@ namespace eval {
     int s = (pos.psqt_mg() * phase + pos.psqt_eg() * (psqt::PHASE_MAX - phase)) / psqt::PHASE_MAX;
     s += pawn_structure(pos, phase);
     s += king_safety(pos);
-    s += mobility_threats(pos, phase); // mobility + threats, sharing one attack-map pass
+    s += piece_activity(pos, phase); // mobility + threats + king-zone attacks, one shared attack pass
     s += pin_penalty(pos);
     s += piece_bonuses(pos, phase);
 
