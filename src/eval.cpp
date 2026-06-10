@@ -474,7 +474,17 @@ namespace eval {
     s += piece_bonuses(pos, phase);
 
     // White-perspective score flipped to the side to move, plus the tempo bonus for that side.
-    return (pos.turn() == WHITE ? s : -s) + taper(TEMPO, phase);
+    const int v = (pos.turn() == WHITE ? s : -s) + taper(TEMPO, phase);
+
+    // Fifty-move damping: scale the whole evaluation linearly toward 0 as the halfmove clock
+    // approaches the fifty-move rule (down to 50% at 100 halfmoves, where is_draw() takes over and
+    // scores it 0 exactly). An advantage the engine cannot convert within the rule is not a real
+    // advantage: this makes shuffling lines decay, so the better side prefers PROGRESS (a pawn push
+    // or capture resets the clock and restores the full eval) over repetition-adjacent drift, and
+    // dead-drawn games converge into the match-runner's draw-adjudication window instead of
+    // shuffling for hundreds of plies. The 200 divisor is the standard (Stockfish-style) starting
+    // value, unproven here — SPRT decides.
+    return v * (200 - pos.fifty()) / 200;
   }
 
 } // namespace eval
