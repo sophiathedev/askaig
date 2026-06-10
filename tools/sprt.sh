@@ -19,7 +19,14 @@
 #     tools/sprt.sh HEAD~1
 #
 # Tunables via env: TC (5+0.05), HASH (16), CONCURRENCY (P-cores - 1), ELO0/ELO1 (0/10),
-#                   ALPHA/BETA (0.1), ROUNDS (5000), BOOK (UHO_4060_v3.epd), ADJUDICATE (1).
+#                   ALPHA/BETA (0.1), ROUNDS (5000), BOOK (UHO_4060_v3.epd), ADJUDICATE (1),
+#                   DEPTH (unset).
+#
+# DEPTH=<n> plays FIXED-DEPTH games (both engines search exactly n plies, no clock). This removes
+# every speed effect — nps, cache pressure, time management — and measures ONLY the quality of the
+# searched tree (eval + ordering + pruning decisions). The standard diagnostic when a TC test fails:
+# if the patch wins at fixed depth but loses on the clock, the heuristic signal is good and the
+# implementation is too slow; if it loses at fixed depth too, the signal itself is harmful.
 #
 # The defaults are the FAST regime for an engine still gaining tens of Elo per change: bounds
 # [0, 10] need ~3-4x fewer games than [0, 5] for a true gain >= 10, alpha/beta 0.1 another ~1.4x,
@@ -45,6 +52,7 @@ BOOK="${BOOK:-$HERE/books/UHO_4060_v3.epd}"
 [ -f "$BOOK" ] || { echo "opening book missing — run 'bash tools/setup.sh' to download it"; exit 1; }
 
 TC="${TC:-5+0.05}"
+DEPTH="${DEPTH:-}" # set to play fixed-depth games instead of timed ones (see header)
 HASH="${HASH:-16}"
 CORES="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
 # Only "real" cores run a search at full speed; on Apple Silicon the efficiency cores are far slower.
@@ -106,13 +114,16 @@ cmake --build "$ROOT/build" -j"$CORES" >/dev/null
 BASE_BIN="$ROOT/build/askaig"
 [ -x "$BASE_BIN" ] || { echo "baseline binary missing: $BASE_BIN"; exit 1; }
 
-echo ">> SPRT  cand vs base   TC=$TC  Hash=$HASH  concurrency=$CONCURRENCY  H1=elo in ($ELO0,$ELO1)  alpha=$ALPHA beta=$BETA"
+# Timed games by default; DEPTH=<n> switches to fixed-depth (no clock — see the header).
+if [ -n "$DEPTH" ]; then LIMIT="depth=$DEPTH"; else LIMIT="tc=$TC"; fi
+
+echo ">> SPRT  cand vs base   $LIMIT  Hash=$HASH  concurrency=$CONCURRENCY  H1=elo in ($ELO0,$ELO1)  alpha=$ALPHA beta=$BETA"
 echo
 
 "$FASTCHESS" \
   -engine cmd="$CAND_BIN" name=cand \
   -engine cmd="$BASE_BIN" name=base \
-  -each tc="$TC" option.Hash="$HASH" option.Threads=1 proto=uci \
+  -each "$LIMIT" option.Hash="$HASH" option.Threads=1 proto=uci \
   -openings file="$BOOK" format=epd order=random \
   -games 2 -rounds "$ROUNDS" -repeat \
   -sprt elo0="$ELO0" elo1="$ELO1" alpha="$ALPHA" beta="$BETA" \
