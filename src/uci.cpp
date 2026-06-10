@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "eval.h"
 #include "position.h"
 #include "search.h"
 #include "tables.h"
@@ -463,6 +464,10 @@ void uci::loop() {
       go_cmd(*pos, is);
     } else if (cmd == "d" || cmd == "display") {
       std::cout << *pos;
+    } else if (cmd == "eval") {
+      // Debug helper (like Stockfish's "eval"): the raw static evaluation of the current position,
+      // in centipawns from the side to move's perspective. No search — for eval-term testing/tuning.
+      std::cout << "eval " << eval::evaluate(*pos) << " cp (side to move)\n" << std::flush;
     } else if (cmd == "setoption") {
       stop_search(); // resizing the TT (or changing threads) under a running search is unsafe
       // setoption name <id> [value <x>]
