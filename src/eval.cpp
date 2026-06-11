@@ -136,72 +136,107 @@ namespace eval {
       return df > dr ? df : dr;
     }
 
+    // Pawn cache: the pawn-only parts of pawn_structure (doubled/isolated/centered score, the
+    // passed-pawn bitboards, the attack spans) depend ONLY on the two pawn bitboards, which change
+    // on a small fraction of moves — so they are cached per thread, keyed by an exact match of
+    // BOTH bitboards (like the perft TT: a hit is provably the same structure, never a hash
+    // collision). The piece-dependent refinements (passer blockade / king race, knight outposts,
+    // the phase taper) are recomputed per call on top. A zeroed entry is the correct answer for
+    // the no-pawns position (everything 0), so the zero-initialised table needs no sentinel.
+    struct PawnEntry {
+      Bitboard wp, bp; // the key (exact match)
+      Bitboard wpassed, bpassed; // passed pawns of each side
+      Bitboard wspan, bspan; // pawn attack spans (their complement = holes, for outposts)
+      int      base; // doubled + isolated + centered, White's perspective (phase-independent)
+    };
+    constexpr size_t       PAWN_CACHE_SIZE = 8192; // entries (power of two), ~0.5 MiB per thread
+    thread_local PawnEntry t_pawn_cache[PAWN_CACHE_SIZE];
+
+    [[gnu::const, gnu::always_inline]] inline size_t pawn_cache_index(Bitboard wp, Bitboard bp) noexcept {
+      return ((wp ^ (bp * UINT64_C(0x9E3779B97F4A7C15))) * UINT64_C(0xC2B2AE3D27D4EB4F)) >> 51; // top 13 bits
+    }
+
     // Evaluates pawn structure (doubled, isolated, passed) from White's perspective. The passed-pawn
     // bonus is tapered by `phase`; the other terms are phase-independent.
-    [[gnu::pure, gnu::hot]] int pawn_structure(const Position &pos, int phase) noexcept {
+    [[gnu::hot]] int pawn_structure(const Position &pos, int phase) noexcept {
       const Bitboard wp = pos.bitboard_of(WHITE, PAWN);
       const Bitboard bp = pos.bitboard_of(BLACK, PAWN);
-      int            s  = 0;
 
-      for (int f = 0; f < 8; ++f) {
-        int wc = pop_count(wp & file_bb(f));
-        int bc = pop_count(bp & file_bb(f));
-        if (wc > 1)
-          s -= DOUBLED_PENALTY * (wc - 1);
-        if (bc > 1)
-          s += DOUBLED_PENALTY * (bc - 1);
-        if (wc > 0 && !(wp & PM.adjacent[f]))
-          s -= ISOLATED_PENALTY * wc;
-        if (bc > 0 && !(bp & PM.adjacent[f]))
-          s += ISOLATED_PENALTY * bc;
+      PawnEntry &e = t_pawn_cache[pawn_cache_index(wp, bp)];
+      if (e.wp != wp || e.bp != bp) { // miss: recompute the pawn-only parts into this slot
+        e.wp      = wp;
+        e.bp      = bp;
+        e.wpassed = e.bpassed = 0;
+        e.wspan = e.bspan = 0;
+        e.base            = 0;
+
+        for (int f = 0; f < 8; ++f) {
+          int wc = pop_count(wp & file_bb(f));
+          int bc = pop_count(bp & file_bb(f));
+          if (wc > 1)
+            e.base -= DOUBLED_PENALTY * (wc - 1);
+          if (bc > 1)
+            e.base += DOUBLED_PENALTY * (bc - 1);
+          if (wc > 0 && !(wp & PM.adjacent[f]))
+            e.base -= ISOLATED_PENALTY * wc;
+          if (bc > 0 && !(bp & PM.adjacent[f]))
+            e.base += ISOLATED_PENALTY * bc;
+        }
+
+        e.base += CENTERED_BONUS * pop_count(wp & CENTER);
+        e.base -= CENTERED_BONUS * pop_count(bp & CENTER);
+
+        for (Bitboard t = wp; t;) {
+          const Square sq = pop_lsb(&t);
+          if (!(bp & PM.passed[WHITE][sq]))
+            e.wpassed |= SQUARE_BB[sq];
+          e.wspan |= PM.span[WHITE][sq];
+        }
+        for (Bitboard t = bp; t;) {
+          const Square sq = pop_lsb(&t);
+          if (!(wp & PM.passed[BLACK][sq]))
+            e.bpassed |= SQUARE_BB[sq];
+          e.bspan |= PM.span[BLACK][sq];
+        }
       }
 
+      int s = e.base;
+
       // Passed pawns: the rank-scaled base bonus, reduced when the stop square is blocked, with an
-      // endgame king-race adjustment (see PASSED_KDIST_W above).
+      // endgame king-race adjustment (see PASSED_KDIST_W above). Piece/king-dependent, so this
+      // part stays outside the cache.
       const Bitboard occ = pos.all_pieces<WHITE>() | pos.all_pieces<BLACK>();
       const Square   wk  = bsf(pos.bitboard_of(WHITE, KING));
       const Square   bk  = bsf(pos.bitboard_of(BLACK, KING));
 
-      Bitboard w = wp;
+      Bitboard w = e.wpassed;
       while (w) {
-        Square sq = pop_lsb(&w);
-        if (!(bp & PM.passed[WHITE][sq])) {
-          const int    r    = rank_of(sq);
-          const Square stop = sq + NORTH;
-          Score        ps{PASSED_MG[r], PASSED_EG[r]};
-          if (occ & SQUARE_BB[stop])
-            ps.mg = ps.mg * 2 / 3, ps.eg = ps.eg * 2 / 3; // blockaded: it cannot advance
-          ps.eg += (5 * cheb(bk, stop) - 2 * cheb(wk, stop)) * PASSED_KDIST_W[r];
-          s += taper(ps, phase);
-        }
+        Square       sq   = pop_lsb(&w);
+        const int    r    = rank_of(sq);
+        const Square stop = sq + NORTH;
+        Score        ps{PASSED_MG[r], PASSED_EG[r]};
+        if (occ & SQUARE_BB[stop])
+          ps.mg = ps.mg * 2 / 3, ps.eg = ps.eg * 2 / 3; // blockaded: it cannot advance
+        ps.eg += (5 * cheb(bk, stop) - 2 * cheb(wk, stop)) * PASSED_KDIST_W[r];
+        s += taper(ps, phase);
       }
-      Bitboard b = bp;
+      Bitboard b = e.bpassed;
       while (b) {
-        Square sq = pop_lsb(&b);
-        if (!(wp & PM.passed[BLACK][sq])) {
-          const int    r    = 7 - rank_of(sq);
-          const Square stop = sq + SOUTH;
-          Score        ps{PASSED_MG[r], PASSED_EG[r]};
-          if (occ & SQUARE_BB[stop])
-            ps.mg = ps.mg * 2 / 3, ps.eg = ps.eg * 2 / 3;
-          ps.eg += (5 * cheb(wk, stop) - 2 * cheb(bk, stop)) * PASSED_KDIST_W[r];
-          s -= taper(ps, phase);
-        }
+        Square       sq   = pop_lsb(&b);
+        const int    r    = 7 - rank_of(sq);
+        const Square stop = sq + SOUTH;
+        Score        ps{PASSED_MG[r], PASSED_EG[r]};
+        if (occ & SQUARE_BB[stop])
+          ps.mg = ps.mg * 2 / 3, ps.eg = ps.eg * 2 / 3;
+        ps.eg += (5 * cheb(wk, stop) - 2 * cheb(bk, stop)) * PASSED_KDIST_W[r];
+        s -= taper(ps, phase);
       }
-
-      // Centered pawns.
-      s += CENTERED_BONUS * pop_count(wp & CENTER);
-      s -= CENTERED_BONUS * pop_count(bp & CENTER);
 
       // Holes / knight outposts. A square is a hole for one side if no pawn of that side can ever
       // attack it (not in its pawn attack span). A knight sitting on the enemy's hole — defended by
       // a friendly pawn, in advanced ranks — is a strong outpost.
-      Bitboard wspan = 0;
-      Bitboard bspan = 0;
-      for (Bitboard t = wp; t;)
-        wspan |= PM.span[WHITE][pop_lsb(&t)];
-      for (Bitboard t = bp; t;)
-        bspan |= PM.span[BLACK][pop_lsb(&t)];
+      const Bitboard wspan = e.wspan;
+      const Bitboard bspan = e.bspan;
 
       for (Bitboard wn = pos.bitboard_of(WHITE, KNIGHT); wn;) {
         Square sq = pop_lsb(&wn);
