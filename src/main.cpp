@@ -23,7 +23,7 @@ int main(int argc, char *argv[]) {
   // book (tools/extract.py output) and exit. No TT needed — only the static eval runs.
   if (argc > 2 && std::string_view(argv[1]) == "tune") {
     const int hw = static_cast<int>(std::thread::hardware_concurrency());
-    tune::run(argv[2], argc > 3 ? std::atoi(argv[3]) : (hw > 2 ? hw - 1 : 1));
+    tune::run(argv[2], argc > 3 ? std::atoi(argv[3]) : (hw > 2 ? hw - 1 : 1), argc > 4 ? std::atof(argv[4]) : 1e-3);
     return 0;
   }
 

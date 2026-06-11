@@ -141,11 +141,38 @@ namespace tune {
 
   } // namespace
 
-  void run(const std::string &book_path, int threads) {
+  void run(const std::string &book_path, int threads, double lambda) {
     if (threads < 1)
       threads = 1;
     const auto &params = eval::params();
     std::cout << "Texel tuning: " << params.size() << " parameters, " << threads << " threads\n";
+
+    // Anti-runaway guards, both relative to the COMPILED-IN defaults (run the tuner from the
+    // hand-tuned baseline, not from a previous tuning round):
+    //  - hard bounds: each parameter may move at most max(2*|default|, 30) from its default —
+    //    collinear features (e.g. the passer bonus vs the king-race term, rook-threatens-rook vs
+    //    everything) otherwise trade off against each other into absurd pairs like -466/+564 that
+    //    happen to cancel on the training set;
+    //  - L2 regularization: the objective is mse + lambda * mean(((v - default)/scale)^2), with
+    //    scale = max(|default|, 10): big drifts must EARN their distance with real error
+    //    reduction. lambda = 0 disables it; ~1e-3 blocks runaways while letting modest moves pass.
+    std::vector<int> def(params.size()), plo(params.size()), phi(params.size());
+    for (size_t i = 0; i < params.size(); ++i) {
+      def[i]         = *params[i].value;
+      const int span = std::max(2 * std::abs(def[i]), 30);
+      plo[i]         = def[i] - span;
+      phi[i]         = def[i] + span;
+    }
+    const auto reg = [&]() {
+      double r = 0.0;
+      for (size_t i = 0; i < params.size(); ++i) {
+        const double sc = std::max(std::abs(static_cast<double>(def[i])), 10.0);
+        const double d  = (static_cast<double>(*params[i].value) - def[i]) / sc;
+        r += d * d;
+      }
+      return lambda * r / static_cast<double>(params.size());
+    };
+    std::printf("regularization: lambda = %g, bounds = default +/- max(2|default|, 30)\n", lambda);
 
     std::vector<Packed> data = load(book_path);
     if (data.size() < 1000) {
@@ -186,8 +213,10 @@ namespace tune {
     std::printf("K = %.4f   initial error: train %.6f  val %.6f  (%zu train / %zu val)\n", K, train, val, ntrain, nval);
     std::cout << std::flush;
 
-    // Coordinate descent with a shrinking step. Each accepted change is printed; an iteration
-    // that changes nothing at step 1 ends the run.
+    // Coordinate descent with a shrinking step, minimising the REGULARIZED objective (see above);
+    // the train/val errors printed stay raw mse so they remain comparable across lambdas. Each
+    // accepted change is printed; an iteration that changes nothing at step 1 ends the run.
+    double     obj    = train + reg();
     const auto tstart = std::chrono::steady_clock::now();
     for (int step: {8, 4, 2, 1}) {
       for (int iter = 1;; ++iter) {
@@ -196,12 +225,16 @@ namespace tune {
           int      &v    = *params[pi].value;
           const int orig = v;
           for (const int trial: {orig + step, orig - step}) {
+            if (trial < plo[pi] || trial > phi[pi])
+              continue; // outside the hard bounds
             v                = trial;
             const double err = mse(data, 0, ntrain, K, threads);
-            if (err + 1e-9 < train) {
+            const double o   = err + reg();
+            if (o + 1e-9 < obj) {
+              obj   = o;
               train = err;
               ++changed;
-              std::printf("  %-22s %4d -> %4d   train %.6f\n", params[pi].name.c_str(), orig, trial, err);
+              std::printf("  %-22s %4d -> %4d   train %.6f  obj %.6f\n", params[pi].name.c_str(), orig, trial, err, o);
               break;
             }
             v = orig; // not better: restore and (maybe) try the other direction
