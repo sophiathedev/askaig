@@ -44,6 +44,58 @@ namespace {
       g_search.join();
   }
 
+  std::string move_to_uci(Move m); // defined below (bench prints bestmoves)
+
+  // --- bench ---------------------------------------------------------------------------------
+  // Fixed positions for "bench": a spread of openings/middlegames/endgames (the perft-suite
+  // classics plus the node-A/B suite this engine is routinely measured on). Searched at a fixed
+  // depth with Threads=1 and a fixed-size, cleared TT, the summed node count is a deterministic
+  // SIGNATURE of the search: any change to search/eval semantics moves it, a pure speedup does
+  // not — the standard way to tell "functional" from "non-functional" patches at a glance (and
+  // the `./askaig bench` convention OpenBench-style testers expect).
+  constexpr const char *BENCH_FENS[] = {
+          "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", // startpos
+          "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", // kiwipete
+          "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", // perft pos3 (rook endgame)
+          "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1", // perft pos4 (promotions)
+          "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8", // perft pos5
+          "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", // perft pos6
+          "r1bq1rk1/pp2ppbp/2np1np1/8/2BNP3/2N1BP2/PPPQ2PP/R3K2R w KQ - 0 1", // dragon yugoslav
+          "r2q1rk1/p1pnbppp/1p2pn2/8/2pP4/2N1PN2/PPQ1BPPP/R1B2RK1 w - - 0 1", // QGD
+          "2r2rk1/1bqnbpp1/1p1ppn1p/pP6/N1P1P3/P2B1N1P/1B2QPP1/R2R2K1 w - - 0 1", // hedgehog
+          "2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - 0 1", // WAC.001 (mating attack)
+          "8/8/4kpp1/3p1b2/p6P/2B5/6P1/6K1 b - - 0 1", // bishop endgame
+          "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1", // K+P vs K
+  };
+  constexpr int BENCH_DEPTH = 12; // default; "bench <depth>" overrides
+
+  void bench_cmd(int depth) {
+    const size_t prev_mb = tt::size_mb(); // restore the user's Hash afterwards
+    tt::resize(16); // fixed size: the signature must not depend on the Hash setting
+    uint64_t   total_nodes = 0;
+    const auto t0          = std::chrono::steady_clock::now();
+    int        i           = 0;
+    for (const char *fen: BENCH_FENS) {
+      tt::clear();
+      search::new_game(); // fresh heuristics per position -> bit-reproducible
+      Position bp;
+      Position::set(fen, bp);
+      search::Result r = search::think(
+              bp, depth, /*threads=*/1, [](int, const search::Result &, uint64_t, long long) {}, 0, 0, false);
+      total_nodes += r.nodes;
+      std::cout << "position " << ++i << "/" << std::size(BENCH_FENS) << " bestmove " << move_to_uci(r.best)
+                << " nodes " << r.nodes << "\n";
+    }
+    const auto ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    std::cout << "\nTotal time (ms) : " << ms << "\nNodes searched  : " << total_nodes
+              << "\nNodes/second    : " << (ms > 0 ? total_nodes * 1000 / static_cast<uint64_t>(ms) : total_nodes)
+              << "\n"
+              << std::flush;
+    tt::resize(prev_mb);
+    search::new_game(); // don't leak bench heuristics into a real game
+  }
+
   // Largest sensible thread count to advertise/accept.
   unsigned max_threads() {
     unsigned hw = std::thread::hardware_concurrency();
@@ -430,6 +482,8 @@ namespace {
 
 } // namespace
 
+void uci::bench(int depth) { bench_cmd(depth > 0 ? depth : BENCH_DEPTH); }
+
 void uci::loop() {
   std::optional<Position> pos;
   pos.emplace();
@@ -491,6 +545,11 @@ void uci::loop() {
     } else if (cmd == "ponderhit") {
       // The predicted move was played: start our clock now (no-op if we aren't pondering).
       search::request_ponderhit(g_ponder_soft, g_ponder_hard);
+    } else if (cmd == "bench") {
+      stop_search(); // bench owns the TT/heuristics while it runs
+      int d = 0;
+      is >> d;
+      bench_cmd(d > 0 ? d : BENCH_DEPTH);
     } else if (cmd == "register" || cmd.empty()) {
       // accepted but no-op
     } else if (cmd == "quit" || cmd == "exit") {
