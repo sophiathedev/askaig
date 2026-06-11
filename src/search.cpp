@@ -136,6 +136,10 @@ namespace search {
       Move    killers[MAX_PLY][2];
       int     history[NCOLORS][NSQUARES][NSQUARES];
       int16_t cont[CONT_PLIES][NPIECE_TO][NPIECE_TO];
+      // Capture history: how often (attacker piece, to-square, victim type) captures cut off,
+      // refining the ordering WITHIN an MVV victim tier (LVA alone knows nothing about position).
+      // Victims indexed P..Q (a king is never captured); same gravity/cap as `cont` (~10 KiB).
+      int16_t capt[NPIECES][NSQUARES][5];
     };
     std::vector<std::unique_ptr<Heuristics>> g_heur; // slot per thread index, persists across searches
     thread_local Heuristics                 *t_heur = nullptr; // this thread's slot, set per search
@@ -214,21 +218,37 @@ namespace search {
       h = static_cast<int16_t>(h + bonus - h * (bonus < 0 ? -bonus : bonus) / CONT_MAX);
     }
 
-    // On a beta cut-off by a quiet move: store it as a killer for this ply, reward its history by
-    // ~depth^2 — and penalise (malus) the quiet moves ALREADY TRIED at this node that failed to cut
-    // (they were refuted where this move wasn't, so they should sort later next time). Only moves
-    // actually searched are punished; quiets skipped by LMP/futility were never refuted. The same
-    // bonus/malus also feeds the continuation histories against the moves 1 and 2 plies back (all
-    // moves are unmade here, so each quiet's piece is back on its from-square).
-    void update_heuristics(const Position &p, Color c, int ply, Move m, int depth, const Move *tried,
-                           int n_tried) noexcept {
+    // The victim type of a capture, read on the unmade position (en passant -> a pawn).
+    [[gnu::pure]] inline PieceType victim_type_of(const Position &p, Move m) noexcept {
+      const Piece v = p.at(m.to());
+      return v == NO_PIECE ? PAWN : type_of(v);
+    }
+
+    // On a beta cut-off: reward the cut-off move's history by ~depth^2 and penalise (malus) the
+    // moves ALREADY TRIED at this node that failed to cut (they were refuted where this move
+    // wasn't, so they should sort later next time). Only moves actually searched are punished;
+    // moves skipped by LMP/futility/SEE were never refuted. A quiet cut-off move also becomes a
+    // killer and feeds the butterfly + continuation histories (against the moves 1 and 2 plies
+    // back); the capture history is fed for the tried captures either way (all moves are unmade
+    // here, so each move's piece is back on its from-square).
+    void update_heuristics(const Position &p, Color c, int ply, Move m, int depth, const Move *quiets, int nq,
+                           const Move *capts, int nc) noexcept {
+      const int bonus = depth * depth;
+
+      // Capture history: bonus for a capture that cut off, malus for every capture searched
+      // before the cut-off move (whatever kind that move was).
+      if (m.is_capture())
+        cont_update(t_heur->capt[p.at(m.from())][m.to()][victim_type_of(p, m)], bonus);
+      for (int j = 0; j < nc; ++j)
+        if (!(capts[j] == m))
+          cont_update(t_heur->capt[p.at(capts[j].from())][capts[j].to()][victim_type_of(p, capts[j])], -bonus);
+
       if (!is_quiet(m))
         return;
       if (ply < MAX_PLY && !(m == t_heur->killers[ply][0])) {
         t_heur->killers[ply][1] = t_heur->killers[ply][0];
         t_heur->killers[ply][0] = m;
       }
-      const int  bonus = depth * depth;
       const int  prev1 = ply >= 1 ? t_move_stack[ply - 1] : -1;
       const int  prev2 = ply >= 2 ? t_move_stack[ply - 2] : -1;
       const auto bump  = [&](Move q, int b) noexcept {
@@ -240,9 +260,9 @@ namespace search {
           cont_update(t_heur->cont[1][prev2][idx], b);
       };
       bump(m, bonus);
-      for (int j = 0; j < n_tried; ++j)
-        if (!(tried[j] == m))
-          bump(tried[j], -bonus);
+      for (int j = 0; j < nq; ++j)
+        if (!(quiets[j] == m))
+          bump(quiets[j], -bonus);
     }
 
     // Mate scores are stored in the TT relative to the node (not the root): a forced mate is
@@ -279,9 +299,13 @@ namespace search {
       if (capture || promo) {
         int score = 1'000'000;
         if (capture) {
-          Piece victim     = pos.at(m.to()); // NO_PIECE for en passant -> count the victim as a pawn
-          int   victim_val = victim == NO_PIECE ? psqt::VALUE[PAWN] : psqt::VALUE[type_of(victim)];
-          score += victim_val * 16 - psqt::VALUE[type_of(pos.at(m.from()))];
+          Piece           victim      = pos.at(m.to()); // NO_PIECE for en passant -> count the victim as a pawn
+          const PieceType victim_type = victim == NO_PIECE ? PAWN : type_of(victim);
+          score += psqt::VALUE[victim_type] * 16 - psqt::VALUE[type_of(pos.at(m.from()))];
+          // Capture history, scaled so it can only reorder WITHIN an MVV victim tier (±CONT_MAX/16
+          // = ±1875 < the 3520 gap between adjacent victim values ×16): the victim hierarchy stays
+          // absolute, the history breaks LVA ties by what actually cut off here before.
+          score += t_heur->capt[pos.at(m.from())][m.to()][victim_type] / 16;
         }
         if (promo)
           score += psqt::VALUE[KNIGHT + (static_cast<int>(f) & 0b11)];
@@ -642,7 +666,9 @@ namespace search {
       int  best     = -INF;
       Move bestMove = Move{};
       Move quiets_tried[MAX_MOVES]; // quiets actually searched at this node (for the history malus)
+      Move capts_tried[MAX_MOVES]; // captures actually searched (for the capture-history malus)
       int  nq = 0;
+      int  nc = 0;
       for (int i = 0; i < n; ++i) {
         pick(moves, scores, i, n);
         Move m = moves[i];
@@ -734,6 +760,8 @@ namespace search {
 
         if (is_quiet(m))
           quiets_tried[nq++] = m; // searched (not pruned away) -> eligible for the malus
+        else if (m.is_capture())
+          capts_tried[nc++] = m;
 
         if (score > best) {
           best     = score;
@@ -749,7 +777,7 @@ namespace search {
         }
         if (alpha >= beta) {
           // Reward the quiet cut-off move; penalise the quiets tried before it (history malus).
-          update_heuristics(p, Us, ply, m, depth, quiets_tried, nq);
+          update_heuristics(p, Us, ply, m, depth, quiets_tried, nq, capts_tried, nc);
           break;
         }
       }
@@ -816,7 +844,8 @@ namespace search {
           }
         }
         if (alpha >= beta) {
-          update_heuristics(p, Us, 0, m, depth, nullptr, 0); // root fail-high: no malus (aspiration artifact)
+          update_heuristics(p, Us, 0, m, depth, nullptr, 0, nullptr,
+                            0); // root fail-high: no malus (aspiration artifact)
           break; // fail-high: the caller re-searches with a wider window
         }
       }
