@@ -115,10 +115,21 @@ void Position::set(const std::string &fen, Position &p) {
   if (ep.size() == 2 && ep[0] >= 'a' && ep[0] <= 'h' && ep[1] >= '1' && ep[1] <= '8')
     p.history[p.game_ply].epsq = create_square(File(ep[0] - 'a'), Rank(ep[1] - '1'));
 
-  // Seed the root position's hash (now fully built) for repetition detection; the halfmove clock
-  // starts at zero (the FEN's counter is ignored, so no pre-root reversible history is assumed).
-  p.history[p.game_ply].hash  = p.hash;
-  p.history[p.game_ply].fifty = 0;
+  // Halfmove clock (5th FEN field, when present): plies since the last irreversible move. It
+  // drives is_draw()'s fifty-move rule and the eval's fifty-move damping, so analysing a mid-game
+  // FEN must not silently reset it to 0 (the engine would overvalue an unconvertible advantage and
+  // miss imminent fifty-move draws). A missing or garbled field leaves 0; the fullmove number (6th
+  // field) stays ignored — game_ply only ever matters relatively. The repetition scan still cannot
+  // see positions from BEFORE the FEN (they were never pushed onto the history), which is inherent
+  // to starting from a FEN.
+  int halfmove = 0;
+  if (ss >> halfmove && halfmove > 0)
+    p.history[p.game_ply].fifty = halfmove;
+  else
+    p.history[p.game_ply].fifty = 0;
+
+  // Seed the root position's hash (now fully built) for repetition detection.
+  p.history[p.game_ply].hash = p.hash;
 }
 
 
