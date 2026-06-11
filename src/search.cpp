@@ -462,15 +462,20 @@ namespace search {
       if (in_check && list.size() == 0)
         return -(MATE - ply); // checkmated at the horizon
 
+      // Fail-soft: track and return the true best score even outside (alpha, beta) — the TT then
+      // carries tighter bounds than the window edges (negamax/search_root already work this way;
+      // quiescence was the fail-hard holdout).
       const int alpha_orig = alpha;
       int       stand_pat  = -INF; // in check: no stand-pat floor, and no eval to cache
+      int       best       = -INF; // in check: only the searched evasions set it (all are searched)
       if (!in_check) {
         stand_pat = ttEval != tt::EVAL_NONE ? ttEval : eval::evaluate(p);
         if (stand_pat >= beta) {
           if (!aborted())
-            tt::store(key, Move{}, score_to_tt(beta, ply), 0, tt::LOWER, stand_pat);
-          return beta;
+            tt::store(key, Move{}, score_to_tt(stand_pat, ply), 0, tt::LOWER, stand_pat);
+          return stand_pat;
         }
+        best = stand_pat;
         if (stand_pat > alpha)
           alpha = stand_pat;
       }
@@ -511,20 +516,22 @@ namespace search {
         int score = -quiescence<~Us>(p, -beta, -alpha, nodes, ply + 1);
         p.undo<Us>(m);
 
+        if (score > best)
+          best = score;
         if (score >= beta) {
           if (!aborted())
-            tt::store(key, m, score_to_tt(beta, ply), 0, tt::LOWER, in_check ? tt::EVAL_NONE : stand_pat);
-          return beta;
+            tt::store(key, m, score_to_tt(best, ply), 0, tt::LOWER, in_check ? tt::EVAL_NONE : stand_pat);
+          return best;
         }
         if (score > alpha)
           alpha = score;
       }
 
-      // No cut-off: alpha raised -> exact; untouched -> an upper bound (true score <= alpha_orig).
+      // No cut-off: the window was entered -> exact; never reached -> an upper bound.
       if (!aborted())
-        tt::store(key, Move{}, score_to_tt(alpha, ply), 0, alpha > alpha_orig ? tt::EXACT : tt::UPPER,
+        tt::store(key, Move{}, score_to_tt(best, ply), 0, best > alpha_orig ? tt::EXACT : tt::UPPER,
                   in_check ? tt::EVAL_NONE : stand_pat);
-      return alpha;
+      return best;
     }
 
     // Fills the move/score buffers from `list`, giving the transposition-table move top priority.
@@ -646,8 +653,8 @@ namespace search {
         t_move_stack[ply] = -1; // a pass carries no (piece, to) to condition continuation history on
         int score         = -negamax<~Us>(p, depth - 1 - R, ply + 1, -beta, -beta + 1, nodes, false, Move{});
         p.undo_null();
-        if (score >= beta)
-          return beta; // fail-high: prune this node
+        if (score >= beta) // fail-high: prune this node (fail-soft, except a reduced null-window
+          return score >= MATE - MAX_MATE_PLY ? beta : score; // result is never trusted as a MATE bound)
         // Mate-threat extension: if passing lets the opponent force mate, this line is dangerous —
         // search it deeper rather than trusting the shallow reductions.
         if (score <= -(MATE - MAX_MATE_PLY))
