@@ -428,25 +428,36 @@ namespace search {
           return ttScore;
       }
 
-      const int alpha_orig = alpha;
-      int       stand_pat  = ttEval != tt::EVAL_NONE ? ttEval : eval::evaluate(p);
-      if (stand_pat >= beta) {
-        if (!aborted())
-          tt::store(key, Move{}, score_to_tt(beta, ply), 0, tt::LOWER, stand_pat);
-        return beta;
-      }
-      if (stand_pat > alpha)
-        alpha = stand_pat;
-
+      // Generate before the stand-pat: the MoveList refreshes p.checkers, and a node IN CHECK has
+      // no stand-pat option (passing is not legal in check) — it must search every evasion, quiet
+      // ones included. This is what catches horizon mates: previously an in-check node here stood
+      // pat on its static eval and only looked at captures, so a mating attack one ply past the
+      // nominal depth could be "evaluated away".
       MoveList<Us> list(p);
-      Move         moves[MAX_MOVES];
-      int          scores[MAX_MOVES];
-      int          n = 0;
+      const bool   in_check = p.checkers != 0;
+      if (in_check && list.size() == 0)
+        return -(MATE - ply); // checkmated at the horizon
+
+      const int alpha_orig = alpha;
+      int       stand_pat  = -INF; // in check: no stand-pat floor, and no eval to cache
+      if (!in_check) {
+        stand_pat = ttEval != tt::EVAL_NONE ? ttEval : eval::evaluate(p);
+        if (stand_pat >= beta) {
+          if (!aborted())
+            tt::store(key, Move{}, score_to_tt(beta, ply), 0, tt::LOWER, stand_pat);
+          return beta;
+        }
+        if (stand_pat > alpha)
+          alpha = stand_pat;
+      }
+
+      Move moves[MAX_MOVES];
+      int  scores[MAX_MOVES];
+      int  n = 0;
       for (Move m: list)
-        if (m.is_capture()) {
-          moves[n] = m;
-          scores[n] =
-                  m == ttMove ? TT_MOVE_SCORE : move_score(p, m, 0); // captures only -> ply unused (no killer/history)
+        if (in_check || m.is_capture()) { // all evasions when in check, else captures only
+          moves[n]  = m;
+          scores[n] = m == ttMove ? TT_MOVE_SCORE : move_score(p, m, 0); // ply 0: no real killers, ordering noise only
           ++n;
         }
 
@@ -455,10 +466,12 @@ namespace search {
         Move m = moves[i];
 
         // Delta pruning: if winning the captured piece (plus a margin) still cannot reach alpha,
-        // this capture is hopeless — skip it. Promotions are exempt (they can swing by a queen).
+        // this capture is hopeless — skip it. Promotions are exempt (they can swing by a queen),
+        // and so are check evasions (every evasion must be considered — there is no stand-pat to
+        // fall back on, and "losing" SEE is irrelevant when the alternative may be mate).
         const MoveFlags f     = m.flags();
         const bool      promo = f >= PC_KNIGHT && f <= PC_QUEEN;
-        if (!promo) {
+        if (!promo && !in_check) {
           const Piece victim = p.at(m.to()); // NO_PIECE for en passant -> the victim is a pawn
           const int   gain   = victim == NO_PIECE ? psqt::VALUE[PAWN] : psqt::VALUE[type_of(victim)];
           if (stand_pat + gain + DELTA_MARGIN <= alpha)
@@ -476,7 +489,7 @@ namespace search {
 
         if (score >= beta) {
           if (!aborted())
-            tt::store(key, m, score_to_tt(beta, ply), 0, tt::LOWER, stand_pat);
+            tt::store(key, m, score_to_tt(beta, ply), 0, tt::LOWER, in_check ? tt::EVAL_NONE : stand_pat);
           return beta;
         }
         if (score > alpha)
@@ -485,7 +498,8 @@ namespace search {
 
       // No cut-off: alpha raised -> exact; untouched -> an upper bound (true score <= alpha_orig).
       if (!aborted())
-        tt::store(key, Move{}, score_to_tt(alpha, ply), 0, alpha > alpha_orig ? tt::EXACT : tt::UPPER, stand_pat);
+        tt::store(key, Move{}, score_to_tt(alpha, ply), 0, alpha > alpha_orig ? tt::EXACT : tt::UPPER,
+                  in_check ? tt::EVAL_NONE : stand_pat);
       return alpha;
     }
 
