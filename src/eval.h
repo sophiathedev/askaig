@@ -1,10 +1,23 @@
 #pragma once
 
+#include <string>
+#include <vector>
 #include "types.h"
 
 class Position;
 
 namespace eval {
+
+  // --- Texel tuning registry ---------------------------------------------------------------
+  // Every "unproven starting value" evaluation constant, exposed by name for the tuner
+  // (`askaig tune`). The defaults reproduce the bench signature exactly; the tuner mutates the
+  // values through the pointers. Structural constants (phase weights, king-attack scale curve,
+  // PeSTO material/PST — already tuned upstream) are deliberately NOT registered.
+  struct Param {
+    std::string name;
+    int        *value;
+  };
+  [[nodiscard]] const std::vector<Param> &params() noexcept;
 
   // Static evaluation (material + PST + pawn structure + king safety + mobility + pins) from the
   // side-to-move's perspective (negamax convention: positive means the side to move is better).

@@ -154,6 +154,11 @@ public:
   [[nodiscard]] inline Bitboard bitboard_of(Color c, PieceType pt) const { return piece_bb[make_piece(c, pt)]; }
   [[nodiscard]] inline Piece    at(Square sq) const { return board[sq]; }
   [[nodiscard]] inline Color    turn() const { return side_to_play; }
+  inline void                   set_turn(Color c) {
+    side_to_play = c;
+  } // for the tuner's scratch positions only:
+    // does NOT touch the hash (search relies on
+    // play/undo/set keeping them consistent)
   [[nodiscard]] inline int      ply() const { return game_ply; }
   [[nodiscard]] inline uint64_t get_hash() const { return hash; }
   [[nodiscard]] inline int      psqt_mg() const { return psqt_mg_score; } // incremental material+PST, MG table

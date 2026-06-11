@@ -16,6 +16,7 @@ add_executable(askaig
     src/eval.cpp
     src/tt.cpp
     src/search.cpp
+    src/tune.cpp
     src/uci.cpp
     src/main.cpp)
 
