@@ -48,6 +48,13 @@ namespace search {
     constexpr int SINGULAR_MIN_DEPTH = 8;
     constexpr int SINGULAR_MARGIN    = 2;
 
+    // ProbCut: at depth >= PROBCUT_MIN_DEPTH, a capture whose (depth - PROBCUT_REDUCTION) search
+    // already beats beta + PROBCUT_MARGIN cuts the node. The margin is in pawn=100 scale and an
+    // unproven starting value (engines with this scale commonly use 100..200).
+    constexpr int PROBCUT_MIN_DEPTH = 5;
+    constexpr int PROBCUT_REDUCTION = 4;
+    constexpr int PROBCUT_MARGIN    = 150;
+
     constexpr int DELTA_MARGIN = 200; // qsearch delta pruning: safety margin above the captured value
 
     // Log-based LMR reduction table, indexed by [depth][move index]: late moves at deep nodes are
@@ -659,6 +666,36 @@ namespace search {
         // search it deeper rather than trusting the shallow reductions.
         if (score <= -(MATE - MAX_MATE_PLY))
           mate_threat = true;
+      }
+
+      // ProbCut: if a capture, searched shallow with the window raised by a wide margin, already
+      // fails high, the full-depth search would almost certainly fail high too — cut now. Gated
+      // like the futility family (can_prune: non-PV, not in check, non-mate), at real depth only,
+      // never during singular verification, and skipped when the TT already holds counter-evidence
+      // (a deep-enough entry whose score sits BELOW the raised beta). Each candidate must first
+      // beat the raised window in a plain qsearch (cheap) before the reduced negamax verification
+      // is paid; a confirmed cut is stored as a depth-(R-1) lower bound so revisits cut instantly.
+      const int pc_beta = beta + PROBCUT_MARGIN;
+      if (can_prune && excluded == Move{} && depth >= PROBCUT_MIN_DEPTH && pc_beta < MATE - MAX_MATE_PLY &&
+          !(tt_hit && ttDepth >= depth - (PROBCUT_REDUCTION - 1) && ttScore < pc_beta)) {
+        for (Move m: list) {
+          if (!m.is_capture())
+            continue;
+          t_move_stack[ply] = piece_to_index(p.at(m.from()), m.to()); // continuation-history context
+          p.play<Us>(m);
+          ++nodes;
+          int v = -quiescence<~Us>(p, -pc_beta, -pc_beta + 1, nodes, ply + 1);
+          if (v >= pc_beta) // qsearch agrees -> pay for the reduced full verification
+            v = -negamax<~Us>(p, depth - PROBCUT_REDUCTION, ply + 1, -pc_beta, -pc_beta + 1, nodes, true, Move{});
+          p.undo<Us>(m);
+          if (aborted())
+            return 0;
+          if (v >= pc_beta) {
+            tt::store(key, m, score_to_tt(v, ply), depth - (PROBCUT_REDUCTION - 1), tt::LOWER,
+                      static_eval == INF ? tt::EVAL_NONE : static_eval);
+            return v;
+          }
+        }
       }
 
       Move moves[MAX_MOVES];
