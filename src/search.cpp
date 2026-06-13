@@ -124,12 +124,13 @@ namespace search {
     //  - killers: quiet moves that caused a beta cut-off at a given ply in a sibling node
     //  - history: how often a quiet (color, from, to) move has caused a cut-off
     //  - cont:    continuation history — quiet-move history conditioned on a PREVIOUS move of the
-    //             current line. cont[0] is keyed by the move 1 ply back (countermove history:
-    //             "after they played that, this reply cuts"), cont[1] by our own move 2 plies back
-    //             (follow-up history). Both moves are flattened to a (piece, to-square) index —
-    //             piece identity matters more than the from-square (the standard formulation), and
-    //             the piece encodes its color, so colors never collide. int16_t (own cap CONT_MAX)
-    //             halves the table's cache footprint vs int — ~3.5 MiB per thread.
+    //             current line, one table per ply-back distance in CONT_OFFSET = {1, 2, 4, 6}:
+    //             cont[0] keyed by the move 1 ply back (countermove history: "after they played
+    //             that, this reply cuts"), cont[1] by our own move 2 plies back (follow-up), and
+    //             cont[2]/cont[3] by the moves 4/6 plies back (longer-range plans). Each prior move
+    //             is flattened to a (piece, to-square) index — piece identity matters more than the
+    //             from-square (the standard formulation), and the piece encodes its color, so colors
+    //             never collide. int16_t (own cap CONT_MAX) halves the cache footprint — ~7 MiB/thread.
     //
     // The slots are PERSISTENT across searches and live in g_heur, NOT in thread_locals: uci.cpp
     // spawns a fresh thread per "go", so a thread_local table would start empty every move — at a
@@ -139,9 +140,10 @@ namespace search {
     // within a game — the gravity update self-ages stale entries — and are cleared only by
     // new_game() ("ucinewgame"). Slots are allocated in think() BEFORE any helper spawns (the
     // vector never grows while threads run); each search thread then points t_heur at its slot.
-    constexpr int CONT_PLIES = 2; // 1 ply back (countermove) and 2 plies back (follow-up)
-    constexpr int NPIECE_TO  = static_cast<int>(NPIECES) * static_cast<int>(NSQUARES);
-    constexpr int CONT_MAX   = 30'000; // gravity cap for the int16_t continuation entries
+    constexpr int CONT_PLIES              = 4; // number of continuation-history tables (one per offset below)
+    constexpr int CONT_OFFSET[CONT_PLIES] = {1, 2, 4, 6}; // plies-back each cont table conditions on
+    constexpr int NPIECE_TO               = static_cast<int>(NPIECES) * static_cast<int>(NSQUARES);
+    constexpr int CONT_MAX                = 30'000; // gravity cap for the int16_t continuation entries
 
     // Pawn correction history: a per-(side, pawn-structure) running estimate of how far the static
     // eval has historically sat from the value the search actually returned. Indexed by a hash of
@@ -177,13 +179,14 @@ namespace search {
     }
 
     // Combined quiet-move statistic: butterfly history plus the continuation histories against the
-    // moves 1 and 2 plies back. `pt_idx` is piece_to_index() of the move being scored.
+    // moves CONT_OFFSET = {1, 2, 4, 6} plies back. `pt_idx` is piece_to_index() of the move scored.
     [[gnu::hot]] inline int quiet_stat(Color c, Move m, int pt_idx, int ply) noexcept {
       int s = t_heur->history[c][m.from()][m.to()];
-      if (ply >= 1 && t_move_stack[ply - 1] >= 0)
-        s += t_heur->cont[0][t_move_stack[ply - 1]][pt_idx];
-      if (ply >= 2 && t_move_stack[ply - 2] >= 0)
-        s += t_heur->cont[1][t_move_stack[ply - 2]][pt_idx];
+      for (int k = 0; k < CONT_PLIES; ++k) {
+        const int o = CONT_OFFSET[k];
+        if (ply >= o && t_move_stack[ply - o] >= 0)
+          s += t_heur->cont[k][t_move_stack[ply - o]][pt_idx];
+      }
       return s;
     }
 
@@ -297,15 +300,15 @@ namespace search {
         t_heur->killers[ply][1] = t_heur->killers[ply][0];
         t_heur->killers[ply][0] = m;
       }
-      const int  prev1 = ply >= 1 ? t_move_stack[ply - 1] : -1;
-      const int  prev2 = ply >= 2 ? t_move_stack[ply - 2] : -1;
-      const auto bump  = [&](Move q, int b) noexcept {
+      int prev[CONT_PLIES];
+      for (int k = 0; k < CONT_PLIES; ++k)
+        prev[k] = ply >= CONT_OFFSET[k] ? t_move_stack[ply - CONT_OFFSET[k]] : -1;
+      const auto bump = [&](Move q, int b) noexcept {
         history_update(t_heur->history[c][q.from()][q.to()], b);
         const int idx = piece_to_index(p.at(q.from()), q.to());
-        if (prev1 >= 0)
-          cont_update(t_heur->cont[0][prev1][idx], b);
-        if (prev2 >= 0)
-          cont_update(t_heur->cont[1][prev2][idx], b);
+        for (int k = 0; k < CONT_PLIES; ++k)
+          if (prev[k] >= 0)
+            cont_update(t_heur->cont[k][prev[k]][idx], b);
       };
       bump(m, bonus);
       for (int j = 0; j < nq; ++j)
