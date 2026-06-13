@@ -14,7 +14,6 @@ extern Bitboard       get_rook_attacks_for_init(Square square, Bitboard occ);
 extern const Bitboard ROOK_MAGICS[NSQUARES];
 extern Bitboard       ROOK_ATTACK_MASKS[NSQUARES];
 extern int            ROOK_ATTACK_SHIFTS[NSQUARES];
-extern Bitboard       ROOK_ATTACKS[NSQUARES][4096];
 extern void           initialise_rook_attacks();
 
 
@@ -25,7 +24,6 @@ extern Bitboard       get_bishop_attacks_for_init(Square square, Bitboard occ);
 extern const Bitboard BISHOP_MAGICS[NSQUARES];
 extern Bitboard       BISHOP_ATTACK_MASKS[NSQUARES];
 extern int            BISHOP_ATTACK_SHIFTS[NSQUARES];
-extern Bitboard       BISHOP_ATTACKS[NSQUARES][512];
 extern void           initialise_bishop_attacks();
 
 

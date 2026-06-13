@@ -42,7 +42,7 @@ if(SIMD)
     target_compile_definitions(askaig PRIVATE SIMD)
     if(ARCH STREQUAL "AVX2")
         target_compile_definitions(askaig PRIVATE ARCH_AVX2)
-        target_compile_options(askaig PRIVATE -mavx2 -mbmi -mpopcnt)
+        target_compile_options(askaig PRIVATE -mavx2 -mbmi -mbmi2 -mpopcnt) # -mbmi2 -> PEXT for sliding attacks
     elseif(ARCH STREQUAL "ARM_NEON")
         target_compile_definitions(askaig PRIVATE ARCH_ARM_NEON)  # NEON is baseline on arm64
     else()
