@@ -21,33 +21,37 @@ table, UCI front-end, SIMD primitives) is built on top of it.
 
 ## Search
 
-A multi-threaded **(Lazy SMP) iterative-deepening PVS** (negamax + alpha-beta) search:
+A multi-threaded **(Lazy SMP) iterative-deepening PVS** (negamax + alpha-beta, **fail-soft**) search:
 
 - **Aspiration windows** around the previous iteration's score.
 - **Principal Variation Search** (full window on the first move, null-window scout on the rest).
-- **Transposition table** — lockless, power-of-two, depth-preferred replacement, ply-adjusted mate scores (default 2 GiB, resizable via `setoption Hash`).
-- **Move ordering** — TT move → MVV-LVA captures → killer moves → **signed history** (gravity bonus on quiet cut-offs, malus for the quiets refuted before them).
-- **Quiescence** search at the horizon (capture resolution) with **delta pruning**.
-- **Draw detection** — repetition and the fifty-move rule are scored as draws in the search (via a per-ply hash + halfmove clock), so the engine claims draws when worse and never repeats away a won position.
-- **Pruning** — null-move pruning (with a zugzwang guard), reverse futility / static null move, futility pruning, late move pruning (LMP), **log-table late move reductions (LMR)** adjusted by the signed history score, **SEE pruning of losing captures** in quiescence, and mate-distance pruning.
-- **Adaptive time management** — clock-based searches scale their per-move budget by best-move stability: more time when the best move keeps changing or the score drops, less when it has settled (banking time for later moves), with a hard cap as a safety net. Also supports `movetime` and pondering.
-- **Extensions** — check, mate-threat, one-reply, passed-pawn, and **singular** extensions.
+- **Transposition table** — lockless, **4-entry bucket** per 64-byte cache line, **generation aging** (eviction by `depth − 8×age`), depth-preferred replacement, carries the **static eval** per entry (reused by shallow pruning nodes), ply-adjusted mate scores. Allocated with `mmap`/`munmap` so resize returns memory to the OS immediately; anonymous pages are lazily faulted (`ucinewgame` is O(1)). Default 2 GiB, resizable via `setoption Hash`.
+- **Move ordering** — TT move → MVV-LVA captures refined by a **capture history** (`[attacker][to][victim type]`, gravity-updated alongside quiet history) → killer moves → **signed butterfly history** + **two-ply continuation history** (countermove + follow-up, keyed by `(piece, to)×(piece, to)`, persistent across searches in per-thread heuristic slots).
+- **Quiescence** search at the horizon with **check evasions** (when in check: no stand-pat, all evasions searched including quiets, mate detected if no legal move), **delta pruning**, and **SEE pruning** of losing captures.
+- **SEE pruning in the main search** — losing quiet moves (`> 65×depth` cp) and losing captures (`> 20×depth²` cp) are skipped at `depth ≤ 9` on non-PV nodes; evaluated with a from-scratch static exchange algorithm including x-ray attackers and king recaptures.
+- **ProbCut** (`depth ≥ 5`) — captures pre-screened by quiescence at `beta + 150`; confirmed by a `depth − 4` search; stored as a lower-bound TT entry.
+- **Draw detection** — repetition and the fifty-move rule scored as draws in the search (per-ply hash + halfmove clock); the engine claims draws when worse and never repeats away a won position.
+- **Pruning** — null-move (adaptive R, zugzwang guard), reverse futility / static null move, futility pruning, late-move pruning (LMP), **log-table LMR** (`1.00 + ln(d)·ln(i)/1.50`) adjusted by the signed butterfly history, and mate-distance pruning.
+- **Adaptive time management** — clock-based searches scale their per-move soft budget by best-move stability (`scale = 1.4 − 0.08×stable`, `+0.3` on score drops ≥ 30 cp, clamped `[0.5, 1.8]`): more time when the best move keeps changing or the score drops, less when it has settled. Hard deadline polled every 2048 nodes to bound any runaway. Also supports `movetime` and **pondering** (`go ponder` + `ponderhit`).
+- **Extensions** — check, mate-threat, one-reply, passed-pawn (pawn pushed to the relative 7th), and **singular** (reduced multi-search shows the TT move is the only good one).
+- **Heuristics persistence** — butterfly, continuation, and capture history tables live in persistent per-thread slots (`g_heur`), carrying over across moves; cleared only by `ucinewgame`. History bonuses and maluses are applied to quiet cut-off moves and the refuted quiets searched before them.
 - The exact **principal variation** is collected via a triangular PV table and reported on each `info` line.
 
 Together these cut the searched node count by **~95%+** on quiet positions versus plain alpha-beta, letting the engine reach much greater depth in the same time. With `Threads 1` the search is fully deterministic.
 
 ## Evaluation
 
-A **tapered** (middlegame ↔ endgame) evaluation, interpolated by game phase from the remaining material:
+A **tapered** (middlegame ↔ endgame) evaluation, interpolated by game phase from the remaining material. All tunable constants were **Texel-tuned** (coordinate descent on self-play positions with L2 regularisation and per-parameter hard bounds):
 
-- **Material + piece-square tables** — [**PeSTO's Evaluation Function**](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) (Ronald Friederich's tuned tables), with separate middlegame/endgame material values and tables for every piece, maintained **incrementally** in the make/unmake primitives (two MG/EG accumulators) and interpolated by game phase.
-- **Pawn structure** — doubled / isolated penalties, a **tapered passed-pawn** bonus (reduced when **blockaded**, plus an endgame **king-distance race** term), centered pawns, and knight **outposts** (a knight on an enemy "hole" defended by a pawn).
-- **King safety** — missing pawn-shield and open/semi-open files beside the king, **scaled by the opponent's attacking material** (fades out in the endgame), plus a **king-zone attack** term (weighted attacks into the ring around the enemy king, scaled by the number of attackers).
-- **Mobility** — per safe square each piece attacks, **tapered** (sliders are worth more on the open endgame board); mobility, threats and king-zone attacks share a **single pass** over the piece attack sets.
+- **Material + piece-square tables** — [**PeSTO's Evaluation Function**](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) (Ronald Friederich's tuned tables), with separate MG/EG material values and tables for every piece. Maintained **incrementally** in the make/unmake primitives (two running MG/EG accumulators) and interpolated by game phase.
+- **Pawn structure** — doubled / isolated penalties, a **tapered passed-pawn** bonus (reduced when **blockaded**, plus an endgame **king-distance race** term), centered pawns, and knight **outposts** (a knight on an enemy "hole" defended by a pawn). Evaluated via a **per-thread pawn cache** (exact `(wp, bp)` match, ~8k entries) so most positions pay O(1) for the pawn terms.
+- **King safety** — missing pawn-shield and open/semi-open files beside the king, **scaled by the opponent's attacking material** (fades out in the endgame), plus a **king-zone attack** term (weighted attacks into the ring around the enemy king, scaled by the number of distinct attackers, quartered in the endgame).
+- **Mobility** — per safe square each piece attacks, **tapered** (sliders are worth more on the open endgame board); mobility, threats, and king-zone attacks share a **single pass** over the piece attack maps so the costly magic-bitboard lookups are done exactly once per piece.
 - **Threats** — pieces attacked by pawns / minors / rooks (by victim type) and **hanging** (attacked, undefended) pieces.
 - **Pin penalties** for pieces pinned to their own king.
 - **Bishop pair** (tapered), **rook on an open / semi-open file**, and **rook on the 7th rank** (tapered).
 - A **tempo** bonus for the side to move.
+- **Fifty-move damping** — the static eval is damped toward zero as the halfmove clock approaches 100 (so the engine doesn't over-value a winning position it can no longer convert).
 
 ## Building
 
@@ -80,6 +84,29 @@ Supported commands: `uci`, `isready`, `ucinewgame`, `position [startpos | fen <f
 (clock-based time management), `go ponder` + `ponderhit` (think on the opponent's time), `go infinite`
 (search until `stop`), `go perft <depth>`, `setoption name Hash value <MB>`, `setoption name Threads value <n>`,
 `d` / `display`, `eval` (static evaluation of the current position), `stop`, `quit`.
+
+### Benchmark
+
+```bash
+./build/askaig bench          # 12 fixed positions, Threads=1, 16 MB TT — prints per-position nodes
+./build/askaig bench 10       # same at depth 10
+```
+
+The total node count is a **bit-reproducible search signature**: functional patches (changed
+move-ordering, pruning, extensions) change it; pure refactors and UCI changes don't. Use it to
+classify changes before running full SPRT.
+
+### Texel tuning
+
+```bash
+./build/askaig tune <book> [threads] [lambda]
+```
+
+`<book>` is a `<FEN> <result>` file (one line per position, result in `{1.0, 0.5, 0.0}` from
+White's POV). The tuner fits the sigmoid scale K by ternary search, then runs coordinate descent
+over all 64 eval constants, minimising `mse + λ × L2_penalty` (L2 pulls toward compiled-in
+defaults; hard bounds prevent collinear features from trading off into absurd pairs). Progress and
+the final paste-ready dump are printed to stdout; results are also written to `<book>.tuned`.
 
 ## Correctness (perft)
 
