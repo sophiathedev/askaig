@@ -28,13 +28,15 @@ namespace search {
     constexpr int HISTORY_MAX   = 100'000; // cap on history scores (kept below the killers)
 
     // Forward-pruning margins for shallow non-PV nodes (futility-pruning family).
-    constexpr int RFP_MAX_DEPTH      = 6; // reverse futility (static null move) up to this depth
-    constexpr int RFP_MARGIN         = 80; // per-depth eval surplus over beta needed to prune
-    constexpr int FUTILITY_MAX_DEPTH = 4; // move-loop futility up to this depth
-    constexpr int FUTILITY_MARGIN    = 100; // per-depth eval deficit below alpha that prunes quiets
-    constexpr int LMP_MAX_DEPTH      = 4; // late-move (move-count) pruning up to this depth
-    constexpr int RAZOR_MAX_DEPTH    = 3; // razoring up to this depth
-    constexpr int RAZOR_MARGIN       = 200; // per-depth eval deficit below alpha that triggers a qsearch verify
+    constexpr int RFP_MAX_DEPTH           = 6; // reverse futility (static null move) up to this depth
+    constexpr int RFP_MARGIN              = 80; // per-depth eval surplus over beta needed to prune
+    constexpr int FUTILITY_MAX_DEPTH      = 4; // move-loop futility up to this depth
+    constexpr int FUTILITY_MARGIN         = 100; // per-depth eval deficit below alpha that prunes quiets
+    constexpr int LMP_MAX_DEPTH           = 4; // late-move (move-count) pruning up to this depth
+    constexpr int RAZOR_MAX_DEPTH         = 3; // razoring up to this depth
+    constexpr int RAZOR_MARGIN            = 200; // per-depth eval deficit below alpha that triggers a qsearch verify
+    constexpr int HISTORY_PRUNE_MAX_DEPTH = 4; // history pruning up to this depth
+    constexpr int HISTORY_PRUNE_MARGIN    = 4096; // per-depth quiet-history floor below which a quiet is skipped
 
     // SEE pruning in the main search (quiescence has its own): at shallow depths, skip moves that
     // lose material to the exchange on their destination square. Captures get a per-depth^2
@@ -780,6 +782,12 @@ namespace search {
             continue;
           // Futility pruning: if the static eval plus a margin can't reach alpha, skip the quiet.
           if (depth <= FUTILITY_MAX_DEPTH && static_eval + FUTILITY_MARGIN * depth <= alpha)
+            continue;
+          // History pruning: a quiet whose combined history score is strongly negative has been
+          // refuted here repeatedly — at shallow depth skip it. scores[i] IS that history value for
+          // a non-killer quiet (killers carry a large positive score, TT/captures larger still, so
+          // none of those are ever caught by the negative threshold).
+          if (depth <= HISTORY_PRUNE_MAX_DEPTH && scores[i] < -HISTORY_PRUNE_MARGIN * depth)
             continue;
         }
         // SEE pruning: skip a move that loses material on its destination square (same gates as
