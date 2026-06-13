@@ -154,7 +154,7 @@ namespace search {
     constexpr int CORR_SIZE  = 16384; // buckets per side (power of two)
     constexpr int CORR_MASK  = CORR_SIZE - 1;
     constexpr int CORR_LIMIT = 1024; // gravity cap on a stored entry
-    constexpr int CORR_GRAIN = 16; // entry / CORR_GRAIN = the cp correction applied (per table; max ±64 cp)
+    constexpr int CORR_GRAIN = 32; // entry / CORR_GRAIN = the cp correction applied (per table; max ±32 cp)
 
     struct Heuristics {
       Move    killers[MAX_PLY][2];
@@ -164,9 +164,15 @@ namespace search {
       // refining the ordering WITHIN an MVV victim tier (LVA alone knows nothing about position).
       // Victims indexed P..Q (a king is never captured); same gravity/cap as `cont` (~10 KiB).
       int16_t capt[NPIECES][NSQUARES][5];
-      // Correction history (see above): [side][pawn-hash bucket] and [side][non-pawn-hash bucket].
-      int corr[NCOLORS][CORR_SIZE];
-      int corr_np[NCOLORS][CORR_SIZE];
+      // Correction history (see above): four material-structure tables [side][structure-hash bucket]
+      // (pawn skeleton / all non-pawn / minor pieces N+B / major pieces R+Q) plus a continuation
+      // correction keyed by the move one ply back ([prev (piece,to) index] — the piece encodes the
+      // side, so it is not indexed by color). All summed in corrected_eval, all taught by corr_update.
+      int corr[NCOLORS][CORR_SIZE]; // pawn structure
+      int corr_np[NCOLORS][CORR_SIZE]; // all non-pawn material
+      int corr_minor[NCOLORS][CORR_SIZE]; // minor pieces (knights + bishops)
+      int corr_major[NCOLORS][CORR_SIZE]; // major pieces (rooks + queens)
+      int corr_cont[NPIECE_TO]; // continuation: keyed by the previous move's (piece, to)
     };
     std::vector<std::unique_ptr<Heuristics>> g_heur; // slot per thread index, persists across searches
     thread_local Heuristics                 *t_heur = nullptr; // this thread's slot, set per search
@@ -270,22 +276,49 @@ namespace search {
       return static_cast<int>((k >> 47) & CORR_MASK);
     }
 
-    // The raw eval nudged by this side's learned corrections (pawn structure + non-pawn material,
-    // summed), clamped clear of the mate range so it can never masquerade as a forced mate.
-    [[gnu::hot, gnu::always_inline]] inline int corrected_eval(const Position &p, Color c, int raw) noexcept {
-      const int corr = t_heur->corr[c][corr_index(p)] + t_heur->corr_np[c][corr_np_index(p)];
+    // Bucket index for the minor pieces (knights + bishops, both colors).
+    [[gnu::pure, gnu::always_inline]] inline int corr_minor_index(const Position &p) noexcept {
+      const uint64_t k = p.bitboard_of(WHITE, KNIGHT) * 0xFF51AFD7ED558CCDULL ^
+                         p.bitboard_of(BLACK, KNIGHT) * 0xC4CEB9FE1A85EC53ULL ^
+                         p.bitboard_of(WHITE, BISHOP) * 0x9E3779B97F4A7C15ULL ^
+                         p.bitboard_of(BLACK, BISHOP) * 0xC2B2AE3D27D4EB4FULL;
+      return static_cast<int>((k >> 47) & CORR_MASK);
+    }
+
+    // Bucket index for the major pieces (rooks + queens, both colors).
+    [[gnu::pure, gnu::always_inline]] inline int corr_major_index(const Position &p) noexcept {
+      const uint64_t k =
+              p.bitboard_of(WHITE, ROOK) * 0x165667B19E3779F9ULL ^ p.bitboard_of(BLACK, ROOK) * 0x27D4EB2F165667C5ULL ^
+              p.bitboard_of(WHITE, QUEEN) * 0x2545F4914F6CDD1DULL ^ p.bitboard_of(BLACK, QUEEN) * 0xD6E8FEB86659FD93ULL;
+      return static_cast<int>((k >> 47) & CORR_MASK);
+    }
+
+    // The raw eval nudged by this side's learned corrections: four material-structure tables (pawn /
+    // non-pawn / minor / major) plus the continuation correction keyed by the move `prev_pt` one ply
+    // back (skipped when prev_pt < 0). Summed (each entry / CORR_GRAIN) and clamped clear of the mate
+    // range so it can never masquerade as a forced mate.
+    [[gnu::hot, gnu::always_inline]] inline int corrected_eval(const Position &p, Color c, int raw,
+                                                               int prev_pt) noexcept {
+      int corr = t_heur->corr[c][corr_index(p)] + t_heur->corr_np[c][corr_np_index(p)] +
+                 t_heur->corr_minor[c][corr_minor_index(p)] + t_heur->corr_major[c][corr_major_index(p)];
+      if (prev_pt >= 0)
+        corr += t_heur->corr_cont[prev_pt];
       return std::clamp(raw + corr / CORR_GRAIN, -(MATE - MAX_MATE_PLY) + 1, MATE - MAX_MATE_PLY - 1);
     }
 
-    // Pull both of this side's correction tables toward the (search - static) error, with the same
+    // Pull all of this side's correction tables toward the (search - static) error, with the same
     // self-capping/self-aging gravity formula the other history tables use.
-    [[gnu::always_inline]] inline void corr_update(const Position &p, Color c, int depth, int diff) noexcept {
-      const int bonus  = std::clamp(diff * depth / 8, -CORR_LIMIT / 4, CORR_LIMIT / 4);
-      const int absb   = bonus < 0 ? -bonus : bonus;
-      int      &pawn   = t_heur->corr[c][corr_index(p)];
-      int      &nonpaw = t_heur->corr_np[c][corr_np_index(p)];
-      pawn += bonus - pawn * absb / CORR_LIMIT;
-      nonpaw += bonus - nonpaw * absb / CORR_LIMIT;
+    [[gnu::always_inline]] inline void corr_update(const Position &p, Color c, int depth, int diff,
+                                                   int prev_pt) noexcept {
+      const int  bonus = std::clamp(diff * depth / 8, -CORR_LIMIT / 4, CORR_LIMIT / 4);
+      const int  absb  = bonus < 0 ? -bonus : bonus;
+      const auto pull  = [&](int &e) noexcept { e += bonus - e * absb / CORR_LIMIT; };
+      pull(t_heur->corr[c][corr_index(p)]);
+      pull(t_heur->corr_np[c][corr_np_index(p)]);
+      pull(t_heur->corr_minor[c][corr_minor_index(p)]);
+      pull(t_heur->corr_major[c][corr_major_index(p)]);
+      if (prev_pt >= 0)
+        pull(t_heur->corr_cont[prev_pt]);
     }
 
     // The victim type of a capture, read on the unmade position (en passant -> a pawn).
@@ -540,8 +573,11 @@ namespace search {
       int       best       = -INF; // in check: only the searched evasions set it (all are searched)
       int       raw_eval   = tt::EVAL_NONE; // uncorrected eval for the TT field (EVAL_NONE in check)
       if (!in_check) {
-        raw_eval  = ttEval != tt::EVAL_NONE ? ttEval : eval::evaluate(p);
-        stand_pat = corrected_eval(p, Us, raw_eval); // pawn-correction-adjusted, like the main search
+        raw_eval = ttEval != tt::EVAL_NONE ? ttEval : eval::evaluate(p);
+        // Correction-adjusted, like the main search, but with no continuation term (prev_pt = -1):
+        // quiescence does not maintain t_move_stack below its entry node, so the move-one-ply-back
+        // key would be stale deeper in. The four material-structure corrections still apply.
+        stand_pat = corrected_eval(p, Us, raw_eval, -1);
         if (stand_pat >= beta) {
           if (!aborted())
             tt::store(key, Move{}, score_to_tt(stand_pat, ply), 0, tt::LOWER, raw_eval);
@@ -696,10 +732,13 @@ namespace search {
 
       // Captured now because the null-move / child searches below overwrite p.checkers.
       const bool in_check = p.checkers != 0;
+      // (piece, to) of the move one ply back — the continuation-correction key (valid here: the
+      // parent set it before recursing; this node only writes t_move_stack[ply]). -1 = none.
+      const int prev_pt = ply >= 1 ? t_move_stack[ply - 1] : -1;
 
       // Static eval at every non-check interior node (the TT carries it across revisits, so this is
       // cheap). Two forms: `raw_eval` (uncorrected, stored in the TT eval field) and `static_eval`
-      // (nudged by the pawn correction history — see corrected_eval — and used for every pruning
+      // (nudged by the correction histories — see corrected_eval — and used for every pruning
       // decision and for the post-search correction update). INF means "not computed" (in check).
       int        raw_eval    = INF;
       int        static_eval = INF;
@@ -710,7 +749,7 @@ namespace search {
         // halfmove clock — the hash omits it — so the fifty-move damping can be slightly off; the
         // same staleness is already accepted for stored scores.)
         raw_eval    = ttEval != tt::EVAL_NONE ? ttEval : eval::evaluate(p);
-        static_eval = corrected_eval(p, Us, raw_eval);
+        static_eval = corrected_eval(p, Us, raw_eval, prev_pt);
         // Reverse futility pruning (static null move): a depth-scaled margin above beta -> prune.
         if (can_prune && depth <= RFP_MAX_DEPTH && static_eval - RFP_MARGIN * depth >= beta)
           return static_eval;
@@ -925,14 +964,14 @@ namespace search {
         tt::Bound bound = best <= alpha_orig ? tt::UPPER : (best >= beta ? tt::LOWER : tt::EXACT);
         tt::store(key, bestMove, score_to_tt(best, ply), depth, bound, raw_eval == INF ? tt::EVAL_NONE : raw_eval);
         // Correction history: when not in check and the best move is quiet, and the search bound
-        // corroborates the direction of the (search - static) gap, teach this pawn structure that
-        // gap so future static evals of the same skeleton are less biased. Captures are excluded
-        // (their swing is tactical, not a structural eval bias), as are mate-range scores.
+        // corroborates the direction of the (search - static) gap, teach every correction table
+        // that gap so future static evals of the same structure are less biased. Captures are
+        // excluded (their swing is tactical, not a structural eval bias), as are mate-range scores.
         if (!in_check && static_eval != INF && !bestMove.is_capture() && best < MATE - MAX_MATE_PLY &&
             best > -(MATE - MAX_MATE_PLY) &&
             (bound == tt::EXACT || (bound == tt::LOWER && best > static_eval) ||
              (bound == tt::UPPER && best < static_eval)))
-          corr_update(p, Us, depth, best - static_eval);
+          corr_update(p, Us, depth, best - static_eval, prev_pt);
       }
       return best;
     }
