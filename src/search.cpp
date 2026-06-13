@@ -145,15 +145,16 @@ namespace search {
     constexpr int NPIECE_TO               = static_cast<int>(NPIECES) * static_cast<int>(NSQUARES);
     constexpr int CONT_MAX                = 30'000; // gravity cap for the int16_t continuation entries
 
-    // Pawn correction history: a per-(side, pawn-structure) running estimate of how far the static
-    // eval has historically sat from the value the search actually returned. Indexed by a hash of
-    // the two pawn bitboards (positions sharing a pawn skeleton share a correction entry), it nudges
-    // the raw eval toward the truth — the static eval is biased in structure-dependent ways (it
-    // under/over-values a fixed pawn chain, an outpost hole, etc.) that one learned offset captures.
+    // Correction history: a per-(side, structure) running estimate of how far the static eval has
+    // historically sat from the value the search actually returned, nudging the raw eval toward the
+    // truth — the static eval is biased in structure-dependent ways (it under/over-values a fixed
+    // pawn chain, a piece configuration) that a learned offset captures. Two independent tables,
+    // summed: one keyed by the pawn skeleton (the two pawn bitboards), one by the non-pawn material
+    // (the knight/bishop/rook/queen bitboards). Positions sharing that structure share an entry.
     constexpr int CORR_SIZE  = 16384; // buckets per side (power of two)
     constexpr int CORR_MASK  = CORR_SIZE - 1;
     constexpr int CORR_LIMIT = 1024; // gravity cap on a stored entry
-    constexpr int CORR_GRAIN = 16; // entry / CORR_GRAIN = the cp correction applied (so max ±64 cp)
+    constexpr int CORR_GRAIN = 16; // entry / CORR_GRAIN = the cp correction applied (per table; max ±64 cp)
 
     struct Heuristics {
       Move    killers[MAX_PLY][2];
@@ -163,8 +164,9 @@ namespace search {
       // refining the ordering WITHIN an MVV victim tier (LVA alone knows nothing about position).
       // Victims indexed P..Q (a king is never captured); same gravity/cap as `cont` (~10 KiB).
       int16_t capt[NPIECES][NSQUARES][5];
-      // Pawn correction history (see above), keyed [side][pawn-hash bucket]. ~128 KiB.
+      // Correction history (see above): [side][pawn-hash bucket] and [side][non-pawn-hash bucket].
       int corr[NCOLORS][CORR_SIZE];
+      int corr_np[NCOLORS][CORR_SIZE];
     };
     std::vector<std::unique_ptr<Heuristics>> g_heur; // slot per thread index, persists across searches
     thread_local Heuristics                 *t_heur = nullptr; // this thread's slot, set per search
@@ -245,7 +247,7 @@ namespace search {
       h = static_cast<int16_t>(h + bonus - h * (bonus < 0 ? -bonus : bonus) / CONT_MAX);
     }
 
-    // --- Pawn correction history ------------------------------------------------------------
+    // --- Correction history -----------------------------------------------------------------
     // Bucket index for the current pawn structure (both colors' pawns mixed into a hash).
     [[gnu::pure, gnu::always_inline]] inline int corr_index(const Position &p) noexcept {
       const uint64_t wp = p.bitboard_of(WHITE, PAWN);
@@ -254,19 +256,36 @@ namespace search {
       return static_cast<int>((k >> 47) & CORR_MASK);
     }
 
-    // The raw eval nudged by this side's learned pawn-structure correction, clamped clear of the
-    // mate range so it can never masquerade as a forced mate in a pruning comparison.
-    [[gnu::hot, gnu::always_inline]] inline int corrected_eval(const Position &p, Color c, int raw) noexcept {
-      const int adj = raw + t_heur->corr[c][corr_index(p)] / CORR_GRAIN;
-      return std::clamp(adj, -(MATE - MAX_MATE_PLY) + 1, MATE - MAX_MATE_PLY - 1);
+    // Bucket index for the non-pawn material configuration (the eight knight/bishop/rook/queen
+    // bitboards mixed into a hash; the king is omitted — its bias is largely the pawn-shield term,
+    // already captured by the pawn table).
+    [[gnu::pure, gnu::always_inline]] inline int corr_np_index(const Position &p) noexcept {
+      uint64_t k =
+              p.bitboard_of(WHITE, KNIGHT) * 0xFF51AFD7ED558CCDULL ^
+              p.bitboard_of(BLACK, KNIGHT) * 0xC4CEB9FE1A85EC53ULL ^
+              p.bitboard_of(WHITE, BISHOP) * 0x9E3779B97F4A7C15ULL ^
+              p.bitboard_of(BLACK, BISHOP) * 0xC2B2AE3D27D4EB4FULL ^
+              p.bitboard_of(WHITE, ROOK) * 0x165667B19E3779F9ULL ^ p.bitboard_of(BLACK, ROOK) * 0x27D4EB2F165667C5ULL ^
+              p.bitboard_of(WHITE, QUEEN) * 0x2545F4914F6CDD1DULL ^ p.bitboard_of(BLACK, QUEEN) * 0xD6E8FEB86659FD93ULL;
+      return static_cast<int>((k >> 47) & CORR_MASK);
     }
 
-    // Pull this side's pawn-structure correction toward the (search - static) error, with the same
+    // The raw eval nudged by this side's learned corrections (pawn structure + non-pawn material,
+    // summed), clamped clear of the mate range so it can never masquerade as a forced mate.
+    [[gnu::hot, gnu::always_inline]] inline int corrected_eval(const Position &p, Color c, int raw) noexcept {
+      const int corr = t_heur->corr[c][corr_index(p)] + t_heur->corr_np[c][corr_np_index(p)];
+      return std::clamp(raw + corr / CORR_GRAIN, -(MATE - MAX_MATE_PLY) + 1, MATE - MAX_MATE_PLY - 1);
+    }
+
+    // Pull both of this side's correction tables toward the (search - static) error, with the same
     // self-capping/self-aging gravity formula the other history tables use.
     [[gnu::always_inline]] inline void corr_update(const Position &p, Color c, int depth, int diff) noexcept {
-      int      &e     = t_heur->corr[c][corr_index(p)];
-      const int bonus = std::clamp(diff * depth / 8, -CORR_LIMIT / 4, CORR_LIMIT / 4);
-      e += bonus - e * (bonus < 0 ? -bonus : bonus) / CORR_LIMIT;
+      const int bonus  = std::clamp(diff * depth / 8, -CORR_LIMIT / 4, CORR_LIMIT / 4);
+      const int absb   = bonus < 0 ? -bonus : bonus;
+      int      &pawn   = t_heur->corr[c][corr_index(p)];
+      int      &nonpaw = t_heur->corr_np[c][corr_np_index(p)];
+      pawn += bonus - pawn * absb / CORR_LIMIT;
+      nonpaw += bonus - nonpaw * absb / CORR_LIMIT;
     }
 
     // The victim type of a capture, read on the unmade position (en passant -> a pawn).
