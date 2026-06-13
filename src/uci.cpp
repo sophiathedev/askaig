@@ -432,11 +432,12 @@ namespace {
       const int     mtg   = movestogo > 0 ? movestogo : 40; // assume 40 moves to go under sudden death
       const int64_t avail = std::max<int64_t>(t - MOVE_OVERHEAD_MS, 1);
       // Optimum slice of the clock for this move (a share of the remaining time plus the increment);
-      // the search scales it by best-move stability. The hard cap bounds a single move to ~5x the
-      // optimum and never more than 75% of what we have, so we keep reserves for the rest of the game.
+      // the search scales it by best-move stability. The hard cap bounds a single move to 3x the
+      // optimum and never more than HALF of what we have left — a long final iteration can't drain
+      // the bank and leave us scraping by 2s in the middlegame. (Was 5x / 75%, which front-loaded.)
       const int64_t opt = std::min(avail / mtg + inc, avail);
       soft_ms           = std::max<int64_t>(opt, 1);
-      hard_ms           = std::clamp<int64_t>(opt * 5, soft_ms, std::max<int64_t>(avail * 3 / 4, 1));
+      hard_ms           = std::max<int64_t>(soft_ms, std::min<int64_t>(opt * 3, std::max<int64_t>(avail / 2, 1)));
     } else if (infinite) {
       max_depth = search::MAX_DEPTH; // search to the ply ceiling — effectively until "stop"
     } else if (depth > 0) {

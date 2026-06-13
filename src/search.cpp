@@ -1227,10 +1227,13 @@ namespace search {
         stable    = best.best == last_best ? std::min(stable + 1, 10) : 0;
         last_best = best.best;
 
-        double scale = 1.4 - 0.08 * stable; // 1.4 (just changed) down to 0.6 (very stable)
+        double scale = 1.2 - 0.07 * stable; // 1.2 (just changed) down to ~0.5 (stable for ~10 iters)
         if (have_prev_sc && best.score + 30 < prev_iter_sc)
           scale += 0.3; // the position got worse — look harder for something better
-        scale = std::clamp(scale, 0.5, 1.8);
+        // Tighter ceiling than before (was 1.4 base / 1.8 cap): the opening is full of unstable
+        // best moves, and spending ~1.8x on each of those front-loaded the clock and left the engine
+        // on increment by the middlegame. A 1.5 cap banks that time for later instead.
+        scale = std::clamp(scale, 0.5, 1.5);
 
         prev_iter_sc = best.score;
         have_prev_sc = true;
