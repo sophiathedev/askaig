@@ -168,6 +168,7 @@ namespace search {
     thread_local Heuristics                 *t_heur = nullptr; // this thread's slot, set per search
 
     thread_local int t_move_stack[MAX_PLY + 1]; // (piece,to) played at each ply of the current line
+    thread_local int t_static_eval[MAX_PLY + 1]; // corrected static eval per ply (INF in check), for "improving"
 
     // Flattened (piece, to-square) index of a move; must be taken BEFORE the move is played (the
     // piece is read from its from-square).
@@ -702,6 +703,16 @@ namespace search {
         }
       }
 
+      // Record this node's static eval (INF when in check) on the per-ply stack and derive the
+      // "improving" flag: our static eval is higher than it was two plies ago (same side to move),
+      // i.e. the position is trending our way. Used ONLY to reduce late quiet moves one ply more
+      // when NOT improving (a stagnant/worsening line spends less on its unpromising tail). NOTE: an
+      // improving heuristic was previously rejected for RFP-margin / LMP-count tuning (SPRT -23.7);
+      // this is a deliberately narrower, distinct application (LMR depth only) and is SPRT-gated.
+      t_static_eval[ply] = static_eval;
+      const bool improving =
+              !in_check && ply >= 2 && t_static_eval[ply - 2] != INF && static_eval > t_static_eval[ply - 2];
+
       // Null-move pruning: if passing the turn (a free move for the opponent) still leaves us at
       // >= beta after a shallower search, the position is so good we can prune. Skipped when in
       // check (can't pass), shallow, right after a null move, during a singular search, near mate
@@ -843,6 +854,8 @@ namespace search {
             reduction = LMR_TABLE[depth < 63 ? depth : 63][i < 63 ? i : 63];
             if (is_pv)
               --reduction;
+            if (!improving)
+              ++reduction; // a stagnant/worsening line reduces its late quiets one ply more
             // History-informed adjustment: quiets with a strong (signed) history record are reduced
             // less, persistent fail-lows more. Deliberately the butterfly history ONLY: feeding the
             // combined stat (with a rescaled divisor) in here was SPRT-tested together with the
