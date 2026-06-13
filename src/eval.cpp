@@ -13,43 +13,43 @@ namespace eval {
 
     // Penalties (centipawns) and a passed-pawn bonus indexed by the pawn's own rank of advancement
     // (rank 1 = just left home ... rank 6 = one step from promotion).
-    int DOUBLED_PENALTY  = 13; // tunable (see eval::params)
-    int ISOLATED_PENALTY = 10; // tunable
+    int DOUBLED_PENALTY  = 12; // tunable (see eval::params)
+    int ISOLATED_PENALTY = 9; // tunable
     // Passed-pawn bonus, indexed by rank of advancement, tapered: passers are worth far more in the
     // endgame (often decisive) than the middlegame (where pieces blockade/round them up).
-    int PASSED_MG[8] = {0, -3, -50, 2, 28, 40, 95, 0}; // tunable [1..6]
-    int PASSED_EG[8] = {0, -3, 33, 28, 20, -2, -90, 0}; // tunable [1..6]
+    int PASSED_MG[8] = {0, 0, -42, 1, 28, 48, 119, 0}; // tunable [1..6]
+    int PASSED_EG[8] = {0, -1, 41, 25, 25, 2, -42, 0}; // tunable [1..6]
     // Passed-pawn refinements: a blockaded passer (any piece on its stop square) keeps only 2/3 of
     // the bonus, and in the endgame the kings join the race — per square of Chebyshev distance from
     // the stop square, the ENEMY king being far is worth +5 eg and our own king being far costs -2
     // eg, weighted by how advanced the passer is (irrelevant for a pawn still at home, decisive on
     // the 7th). Starting values for SPRT tuning.
-    int PASSED_KDIST_W[8] = {0, 0, 0, 2, 6, 6, 8, 0}; // by rank of advancement; tunable [3..6]
-    int CENTERED_BONUS    = 2; // pawn on a central square (d4/e4/d5/e5); tunable
-    int OUTPOST_BONUS     = 25; // knight on a hole, defended by a pawn, in advanced ranks; tunable
+    int PASSED_KDIST_W[8] = {0, 0, 0, 1, 6, 8, 8, 0}; // by rank of advancement; tunable [3..6]
+    int CENTERED_BONUS    = -5; // pawn on a central square (d4/e4/d5/e5); tunable
+    int OUTPOST_BONUS     = 16; // knight on a hole, defended by a pawn, in advanced ranks; tunable
 
     // King safety: penalty per missing pawn-shield file and per open/semi-open file by the king,
     // scaled by the opponent's attacking material (KS_MAX_POWER = full middlegame) so it fades out
     // in the endgame, where the king should instead be active.
-    int           SHIELD_DEFICIT    = 16; // tunable
-    int           OPEN_FILE_PENALTY = 20; // tunable
+    int           SHIELD_DEFICIT    = 4; // tunable
+    int           OPEN_FILE_PENALTY = 28; // tunable
     constexpr int KS_MAX_POWER      = 12;
 
     // Mobility: bonus per safe square a piece can move to (not onto own pieces or enemy-pawn-
     // controlled squares), indexed by PieceType and tapered — sliders are worth more per square in
     // the (open) endgame. Pinned: penalty per piece pinned to its own king.
-    int MOB_MG[NPIECE_TYPES] = {0, 7, 6, 6, 4, 0}; // P N B R Q K; tunable [N..Q]
-    int MOB_EG[NPIECE_TYPES] = {0, 2, 4, 2, 7, 0}; // tunable [N..Q]
-    int PIN_PENALTY          = 23; // tunable
+    int MOB_MG[NPIECE_TYPES] = {0, 8, 6, 4, 3, 0}; // P N B R Q K; tunable [N..Q]
+    int MOB_EG[NPIECE_TYPES] = {0, 6, 3, 2, 2, 0}; // tunable [N..Q]
+    int PIN_PENALTY          = 16; // tunable
 
     // Piece bonuses: the bishop pair (worth more in the open endgame), a rook on a fully open or
     // semi-open (no friendly pawn) file, and a rook on the relative 7th rank (decisive in endgames).
-    int BISHOP_PAIR_MG = 9; // tunable
-    int BISHOP_PAIR_EG = 23; // tunable
-    int ROOK_OPEN      = 13; // file with no pawns at all; tunable
-    int ROOK_SEMIOPEN  = 6; // file with no friendly pawns; tunable
-    int ROOK_7TH_MG    = -70; // tunable
-    int ROOK_7TH_EG    = 35; // tunable
+    int BISHOP_PAIR_MG = 11; // tunable
+    int BISHOP_PAIR_EG = 35; // tunable
+    int ROOK_OPEN      = 10; // file with no pawns at all; tunable
+    int ROOK_SEMIOPEN  = 0; // file with no friendly pawns; tunable
+    int ROOK_7TH_MG    = -68; // tunable
+    int ROOK_7TH_EG    = 30; // tunable
 
     // A middlegame/endgame score pair and its interpolation by game phase (PHASE_MAX = middlegame).
     struct Score {
@@ -61,25 +61,25 @@ namespace eval {
     // piece we attack that the enemy does not defend). Tapered. Values are deliberately modest and
     // SHOULD be tuned by SPRT self-play (tools/sprt.sh) — these are reasonable starting points, not
     // proven optima. Indexed by the *threatened* (victim) piece type; bigger victims = bigger threat.
-    Score THREAT_BY_PAWN                = {51, 28}; // a pawn attacks any enemy minor/rook/queen; tunable
-    Score THREAT_BY_MINOR[NPIECE_TYPES] = {{0, 0},   {29, 38},  {37, 15},
-                                           {44, -4}, {56, -47}, {0, 0}}; // victim: P N B R Q K; tunable [N..Q]
-    Score THREAT_BY_ROOK[NPIECE_TYPES]  = {{0, 0},      {28, 8}, {22, 13},
-                                           {-466, 564}, {58, 6}, {0, 0}}; // rooks chiefly threaten R/Q; tunable [N..Q]
-    Score HANGING                       = {20, 8}; // per undefended enemy piece we attack; tunable
+    Score THREAT_BY_PAWN                = {31, 28}; // a pawn attacks any enemy minor/rook/queen; tunable
+    Score THREAT_BY_MINOR[NPIECE_TYPES] = {{0, 0},   {23, 33},  {27, 17},
+                                           {36, -4}, {53, -47}, {0, 0}}; // victim: P N B R Q K; tunable [N..Q]
+    Score THREAT_BY_ROOK[NPIECE_TYPES]  = {{0, 0},      {19, 8}, {20, 12},
+                                           {-436, 578}, {60, 6}, {0, 0}}; // rooks chiefly threaten R/Q; tunable [N..Q]
+    Score HANGING                       = {18, 8}; // per undefended enemy piece we attack; tunable
 
     // King-zone attacks: each knight/bishop/rook/queen attack into the ring around the enemy king
     // (the king's square + its 8 neighbours) earns weight units; the total is then scaled by the
     // NUMBER of distinct attacking pieces — one piece alone cannot mate, so danger grows steeply as
     // attackers join (0% for <2 attackers). Score = units * scale% * KING_ATT_UNIT cp, mostly a
     // middlegame term (quartered in the endgame). Starting values — to be SPRT-tuned like threats.
-    int           KING_ATT_WEIGHT[NPIECE_TYPES] = {0, 4, -1, 3, 9, 0}; // P N B R Q K (per zone square); tunable [N..Q]
+    int           KING_ATT_WEIGHT[NPIECE_TYPES] = {0, 4, -5, 3, 12, 0}; // P N B R Q K (per zone square); tunable [N..Q]
     constexpr int KING_ATT_SCALE[8]             = {0, 0, 50, 75, 88, 94, 97, 99}; // % by attacker count
     int           KING_ATT_UNIT                 = 7; // cp per weighted unit (after the % scale); tunable
 
     // Tempo: a small bonus for simply being the side to move (the mover usually has the option to
     // improve their position). Also damps eval oscillation between plies. Starting values for SPRT.
-    Score TEMPO = {15, 2}; // tunable
+    Score TEMPO = {8, 2}; // tunable
 
     [[gnu::const, gnu::always_inline]] inline int taper(Score s, int phase) noexcept {
       return (s.mg * phase + s.eg * (psqt::PHASE_MAX - phase)) / psqt::PHASE_MAX;
