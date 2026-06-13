@@ -139,6 +139,16 @@ namespace search {
     constexpr int NPIECE_TO  = static_cast<int>(NPIECES) * static_cast<int>(NSQUARES);
     constexpr int CONT_MAX   = 30'000; // gravity cap for the int16_t continuation entries
 
+    // Pawn correction history: a per-(side, pawn-structure) running estimate of how far the static
+    // eval has historically sat from the value the search actually returned. Indexed by a hash of
+    // the two pawn bitboards (positions sharing a pawn skeleton share a correction entry), it nudges
+    // the raw eval toward the truth — the static eval is biased in structure-dependent ways (it
+    // under/over-values a fixed pawn chain, an outpost hole, etc.) that one learned offset captures.
+    constexpr int CORR_SIZE  = 16384; // buckets per side (power of two)
+    constexpr int CORR_MASK  = CORR_SIZE - 1;
+    constexpr int CORR_LIMIT = 1024; // gravity cap on a stored entry
+    constexpr int CORR_GRAIN = 16; // entry / CORR_GRAIN = the cp correction applied (so max ±64 cp)
+
     struct Heuristics {
       Move    killers[MAX_PLY][2];
       int     history[NCOLORS][NSQUARES][NSQUARES];
@@ -147,6 +157,8 @@ namespace search {
       // refining the ordering WITHIN an MVV victim tier (LVA alone knows nothing about position).
       // Victims indexed P..Q (a king is never captured); same gravity/cap as `cont` (~10 KiB).
       int16_t capt[NPIECES][NSQUARES][5];
+      // Pawn correction history (see above), keyed [side][pawn-hash bucket]. ~128 KiB.
+      int corr[NCOLORS][CORR_SIZE];
     };
     std::vector<std::unique_ptr<Heuristics>> g_heur; // slot per thread index, persists across searches
     thread_local Heuristics                 *t_heur = nullptr; // this thread's slot, set per search
@@ -223,6 +235,30 @@ namespace search {
     // promotes to int, and the result is bounded by ±CONT_MAX so it always fits back).
     [[gnu::always_inline]] inline void cont_update(int16_t &h, int bonus) noexcept {
       h = static_cast<int16_t>(h + bonus - h * (bonus < 0 ? -bonus : bonus) / CONT_MAX);
+    }
+
+    // --- Pawn correction history ------------------------------------------------------------
+    // Bucket index for the current pawn structure (both colors' pawns mixed into a hash).
+    [[gnu::pure, gnu::always_inline]] inline int corr_index(const Position &p) noexcept {
+      const uint64_t wp = p.bitboard_of(WHITE, PAWN);
+      const uint64_t bp = p.bitboard_of(BLACK, PAWN);
+      const uint64_t k  = wp * 0x9E3779B97F4A7C15ULL ^ bp * 0xC2B2AE3D27D4EB4FULL;
+      return static_cast<int>((k >> 47) & CORR_MASK);
+    }
+
+    // The raw eval nudged by this side's learned pawn-structure correction, clamped clear of the
+    // mate range so it can never masquerade as a forced mate in a pruning comparison.
+    [[gnu::hot, gnu::always_inline]] inline int corrected_eval(const Position &p, Color c, int raw) noexcept {
+      const int adj = raw + t_heur->corr[c][corr_index(p)] / CORR_GRAIN;
+      return std::clamp(adj, -(MATE - MAX_MATE_PLY) + 1, MATE - MAX_MATE_PLY - 1);
+    }
+
+    // Pull this side's pawn-structure correction toward the (search - static) error, with the same
+    // self-capping/self-aging gravity formula the other history tables use.
+    [[gnu::always_inline]] inline void corr_update(const Position &p, Color c, int depth, int diff) noexcept {
+      int      &e     = t_heur->corr[c][corr_index(p)];
+      const int bonus = std::clamp(diff * depth / 8, -CORR_LIMIT / 4, CORR_LIMIT / 4);
+      e += bonus - e * (bonus < 0 ? -bonus : bonus) / CORR_LIMIT;
     }
 
     // The victim type of a capture, read on the unmade position (en passant -> a pawn).
@@ -475,11 +511,13 @@ namespace search {
       const int alpha_orig = alpha;
       int       stand_pat  = -INF; // in check: no stand-pat floor, and no eval to cache
       int       best       = -INF; // in check: only the searched evasions set it (all are searched)
+      int       raw_eval   = tt::EVAL_NONE; // uncorrected eval for the TT field (EVAL_NONE in check)
       if (!in_check) {
-        stand_pat = ttEval != tt::EVAL_NONE ? ttEval : eval::evaluate(p);
+        raw_eval  = ttEval != tt::EVAL_NONE ? ttEval : eval::evaluate(p);
+        stand_pat = corrected_eval(p, Us, raw_eval); // pawn-correction-adjusted, like the main search
         if (stand_pat >= beta) {
           if (!aborted())
-            tt::store(key, Move{}, score_to_tt(stand_pat, ply), 0, tt::LOWER, stand_pat);
+            tt::store(key, Move{}, score_to_tt(stand_pat, ply), 0, tt::LOWER, raw_eval);
           return stand_pat;
         }
         best = stand_pat;
@@ -527,7 +565,7 @@ namespace search {
           best = score;
         if (score >= beta) {
           if (!aborted())
-            tt::store(key, m, score_to_tt(best, ply), 0, tt::LOWER, in_check ? tt::EVAL_NONE : stand_pat);
+            tt::store(key, m, score_to_tt(best, ply), 0, tt::LOWER, raw_eval);
           return best;
         }
         if (score > alpha)
@@ -536,8 +574,7 @@ namespace search {
 
       // No cut-off: the window was entered -> exact; never reached -> an upper bound.
       if (!aborted())
-        tt::store(key, Move{}, score_to_tt(best, ply), 0, best > alpha_orig ? tt::EXACT : tt::UPPER,
-                  in_check ? tt::EVAL_NONE : stand_pat);
+        tt::store(key, Move{}, score_to_tt(best, ply), 0, best > alpha_orig ? tt::EXACT : tt::UPPER, raw_eval);
       return best;
     }
 
@@ -633,18 +670,22 @@ namespace search {
       // Captured now because the null-move / child searches below overwrite p.checkers.
       const bool in_check = p.checkers != 0;
 
-      // Static eval, computed once for the futility-pruning heuristics (only at shallow non-PV,
-      // not-in-check, non-mate nodes — where these prunings apply). INF means "not computed".
+      // Static eval at every non-check interior node (the TT carries it across revisits, so this is
+      // cheap). Two forms: `raw_eval` (uncorrected, stored in the TT eval field) and `static_eval`
+      // (nudged by the pawn correction history — see corrected_eval — and used for every pruning
+      // decision and for the post-search correction update). INF means "not computed" (in check).
+      int        raw_eval    = INF;
       int        static_eval = INF;
       const bool can_prune   = !is_pv && !in_check && beta < MATE - MAX_MATE_PLY && beta > -(MATE - MAX_MATE_PLY);
-      if (can_prune && depth <= RFP_MAX_DEPTH) {
-        // Reuse the static eval stored in the TT when the position was seen before — evaluate()
-        // is the dominant cost at these shallow nodes. (The stored eval may have been computed at
-        // a different halfmove clock — the hash omits it — so the fifty-move damping can be
-        // slightly off; the same staleness is already accepted for stored scores.)
-        static_eval = ttEval != tt::EVAL_NONE ? ttEval : eval::evaluate(p);
+      if (!in_check) {
+        // Reuse the static eval stored in the TT when the position was seen before — evaluate() is
+        // the dominant cost at these nodes. (The stored eval may have been computed at a different
+        // halfmove clock — the hash omits it — so the fifty-move damping can be slightly off; the
+        // same staleness is already accepted for stored scores.)
+        raw_eval    = ttEval != tt::EVAL_NONE ? ttEval : eval::evaluate(p);
+        static_eval = corrected_eval(p, Us, raw_eval);
         // Reverse futility pruning (static null move): a depth-scaled margin above beta -> prune.
-        if (static_eval - RFP_MARGIN * depth >= beta)
+        if (can_prune && depth <= RFP_MAX_DEPTH && static_eval - RFP_MARGIN * depth >= beta)
           return static_eval;
       }
 
@@ -692,7 +733,7 @@ namespace search {
             return 0;
           if (v >= pc_beta) {
             tt::store(key, m, score_to_tt(v, ply), depth - (PROBCUT_REDUCTION - 1), tt::LOWER,
-                      static_eval == INF ? tt::EVAL_NONE : static_eval);
+                      raw_eval == INF ? tt::EVAL_NONE : raw_eval);
             return v;
           }
         }
@@ -828,8 +869,16 @@ namespace search {
 
       if (!aborted() && excluded == Move{}) { // don't store a partial (aborted) or singular result
         tt::Bound bound = best <= alpha_orig ? tt::UPPER : (best >= beta ? tt::LOWER : tt::EXACT);
-        tt::store(key, bestMove, score_to_tt(best, ply), depth, bound,
-                  static_eval == INF ? tt::EVAL_NONE : static_eval);
+        tt::store(key, bestMove, score_to_tt(best, ply), depth, bound, raw_eval == INF ? tt::EVAL_NONE : raw_eval);
+        // Correction history: when not in check and the best move is quiet, and the search bound
+        // corroborates the direction of the (search - static) gap, teach this pawn structure that
+        // gap so future static evals of the same skeleton are less biased. Captures are excluded
+        // (their swing is tactical, not a structural eval bias), as are mate-range scores.
+        if (!in_check && static_eval != INF && !bestMove.is_capture() && best < MATE - MAX_MATE_PLY &&
+            best > -(MATE - MAX_MATE_PLY) &&
+            (bound == tt::EXACT || (bound == tt::LOWER && best > static_eval) ||
+             (bound == tt::UPPER && best < static_eval)))
+          corr_update(p, Us, depth, best - static_eval);
       }
       return best;
     }
