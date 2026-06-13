@@ -33,6 +33,8 @@ namespace search {
     constexpr int FUTILITY_MAX_DEPTH = 4; // move-loop futility up to this depth
     constexpr int FUTILITY_MARGIN    = 100; // per-depth eval deficit below alpha that prunes quiets
     constexpr int LMP_MAX_DEPTH      = 4; // late-move (move-count) pruning up to this depth
+    constexpr int RAZOR_MAX_DEPTH    = 3; // razoring up to this depth
+    constexpr int RAZOR_MARGIN       = 200; // per-depth eval deficit below alpha that triggers a qsearch verify
 
     // SEE pruning in the main search (quiescence has its own): at shallow depths, skip moves that
     // lose material to the exchange on their destination square. Captures get a per-depth^2
@@ -687,6 +689,15 @@ namespace search {
         // Reverse futility pruning (static null move): a depth-scaled margin above beta -> prune.
         if (can_prune && depth <= RFP_MAX_DEPTH && static_eval - RFP_MARGIN * depth >= beta)
           return static_eval;
+        // Razoring: when the static eval is far enough BELOW alpha that even resolving every capture
+        // is unlikely to recover, drop straight to a quiescence search; if that also fails to reach
+        // alpha, prune (return its fail-low score). The qsearch verification is what keeps this safe
+        // against a tactic the static eval missed — we only bail when the captures don't rescue it.
+        if (can_prune && depth <= RAZOR_MAX_DEPTH && static_eval + RAZOR_MARGIN * depth <= alpha) {
+          const int v = quiescence<Us>(p, alpha, beta, nodes, ply);
+          if (v <= alpha)
+            return v;
+        }
       }
 
       // Null-move pruning: if passing the turn (a free move for the opponent) still leaves us at
