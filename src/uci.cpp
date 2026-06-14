@@ -20,7 +20,10 @@
 
 namespace {
 
-  constexpr auto ENGINE_NAME   = "Askaig 20260608";
+#ifndef ASKAIG_VERSION
+#define ASKAIG_VERSION "dev" // set by CMake (the build date YYYYMMDD); see CMakeLists.txt
+#endif
+  constexpr auto ENGINE_NAME   = "Askaig " ASKAIG_VERSION;
   constexpr auto ENGINE_AUTHOR = "the Askaig developers (see AUTHORS file)";
 
   // Number of search threads (the "Threads" UCI option).

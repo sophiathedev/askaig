@@ -1,0 +1,138 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Pinned LLVM-MinGW toolchain (clang + lld + libc++) used to cross-build the Windows binaries.
+  # Bump the tag to update; the asset name pattern is llvm-mingw-<tag>-ucrt-ubuntu-<ver>-x86_64.tar.xz.
+  LLVM_MINGW_TAG: "20250709"
+  LLVM_MINGW_UBUNTU: "22.04"
+
+jobs:
+  # Compute the build date ONCE so every binary and the release tag share it (even across UTC midnight).
+  meta:
+    runs-on: ubuntu-24.04
+    outputs:
+      date: ${{ steps.d.outputs.date }}
+    steps:
+      - id: d
+        run: echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: meta
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+            arch: AVX2
+            artifact: askaig-linux-x86_64
+          - name: macos-x86_64
+            runner: macos-15
+            arch: AVX2
+            osx_arch: x86_64
+            artifact: askaig-macos-x86_64
+          - name: macos-arm64
+            runner: macos-15
+            arch: ARM_NEON
+            osx_arch: arm64
+            artifact: askaig-macos-arm64
+          - name: windows-x86_64
+            runner: ubuntu-24.04
+            arch: AVX2
+            mingw_triple: x86_64-w64-mingw32
+            mingw_proc: x86_64
+            artifact: askaig-windows-x86_64.exe
+          - name: windows-arm64
+            runner: ubuntu-24.04
+            arch: ARM_NEON
+            mingw_triple: aarch64-w64-mingw32
+            mingw_proc: arm64
+            artifact: askaig-windows-arm64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      # cmake_minimum_required(VERSION 4.3) is a high floor — install a recent CMake on every runner.
+      - uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: latest
+
+      - name: Install Linux deps (native + Windows-cross host)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 ninja-build
+          # Windows cross targets: fetch the pinned LLVM-MinGW toolchain.
+          if [ -n "${{ matrix.mingw_triple }}" ]; then
+            url="https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_TAG}/llvm-mingw-${LLVM_MINGW_TAG}-ucrt-ubuntu-${LLVM_MINGW_UBUNTU}-x86_64.tar.xz"
+            curl -fL "$url" -o llvm-mingw.tar.xz
+            mkdir -p "$HOME/llvm-mingw"
+            tar -xf llvm-mingw.tar.xz -C "$HOME/llvm-mingw" --strip-components=1
+            echo "$HOME/llvm-mingw/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install macOS deps
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Configure & build (native — Linux / macOS)
+        if: ${{ matrix.mingw_triple == '' }}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSIMD=ON -DARCH=${{ matrix.arch }} \
+            -DASKAIG_VERSION=${{ needs.meta.outputs.date }} \
+            ${{ runner.os == 'Linux' && '-DCMAKE_CXX_COMPILER=g++-14' || '' }} \
+            ${{ matrix.osx_arch && format('-DCMAKE_OSX_ARCHITECTURES={0}', matrix.osx_arch) || '' }}
+          cmake --build build -j
+
+      - name: Configure & build (Windows cross — LLVM-MinGW)
+        if: ${{ matrix.mingw_triple != '' }}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSIMD=ON -DARCH=${{ matrix.arch }} \
+            -DASKAIG_VERSION=${{ needs.meta.outputs.date }} \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.mingw_proc }} \
+            -DCMAKE_C_COMPILER=${{ matrix.mingw_triple }}-clang \
+            -DCMAKE_CXX_COMPILER=${{ matrix.mingw_triple }}-clang++ \
+            -DCMAKE_EXE_LINKER_FLAGS=-static
+          cmake --build build -j
+
+      - name: Rename binary
+        run: |
+          if [ -f build/askaig.exe ]; then mv build/askaig.exe "${{ matrix.artifact }}"; \
+          else mv build/askaig "${{ matrix.artifact }}"; fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    needs: [meta, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.meta.outputs.date }}
+          name: Askaig ${{ needs.meta.outputs.date }}
+          files: dist/*
+          fail_on_unmatched_files: true

@@ -25,6 +25,14 @@ target_include_directories(askaig PRIVATE src)
 find_package(Threads REQUIRED)
 target_link_libraries(askaig PRIVATE Threads::Threads)
 
+# Build-date version. CI passes -DASKAIG_VERSION=<YYYYMMDD> (shared across all targets, == the release
+# tag); a plain local build auto-stamps the configure date. uci.cpp falls back to "dev" if undefined.
+if(NOT DEFINED ASKAIG_VERSION)
+    string(TIMESTAMP ASKAIG_VERSION "%Y%m%d" UTC)
+endif()
+target_compile_definitions(askaig PRIVATE ASKAIG_VERSION="${ASKAIG_VERSION}")
+message(STATUS "Askaig version: ${ASKAIG_VERSION}")
+
 # SIMD / hardware bit-intrinsics. ARCH auto-detects from the host (override with -DARCH=...).
 option(SIMD "Enable SIMD/hardware bit intrinsics" ON)
 set(ARCH "" CACHE STRING "Target SIMD arch: AVX2 or ARM_NEON (auto-detected when empty)")
