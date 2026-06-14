@@ -480,6 +480,49 @@ namespace eval {
       return mob + thr + katt;
     }
 
+    // --- Drawish-endgame scaling -------------------------------------------------------------
+    // Many material configurations are dead or near-dead draws even with a nominal material edge; the
+    // engine must not score them as wins (or it trades into them). scale_factor returns a
+    // 0..SCALE_NORMAL multiplier for the White-perspective score `s` — it only narrows a winning eval
+    // toward 0, never flips the sign. White-POV: s > 0 means White is the (nominally) stronger side.
+    // Pawnless cases are tested first, so a pawnless opposite-bishop position hits the dead-draw
+    // branch rather than the OCB branch (which is for OCB *with* pawns). Starting values, SPRT-tune.
+    constexpr int      SCALE_NORMAL  = 64;
+    constexpr int      SCALE_DRAWISH = 16; // only ~a minor up with no pawns (rook-vs-minor, R+B vs R…)
+    constexpr int      SCALE_OCB     = 26; // opposite-coloured bishops (with pawns) — notoriously drawish
+    constexpr Bitboard LIGHT_SQUARES = 0x55AA55AA55AA55AAULL;
+
+    [[gnu::pure]] int scale_factor(const Position &pos, int s) noexcept {
+      const Color strong = s > 0 ? WHITE : BLACK;
+      const Color weak   = ~strong;
+      const auto  cnt    = [&](Color c, PieceType pt) noexcept { return pop_count(pos.bitboard_of(c, pt)); };
+
+      const int sP = cnt(strong, PAWN);
+      const int sN = cnt(strong, KNIGHT), sB = cnt(strong, BISHOP), sR = cnt(strong, ROOK), sQ = cnt(strong, QUEEN);
+      const int wN = cnt(weak, KNIGHT), wB = cnt(weak, BISHOP), wR = cnt(weak, ROOK), wQ = cnt(weak, QUEEN);
+      const int sNPM = 3 * (sN + sB) + 5 * sR + 9 * sQ; // non-pawn material in pawn-ish units
+      const int wNPM = 3 * (wN + wB) + 5 * wR + 9 * wQ;
+
+      // Stronger side has NO pawns: forcing a win needs real material superiority it may lack.
+      if (sP == 0) {
+        if (sNPM <= 3) // at most one minor: cannot force mate (KN/KB vs K, minor vs minor)
+          return 0;
+        if (sN == 2 && sB == 0 && sR == 0 && sQ == 0 && wNPM == 0) // two knights vs lone king: no forced mate
+          return 0;
+        if (sNPM - wNPM <= 3) // only ~a minor up (rook vs minor, R+B vs R, equal heavy material…)
+          return SCALE_DRAWISH;
+      }
+
+      // Opposite-coloured bishops with no other pieces (only B + pawns): notoriously drawish.
+      if (sQ == 0 && wQ == 0 && sR == 0 && wR == 0 && sN == 0 && wN == 0 && sB == 1 && wB == 1) {
+        const bool sLight = (pos.bitboard_of(strong, BISHOP) & LIGHT_SQUARES) != 0;
+        const bool wLight = (pos.bitboard_of(weak, BISHOP) & LIGHT_SQUARES) != 0;
+        if (sLight != wLight)
+          return SCALE_OCB;
+      }
+      return SCALE_NORMAL;
+    }
+
   } // namespace
 
   [[gnu::pure]] bool is_passed_pawn(const Position &pos, Color c, Square sq) noexcept {
@@ -507,6 +550,11 @@ namespace eval {
     s += piece_activity(pos, phase); // mobility + threats + king-zone attacks, one shared attack pass
     s += pin_penalty(pos);
     s += piece_bonuses(pos, phase);
+
+    // Drawish-endgame scaling: narrow a nominal material edge toward 0 in dead / near-dead-drawn
+    // material configurations (insufficient minors, rook-vs-minor, opposite-coloured bishops) so the
+    // engine neither overvalues them nor trades into them. Applied before the side-to-move flip.
+    s = s * scale_factor(pos, s) / SCALE_NORMAL;
 
     // White-perspective score flipped to the side to move, plus the tempo bonus for that side.
     const int v = (pos.turn() == WHITE ? s : -s) + taper(TEMPO, phase);
