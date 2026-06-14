@@ -383,6 +383,37 @@ namespace {
   constexpr int     DEFAULT_DEPTH    = 8;
   constexpr int64_t MOVE_OVERHEAD_MS = 30; // safety buffer for GUI/transport lag, reserved from the clock
 
+  // Plays a Move on `p`, dispatching on the side to move (Position::play is templated on Color).
+  void play_any(Position &p, Move m) {
+    if (p.turn() == WHITE)
+      p.play<WHITE>(m);
+    else
+      p.play<BLACK>(m);
+  }
+
+  // Truncates a reported principal variation so it never continues past a draw by the fifty-move rule
+  // or repetition: replaying `pv` from `root`, a continuation move that would reach a draw is dropped
+  // (along with the rest), so the last reported position is never a claimed draw. The first move (the
+  // bestmove) is always kept, even if it itself reaches the draw. This only changes the `info ... pv`
+  // / ponder OUTPUT — not the search — and silences match-runner "PV continues after fifty-move rule"
+  // warnings, which the draw-seeking eval terms (fifty-move damping, drawish scaling) made frequent.
+  std::vector<Move> clamp_pv_to_draw(const Position &root, const std::vector<Move> &pv) {
+    Position          p = clone_position(root);
+    std::vector<Move> out;
+    for (Move m: pv) {
+      Position nxt = clone_position(p);
+      play_any(nxt, m);
+      const bool draw = nxt.is_draw();
+      if (draw && !out.empty())
+        break; // a later move reaches a draw -> stop before it (no PV move follows a drawn position)
+      play_any(p, m);
+      out.push_back(m);
+      if (draw)
+        break; // even the first move reaches the draw: keep it (it is the bestmove) but go no further
+    }
+    return out;
+  }
+
   // Handles "go ...". "go perft <depth>" counts move-generation nodes; otherwise it runs an
   // iterative-deepening, multi-threaded (Lazy SMP) negamax/alpha-beta search. Recognised limits:
   //   depth <n>            — fixed depth (default DEFAULT_DEPTH when no limit is given)
@@ -471,14 +502,15 @@ namespace {
     g_search     = std::thread([pp, max_depth, soft_ms, hard_ms, ponder]() {
       search::Result r = search::think(
               *pp, max_depth, g_threads,
-              [](int d, const search::Result &res, uint64_t nodes, long long ms) {
+              [pp](int d, const search::Result &res, uint64_t nodes, long long ms) {
                 const uint64_t              nps = ms > 0 ? nodes * 1000 / static_cast<uint64_t>(ms) : nodes * 1000;
+                const std::vector<Move>     pv  = clamp_pv_to_draw(*pp, res.pv); // don't report past a draw
                 std::lock_guard<std::mutex> lk(g_out);
                 std::cout << "info depth " << d << " seldepth " << res.seldepth << " score " << format_score(res.score)
                           << " nodes " << nodes << " nps " << nps << " time " << ms;
-                if (!res.pv.empty()) {
+                if (!pv.empty()) {
                   std::cout << " pv";
-                  for (Move m: res.pv)
+                  for (Move m: pv)
                     std::cout << " " << move_to_uci(m);
                 } else if (res.best.to_from() != 0)
                   std::cout << " pv " << move_to_uci(res.best);
@@ -486,10 +518,11 @@ namespace {
               },
               soft_ms, hard_ms, ponder);
 
+      const std::vector<Move>     pv = clamp_pv_to_draw(*pp, r.pv); // don't ponder into a draw either
       std::lock_guard<std::mutex> lk(g_out);
       std::cout << "bestmove " << (r.best.to_from() != 0 ? move_to_uci(r.best) : "0000");
-      if (r.pv.size() >= 2) // the move we expect the opponent to reply with -> the GUI can ponder on it
-        std::cout << " ponder " << move_to_uci(r.pv[1]);
+      if (pv.size() >= 2) // the move we expect the opponent to reply with -> the GUI can ponder on it
+        std::cout << " ponder " << move_to_uci(pv[1]);
       std::cout << "\n" << std::flush;
     });
   }
