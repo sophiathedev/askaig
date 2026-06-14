@@ -55,6 +55,9 @@ namespace search {
     // move and uses a window `SINGULAR_MARGIN * depth` below the TT score.
     int SINGULAR_MIN_DEPTH = 7;
     int SINGULAR_MARGIN    = 3;
+    // Double extension: if the singular verification falls this far BELOW the singular window, the TT
+    // move is not just singular but far better than every alternative -> extend it 2 plies, not 1.
+    int DOUBLE_EXT_MARGIN = 50; // cp below sBeta (non-PV only); tunable
 
     // ProbCut: at depth >= PROBCUT_MIN_DEPTH, a capture whose (depth - PROBCUT_REDUCTION) search
     // already beats beta + PROBCUT_MARGIN cuts the node. The margin is in pawn=100 scale and an
@@ -875,9 +878,9 @@ namespace search {
             !see_ge(p, m, is_quiet(m) ? -SEE_QUIET_MARGIN * depth : -SEE_CAPT_MARGIN * depth * depth))
           continue;
 
-        // Per-move extension (capped at one ply): node-level (check / mate threat) or singular TT
-        // move. (A recapture extension was tried and removed: it cost ~+40% nodes while quiescence
-        // and the check extension already cover exchange resolution — SPRT preferred it gone.)
+        // Per-move extension (node-level check/mate-threat or a singular TT move; up to two plies for
+        // a decisively-singular move — see below). (A recapture extension was tried and removed: it
+        // cost ~+40% nodes while quiescence and the check extension already cover exchange resolution.)
         int ext = node_ext;
         if (!ext && depth >= SINGULAR_MIN_DEPTH && m == ttMove && excluded == Move{} && tt_hit &&
             ttDepth >= depth - 3 && ttBound != tt::UPPER && ttScore > -(MATE - MAX_MATE_PLY) &&
@@ -887,8 +890,15 @@ namespace search {
           const int sBeta  = ttScore - SINGULAR_MARGIN * depth;
           const int sDepth = (depth - 1) / 2;
           const int v      = negamax<Us>(p, sDepth, ply, sBeta - 1, sBeta, nodes, false, cutNode, m);
-          if (v < sBeta)
+          if (v < sBeta) {
             ext = 1;
+            // Double extension: the best alternative falls not just short of the singular window but
+            // well below it -> the TT move is decisively the only good move, search it two plies
+            // deeper. Non-PV only (PV lines are already searched to full depth) and gated by the
+            // singular conditions (depth >= 7, a deep TT move) so it stays rare.
+            if (!is_pv && v < sBeta - DOUBLE_EXT_MARGIN)
+              ext = 2;
+          }
         }
         if (!ext && type_of(p.at(m.from())) == PAWN &&
             ((Us == WHITE && rank_of(m.to()) == RANK7) || (Us == BLACK && rank_of(m.to()) == RANK2)) &&
@@ -1149,6 +1159,7 @@ namespace search {
             {"SEE_PRUNE_MAX_DEPTH", &SEE_PRUNE_MAX_DEPTH, 5, 14},
             {"SINGULAR_MIN_DEPTH", &SINGULAR_MIN_DEPTH, 5, 12},
             {"SINGULAR_MARGIN", &SINGULAR_MARGIN, 1, 6},
+            {"DOUBLE_EXT_MARGIN", &DOUBLE_EXT_MARGIN, 8, 200},
             {"PROBCUT_MARGIN", &PROBCUT_MARGIN, 60, 300},
             {"PROBCUT_MIN_DEPTH", &PROBCUT_MIN_DEPTH, 3, 8},
             {"PROBCUT_REDUCTION", &PROBCUT_REDUCTION, 3, 6},
