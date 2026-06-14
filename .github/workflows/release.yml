@@ -107,13 +107,16 @@ jobs:
       - name: Package
         id: pkg
         run: |
-          base="askaig-${{ needs.meta.outputs.date }}-${{ matrix.name }}"
+          base="askaig-${{ needs.meta.outputs.date }}-${{ matrix.name }}"  # archive base (incl. arch)
+          binname="askaig-${{ needs.meta.outputs.date }}"                  # executable carries the version too
           if [ -f build/askaig.exe ]; then
-            archive="$base.zip"                                  # Windows -> .zip (askaig.exe inside)
-            (cd build && zip -q "../$archive" askaig.exe)
+            mv "build/askaig.exe" "build/$binname.exe"
+            archive="$base.zip"                                            # Windows -> .zip
+            (cd build && zip -q "../$archive" "$binname.exe")
           else
-            archive="$base.tar.gz"                               # Linux/macOS -> .tar.gz (askaig inside)
-            tar -czf "$archive" -C build askaig
+            mv "build/askaig" "build/$binname"
+            archive="$base.tar.gz"                                         # Linux/macOS -> .tar.gz
+            tar -czf "$archive" -C build "$binname"
           fi
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
