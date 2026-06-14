@@ -65,7 +65,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-14 ninja-build
+          sudo apt-get install -y g++-14 ninja-build zip
           # Windows cross targets: fetch the pinned LLVM-MinGW toolchain.
           if [ -n "${{ matrix.mingw_triple }}" ]; then
             url="https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_TAG}/llvm-mingw-${LLVM_MINGW_TAG}-ucrt-ubuntu-${LLVM_MINGW_UBUNTU}-x86_64.tar.xz"
@@ -107,10 +107,14 @@ jobs:
       - name: Package
         id: pkg
         run: |
-          bin=askaig
-          [ -f build/askaig.exe ] && bin=askaig.exe
-          archive="askaig-${{ needs.meta.outputs.date }}-${{ matrix.name }}.tar.gz"
-          tar -czf "$archive" -C build "$bin"   # archive contains just the binary (askaig[.exe])
+          base="askaig-${{ needs.meta.outputs.date }}-${{ matrix.name }}"
+          if [ -f build/askaig.exe ]; then
+            archive="$base.zip"                                  # Windows -> .zip (askaig.exe inside)
+            (cd build && zip -q "../$archive" askaig.exe)
+          else
+            archive="$base.tar.gz"                               # Linux/macOS -> .tar.gz (askaig inside)
+            tar -czf "$archive" -C build askaig
+          fi
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
