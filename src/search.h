@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <vector>
 #include "types.h"
 
@@ -60,5 +61,16 @@ namespace search {
   // leave ponder mode and start enforcing the time control (`soft_ms`/`hard_ms`) from now. Safe to
   // call from another thread; a no-op if the search is not pondering.
   void request_ponderhit(int64_t soft_ms, int64_t hard_ms);
+
+  // SPSA-tunable search constants (pruning margins, depth gates) exposed as UCI spin options so an
+  // external tuner (tools/spsa.py) can drive them. Each carries a [min, max] range. A normal game
+  // never sets them — they keep their compiled defaults.
+  struct Tunable {
+    std::string name;
+    int        *ptr;
+    int         min, max;
+  };
+  [[nodiscard]] const std::vector<Tunable> &tunables();
+  bool                                      set_tunable(const std::string &name, int value); // true if matched
 
 } // namespace search

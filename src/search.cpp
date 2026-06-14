@@ -27,39 +27,41 @@ namespace search {
     constexpr int KILLER2_SCORE = 800'000; // second killer
     constexpr int HISTORY_MAX   = 100'000; // cap on history scores (kept below the killers)
 
-    // Forward-pruning margins for shallow non-PV nodes (futility-pruning family).
-    constexpr int RFP_MAX_DEPTH           = 6; // reverse futility (static null move) up to this depth
-    constexpr int RFP_MARGIN              = 80; // per-depth eval surplus over beta needed to prune
-    constexpr int FUTILITY_MAX_DEPTH      = 4; // move-loop futility up to this depth
-    constexpr int FUTILITY_MARGIN         = 100; // per-depth eval deficit below alpha that prunes quiets
-    constexpr int LMP_MAX_DEPTH           = 4; // late-move (move-count) pruning up to this depth
-    constexpr int RAZOR_MAX_DEPTH         = 3; // razoring up to this depth
-    constexpr int RAZOR_MARGIN            = 200; // per-depth eval deficit below alpha that triggers a qsearch verify
-    constexpr int HISTORY_PRUNE_MAX_DEPTH = 4; // history pruning up to this depth
-    constexpr int HISTORY_PRUNE_MARGIN    = 4096; // per-depth quiet-history floor below which a quiet is skipped
+    // Forward-pruning margins for shallow non-PV nodes (futility-pruning family). NOTE: the search
+    // tunables below are plain `int` (not constexpr) so they can be exposed as UCI spin options for
+    // SPSA tuning (see tunables()); a normal run uses the defaults shown.
+    int RFP_MAX_DEPTH           = 6; // reverse futility (static null move) up to this depth
+    int RFP_MARGIN              = 80; // per-depth eval surplus over beta needed to prune
+    int FUTILITY_MAX_DEPTH      = 4; // move-loop futility up to this depth
+    int FUTILITY_MARGIN         = 100; // per-depth eval deficit below alpha that prunes quiets
+    int LMP_MAX_DEPTH           = 4; // late-move (move-count) pruning up to this depth
+    int RAZOR_MAX_DEPTH         = 3; // razoring up to this depth
+    int RAZOR_MARGIN            = 200; // per-depth eval deficit below alpha that triggers a qsearch verify
+    int HISTORY_PRUNE_MAX_DEPTH = 4; // history pruning up to this depth
+    int HISTORY_PRUNE_MARGIN    = 4096; // per-depth quiet-history floor below which a quiet is skipped
 
     // SEE pruning in the main search (quiescence has its own): at shallow depths, skip moves that
     // lose material to the exchange on their destination square. Captures get a per-depth^2
     // allowance (a deep node may sacrifice for compensation the search can still find); quiets a
     // stricter per-depth one (a quiet that just hangs the piece rarely justifies itself). Margins
     // are in psqt::VALUE scale (pawn = 100) and are unproven starting values (Ethereal-like).
-    constexpr int SEE_PRUNE_MAX_DEPTH = 9;
-    constexpr int SEE_QUIET_MARGIN    = 65; // * depth
-    constexpr int SEE_CAPT_MARGIN     = 20; // * depth^2
+    int SEE_PRUNE_MAX_DEPTH = 9;
+    int SEE_QUIET_MARGIN    = 65; // * depth
+    int SEE_CAPT_MARGIN     = 20; // * depth^2
 
     // Singular extensions: only attempted from this depth; the verification search excludes the TT
     // move and uses a window `SINGULAR_MARGIN * depth` below the TT score.
-    constexpr int SINGULAR_MIN_DEPTH = 8;
-    constexpr int SINGULAR_MARGIN    = 2;
+    int SINGULAR_MIN_DEPTH = 8;
+    int SINGULAR_MARGIN    = 2;
 
     // ProbCut: at depth >= PROBCUT_MIN_DEPTH, a capture whose (depth - PROBCUT_REDUCTION) search
     // already beats beta + PROBCUT_MARGIN cuts the node. The margin is in pawn=100 scale and an
     // unproven starting value (engines with this scale commonly use 100..200).
-    constexpr int PROBCUT_MIN_DEPTH = 5;
-    constexpr int PROBCUT_REDUCTION = 4;
-    constexpr int PROBCUT_MARGIN    = 150;
+    int PROBCUT_MIN_DEPTH = 5;
+    int PROBCUT_REDUCTION = 4;
+    int PROBCUT_MARGIN    = 150;
 
-    constexpr int DELTA_MARGIN = 200; // qsearch delta pruning: safety margin above the captured value
+    int DELTA_MARGIN = 200; // qsearch delta pruning: safety margin above the captured value
 
     // Log-based LMR reduction table, indexed by [depth][move index]: late moves at deep nodes are
     // reduced progressively more (log*log growth) instead of the old flat 1-3 steps. Filled once by
@@ -153,8 +155,8 @@ namespace search {
     // (the knight/bishop/rook/queen bitboards). Positions sharing that structure share an entry.
     constexpr int CORR_SIZE  = 16384; // buckets per side (power of two)
     constexpr int CORR_MASK  = CORR_SIZE - 1;
-    constexpr int CORR_LIMIT = 1024; // gravity cap on a stored entry
-    constexpr int CORR_GRAIN = 32; // entry / CORR_GRAIN = the cp correction applied (per table; max ±32 cp)
+    int           CORR_LIMIT = 1024; // gravity cap on a stored entry (tunable, see tunables())
+    int           CORR_GRAIN = 32; // entry / CORR_GRAIN = the cp correction applied (per table; max ±32 cp); tunable
 
     struct Heuristics {
       Move    killers[MAX_PLY][2];
@@ -1119,6 +1121,44 @@ namespace search {
     Move any_legal_move(Position &p) { return p.turn() == WHITE ? first_legal<WHITE>(p) : first_legal<BLACK>(p); }
 
   } // namespace
+
+  // SPSA-tunable search constants, with [min, max] bounds for the tuner. The names double as UCI
+  // option names. Defined here (in namespace search, after the anonymous namespace) so it can take
+  // the addresses of the internal-linkage constants above. Ranges are deliberately wide.
+  const std::vector<Tunable> &tunables() {
+    static const std::vector<Tunable> T = {
+            {"RFP_MARGIN", &RFP_MARGIN, 20, 200},
+            {"RFP_MAX_DEPTH", &RFP_MAX_DEPTH, 4, 10},
+            {"FUTILITY_MARGIN", &FUTILITY_MARGIN, 40, 220},
+            {"FUTILITY_MAX_DEPTH", &FUTILITY_MAX_DEPTH, 2, 8},
+            {"LMP_MAX_DEPTH", &LMP_MAX_DEPTH, 2, 8},
+            {"RAZOR_MARGIN", &RAZOR_MARGIN, 80, 400},
+            {"RAZOR_MAX_DEPTH", &RAZOR_MAX_DEPTH, 1, 6},
+            {"HISTORY_PRUNE_MARGIN", &HISTORY_PRUNE_MARGIN, 1024, 16384},
+            {"HISTORY_PRUNE_MAX_DEPTH", &HISTORY_PRUNE_MAX_DEPTH, 2, 8},
+            {"SEE_QUIET_MARGIN", &SEE_QUIET_MARGIN, 20, 150},
+            {"SEE_CAPT_MARGIN", &SEE_CAPT_MARGIN, 5, 60},
+            {"SEE_PRUNE_MAX_DEPTH", &SEE_PRUNE_MAX_DEPTH, 5, 14},
+            {"SINGULAR_MIN_DEPTH", &SINGULAR_MIN_DEPTH, 5, 12},
+            {"SINGULAR_MARGIN", &SINGULAR_MARGIN, 1, 6},
+            {"PROBCUT_MARGIN", &PROBCUT_MARGIN, 60, 300},
+            {"PROBCUT_MIN_DEPTH", &PROBCUT_MIN_DEPTH, 3, 8},
+            {"PROBCUT_REDUCTION", &PROBCUT_REDUCTION, 3, 6},
+            {"DELTA_MARGIN", &DELTA_MARGIN, 80, 400},
+            {"CORR_GRAIN", &CORR_GRAIN, 8, 96},
+            {"CORR_LIMIT", &CORR_LIMIT, 256, 4096},
+    };
+    return T;
+  }
+
+  bool set_tunable(const std::string &name, int value) {
+    for (const auto &t: tunables())
+      if (name == t.name) {
+        *t.ptr = std::clamp(value, t.min, t.max);
+        return true;
+      }
+    return false;
+  }
 
   void request_stop() { g_stop.store(true, std::memory_order_relaxed); }
 

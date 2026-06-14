@@ -515,6 +515,11 @@ void uci::loop() {
       std::cout << "option name Hash type spin default " << tt::DEFAULT_HASH_MB << " min 1 max 65536\n";
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
       std::cout << "option name Ponder type check default false\n"; // enables the GUI to send "go ponder"
+      // SPSA-tunable search constants (pruning margins, depth gates) — advertised so a tuner can set
+      // them; harmless to a normal GUI (it just ignores options it doesn't use).
+      for (const search::Tunable &t: search::tunables())
+        std::cout << "option name " << t.name << " type spin default " << *t.ptr << " min " << t.min << " max " << t.max
+                  << "\n";
       std::cout << "uciok\n";
     } else if (cmd == "isready") {
       // Must answer even mid-search, so this never touches engine state.
@@ -553,6 +558,12 @@ void uci::loop() {
         int t = 0;
         if (is >> t)
           g_threads = t < 1 ? 1 : (t > 1024 ? 1024 : t);
+      } else {
+        // A search tunable (SPSA): setoption name <X> value <n>. set_tunable clamps to the option's
+        // [min,max] and returns false for an unknown name (silently ignored, per the UCI spec).
+        int v = 0;
+        if (is >> v)
+          search::set_tunable(name, v);
       }
     } else if (cmd == "stop") {
       search::request_stop(); // the search thread finishes promptly and prints its bestmove
