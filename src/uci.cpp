@@ -483,7 +483,12 @@ namespace {
       // the search scales it by best-move stability. The hard cap bounds a single move to 3x the
       // optimum and never more than HALF of what we have left — a long final iteration can't drain
       // the bank and leave us scraping by 2s in the middlegame. (Was 5x / 75%, which front-loaded.)
-      const int64_t opt = std::min(avail / mtg + inc, avail);
+      // The optimum is itself capped at HALF the clock: with a low main time and a big increment,
+      // `avail/mtg + inc` can exceed what we have — committing nearly all of it would leave only the
+      // MOVE_OVERHEAD buffer and risk flagging on lag. Half keeps a safe reserve; the increment
+      // replenishes it next move. This only bites in time trouble (inc dwarfing the clock); normal
+      // play is unaffected (there `avail/mtg + inc` is far below avail/2).
+      const int64_t opt = std::min<int64_t>(avail / mtg + inc, std::max<int64_t>(avail / 2, 1));
       soft_ms           = std::max<int64_t>(opt, 1);
       hard_ms           = std::max<int64_t>(soft_ms, std::min<int64_t>(opt * 3, std::max<int64_t>(avail / 2, 1)));
     } else if (infinite) {
