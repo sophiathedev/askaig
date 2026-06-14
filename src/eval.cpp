@@ -17,16 +17,22 @@ namespace eval {
     int ISOLATED_PENALTY = 10; // tunable
     // Passed-pawn bonus, indexed by rank of advancement, tapered: passers are worth far more in the
     // endgame (often decisive) than the middlegame (where pieces blockade/round them up).
-    int PASSED_MG[8] = {0, 0, -32, 1, 29, 50, 127, 0}; // tunable [1..6]
-    int PASSED_EG[8] = {0, -1, 41, 25, 25, 4, -41, 0}; // tunable [1..6]
+    int PASSED_MG[8] = {0, 0, -31, 0, 29, 40, 127, 0}; // tunable [1..6]
+    int PASSED_EG[8] = {0, -1, 38, 24, 25, 4, -39, 0}; // tunable [1..6]
     // Passed-pawn refinements: a blockaded passer (any piece on its stop square) keeps only 2/3 of
     // the bonus, and in the endgame the kings join the race — per square of Chebyshev distance from
     // the stop square, the ENEMY king being far is worth +5 eg and our own king being far costs -2
     // eg, weighted by how advanced the passer is (irrelevant for a pawn still at home, decisive on
     // the 7th). Starting values for SPRT tuning.
-    int PASSED_KDIST_W[8] = {0, 0, 0, 1, 4, 8, 7, 0}; // by rank of advancement; tunable [3..6]
-    int CENTERED_BONUS    = -6; // pawn on a central square (d4/e4/d5/e5); tunable
-    int OUTPOST_BONUS     = 16; // knight on a hole, defended by a pawn, in advanced ranks; tunable
+    int PASSED_KDIST_W[8] = {0, 0, 0, 1, 4, 8, 8, 0}; // by rank of advancement; tunable [3..6]
+    int CENTERED_BONUS    = -10; // pawn on a central square (d4/e4/d5/e5); tunable
+    int OUTPOST_BONUS     = 15; // knight on a hole, defended by a pawn, in advanced ranks; tunable
+    // Connected pawns (part of a phalanx OR defended by a friendly pawn), bonus by rank of
+    // advancement — a connected chain is harder to break and far stronger as it nears promotion.
+    int CONNECTED[8]     = {0, 0, 1, 8, 12, 40, 91, 0}; // by relative rank; Texel-tuned, tunable [1..6]
+    // Backward pawn: no friendly pawn level-or-behind on an adjacent file to support it, and its
+    // advance square is controlled by an enemy pawn — a lasting weakness on a (semi-)open file.
+    int BACKWARD_PENALTY = 16; // Texel-tuned; tunable
 
     // King safety: penalty per missing pawn-shield file and per open/semi-open file by the king,
     // scaled by the opponent's attacking material (KS_MAX_POWER = full middlegame) so it fades out
@@ -38,18 +44,18 @@ namespace eval {
     // Mobility: bonus per safe square a piece can move to (not onto own pieces or enemy-pawn-
     // controlled squares), indexed by PieceType and tapered — sliders are worth more per square in
     // the (open) endgame. Pinned: penalty per piece pinned to its own king.
-    int MOB_MG[NPIECE_TYPES] = {0, 8, 5, 4, 3, 0}; // P N B R Q K; tunable [N..Q]
-    int MOB_EG[NPIECE_TYPES] = {0, 6, 3, 2, 3, 0}; // tunable [N..Q]
-    int PIN_PENALTY          = 17; // tunable
+    int MOB_MG[NPIECE_TYPES] = {0, 7, 5, 4, 2, 0}; // P N B R Q K; tunable [N..Q]
+    int MOB_EG[NPIECE_TYPES] = {0, 6, 3, 3, 3, 0}; // tunable [N..Q]
+    int PIN_PENALTY          = 18; // tunable
 
     // Piece bonuses: the bishop pair (worth more in the open endgame), a rook on a fully open or
     // semi-open (no friendly pawn) file, and a rook on the relative 7th rank (decisive in endgames).
-    int BISHOP_PAIR_MG = 11; // tunable
-    int BISHOP_PAIR_EG = 47; // tunable
-    int ROOK_OPEN      = 9; // file with no pawns at all; tunable
-    int ROOK_SEMIOPEN  = -1; // file with no friendly pawns; tunable
-    int ROOK_7TH_MG    = -59; // tunable
-    int ROOK_7TH_EG    = 27; // tunable
+    int BISHOP_PAIR_MG = 9; // tunable
+    int BISHOP_PAIR_EG = 67; // tunable
+    int ROOK_OPEN      = 8; // file with no pawns at all; tunable
+    int ROOK_SEMIOPEN  = 3; // file with no friendly pawns; tunable
+    int ROOK_7TH_MG    = -49; // tunable
+    int ROOK_7TH_EG    = 25; // tunable
 
     // A middlegame/endgame score pair and its interpolation by game phase (PHASE_MAX = middlegame).
     struct Score {
@@ -61,12 +67,12 @@ namespace eval {
     // piece we attack that the enemy does not defend). Tapered. Values are deliberately modest and
     // SHOULD be tuned by SPRT self-play (tools/sprt.sh) — these are reasonable starting points, not
     // proven optima. Indexed by the *threatened* (victim) piece type; bigger victims = bigger threat.
-    Score THREAT_BY_PAWN                = {30, 29}; // a pawn attacks any enemy minor/rook/queen; tunable
+    Score THREAT_BY_PAWN                = {28, 29}; // a pawn attacks any enemy minor/rook/queen; tunable
     Score THREAT_BY_MINOR[NPIECE_TYPES] = {{0, 0},   {21, 31},  {26, 19},
-                                           {33, -4}, {38, -47}, {0, 0}}; // victim: P N B R Q K; tunable [N..Q]
+                                           {35, -4}, {32, -47}, {0, 0}}; // victim: P N B R Q K; tunable [N..Q]
     Score THREAT_BY_ROOK[NPIECE_TYPES]  = {{0, 0},      {15, 8}, {20, 12},
-                                           {-427, 585}, {60, 6}, {0, 0}}; // rooks chiefly threaten R/Q; tunable [N..Q]
-    Score HANGING                       = {18, 8}; // per undefended enemy piece we attack; tunable
+                                           {-422, 585}, {63, 6}, {0, 0}}; // rooks chiefly threaten R/Q; tunable [N..Q]
+    Score HANGING                       = {16, 8}; // per undefended enemy piece we attack; tunable
 
     // King-zone attacks: each knight/bishop/rook/queen attack into the ring around the enemy king
     // (the king's square + its 8 neighbours) earns weight units; the total is then scaled by the
@@ -98,6 +104,8 @@ namespace eval {
       Bitboard passed[NCOLORS][NSQUARES]{};
       Bitboard span[NCOLORS][NSQUARES]{};
       Bitboard king_shield[NCOLORS][NSQUARES]{}; // pawn-shield squares (3 files, 2 ranks in front)
+      Bitboard back[NCOLORS][NSQUARES]{};        // adjacent files at the pawn's rank and behind it
+                                                 // (a friendly pawn here can support/advance — not backward)
 
       constexpr PawnMasks() {
         for (int f = 0; f < 8; ++f)
@@ -120,6 +128,8 @@ namespace eval {
           Bitboard bFront        = (r - 1 >= 0 ? rank_bb(r - 1) : 0) | (r - 2 >= 0 ? rank_bb(r - 2) : 0);
           king_shield[WHITE][sq] = files & wFront;
           king_shield[BLACK][sq] = files & bFront;
+          back[WHITE][sq]        = adjacent[f] & (below | rank_bb(r)); // ranks 0..r on adjacent files
+          back[BLACK][sq]        = adjacent[f] & (above | rank_bb(r)); // ranks r..7 on adjacent files
         }
       }
     };
@@ -185,6 +195,30 @@ namespace eval {
 
         e.base += CENTERED_BONUS * pop_count(wp & CENTER);
         e.base -= CENTERED_BONUS * pop_count(bp & CENTER);
+
+        // Connected (phalanx neighbour OR pawn-defended) and backward pawns. Both phase-independent.
+        const Bitboard wAtt = pawn_attacks<WHITE>(wp);
+        const Bitboard bAtt = pawn_attacks<BLACK>(bp);
+        for (Bitboard t = wp & (shift<EAST>(wp) | shift<WEST>(wp) | wAtt); t;) {
+          const Square sq = pop_lsb(&t);
+          e.base += CONNECTED[rank_of(sq)];
+        }
+        for (Bitboard t = bp & (shift<EAST>(bp) | shift<WEST>(bp) | bAtt); t;) {
+          const Square sq = pop_lsb(&t);
+          e.base -= CONNECTED[7 - rank_of(sq)];
+        }
+        for (Bitboard t = wp; t;) {
+          const Square sq = pop_lsb(&t);
+          const int    f  = file_of(sq);
+          if ((wp & PM.adjacent[f]) && !(wp & PM.back[WHITE][sq]) && (bAtt & SQUARE_BB[sq + NORTH]))
+            e.base -= BACKWARD_PENALTY;
+        }
+        for (Bitboard t = bp; t;) {
+          const Square sq = pop_lsb(&t);
+          const int    f  = file_of(sq);
+          if ((bp & PM.adjacent[f]) && !(bp & PM.back[BLACK][sq]) && (wAtt & SQUARE_BB[sq + SOUTH]))
+            e.base += BACKWARD_PENALTY;
+        }
 
         for (Bitboard t = wp; t;) {
           const Square sq = pop_lsb(&t);
@@ -586,6 +620,9 @@ namespace eval {
         add("PASSED_KDIST_W_" + std::to_string(r), PASSED_KDIST_W[r]);
       add("CENTERED_BONUS", CENTERED_BONUS);
       add("OUTPOST_BONUS", OUTPOST_BONUS);
+      for (int r = 1; r <= 6; ++r)
+        add("CONNECTED_" + std::to_string(r), CONNECTED[r]);
+      add("BACKWARD_PENALTY", BACKWARD_PENALTY);
       add("SHIELD_DEFICIT", SHIELD_DEFICIT);
       add("OPEN_FILE_PENALTY", OPEN_FILE_PENALTY);
       static const char *PT = "PNBRQK";
