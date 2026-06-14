@@ -69,13 +69,25 @@ namespace eval {
     Score HANGING                       = {18, 8}; // per undefended enemy piece we attack; tunable
 
     // King-zone attacks: each knight/bishop/rook/queen attack into the ring around the enemy king
-    // (the king's square + its 8 neighbours) earns weight units; the total is then scaled by the
-    // NUMBER of distinct attacking pieces — one piece alone cannot mate, so danger grows steeply as
-    // attackers join (0% for <2 attackers). Score = units * scale% * KING_ATT_UNIT cp, mostly a
-    // middlegame term (quartered in the endgame). Starting values — to be SPRT-tuned like threats.
+    // (the king's square + its 8 neighbours) earns weight units; the total is scaled by the NUMBER of
+    // distinct attacking pieces (0% for <2 attackers — one piece can't mate) to give a "danger" value,
+    // and the score is QUADRATIC in that danger (the Stockfish-classical "attack units" shape): a
+    // concentrated attack is worth far more than the sum of its parts. Capped so it can't dwarf the
+    // rest of the eval. Mostly a middlegame term (quartered in the endgame). Starting values, SPRT-tune.
     int           KING_ATT_WEIGHT[NPIECE_TYPES] = {0, 4, -5, 3, 12, 0}; // P N B R Q K (per zone square); tunable [N..Q]
     constexpr int KING_ATT_SCALE[8]             = {0, 0, 50, 75, 88, 94, 97, 99}; // % by attacker count
-    int           KING_ATT_UNIT                 = 7; // cp per weighted unit (after the % scale); tunable
+    int           KING_ATT_UNIT                 = 7; // scales the quadratic king-danger score; tunable
+    constexpr int KING_DANGER_MAX               = 50; // cap on the danger value before squaring (anti-blowup)
+    constexpr int KING_DANGER_DIV               = 24; // quadratic divisor: score = danger^2 * UNIT / DIV
+
+    // Quadratic king-danger score in cp for `units` weighted attack units from `attackers` distinct
+    // pieces. Below 2 attackers KING_ATT_SCALE is 0, so a lone attacker scores nothing.
+    [[gnu::pure]] inline int king_danger(int units, int attackers) noexcept {
+      int d = units * KING_ATT_SCALE[attackers < 7 ? attackers : 7] / 100;
+      if (d > KING_DANGER_MAX)
+        d = KING_DANGER_MAX;
+      return d * d * KING_ATT_UNIT / KING_DANGER_DIV;
+    }
 
     // Tempo: a small bonus for simply being the side to move (the mover usually has the option to
     // improve their position). Also damps eval oscillation between plies. Starting values for SPRT.
@@ -471,10 +483,10 @@ namespace eval {
       const Score sb  = side_threats<BLACK>(pos, bm, wm.all);
       const int   thr = taper({sw.mg - sb.mg, sw.eg - sb.eg}, phase);
 
-      // King-zone attack score: weighted units, gated/scaled by the attacker count (a lone attacker
-      // scores nothing), in centipawns. Mostly middlegame — quartered in the endgame.
-      const int katt_w = wU * KING_ATT_SCALE[wC < 7 ? wC : 7] / 100 * KING_ATT_UNIT;
-      const int katt_b = bU * KING_ATT_SCALE[bC < 7 ? bC : 7] / 100 * KING_ATT_UNIT;
+      // King-zone attack score: QUADRATIC in the attacker-count-gated weighted units (see
+      // king_danger), in centipawns. Mostly middlegame — quartered in the endgame.
+      const int katt_w = king_danger(wU, wC);
+      const int katt_b = king_danger(bU, bC);
       const int katt   = taper({katt_w - katt_b, (katt_w - katt_b) / 4}, phase);
 
       return mob + thr + katt;
