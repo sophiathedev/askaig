@@ -39,6 +39,8 @@ namespace search {
     int RAZOR_MARGIN            = 248; // per-depth eval deficit below alpha that triggers a qsearch verify
     int HISTORY_PRUNE_MAX_DEPTH = 3; // history pruning up to this depth
     int HISTORY_PRUNE_MARGIN    = 5356; // per-depth quiet-history floor below which a quiet is skipped
+    int CUTNODE_R               = 0; // extra LMR reduction at expected-fail-high (cut) nodes; tunable, SPSA-explore
+                       // (default 0: at +1 it grew the tree ~15% here, like IIR — let SPSA decide)
 
     // SEE pruning in the main search (quiescence has its own): at shallow depths, skip moves that
     // lose material to the exchange on their destination square. Captures get a per-depth^2
@@ -657,7 +659,7 @@ namespace search {
     // fastest mate (and, when losing, drags the mate out as long as possible).
     template<Color Us>
     [[gnu::hot]] int negamax(Position &p, int depth, int ply, int alpha, int beta, uint64_t &nodes, bool null_ok,
-                             Move excluded = Move{}) {
+                             bool cutNode, Move excluded = Move{}) {
       if (stop_or_time_up())
         return 0; // stop requested / hard deadline hit: value is discarded, last completed depth kept
 
@@ -786,7 +788,7 @@ namespace search {
         const int R = 2 + depth / 6;
         p.play_null();
         t_move_stack[ply] = -1; // a pass carries no (piece, to) to condition continuation history on
-        int score         = -negamax<~Us>(p, depth - 1 - R, ply + 1, -beta, -beta + 1, nodes, false, Move{});
+        int score         = -negamax<~Us>(p, depth - 1 - R, ply + 1, -beta, -beta + 1, nodes, false, !cutNode, Move{});
         p.undo_null();
         if (score >= beta) // fail-high: prune this node (fail-soft, except a reduced null-window
           return score >= MATE - MAX_MATE_PLY ? beta : score; // result is never trusted as a MATE bound)
@@ -814,7 +816,8 @@ namespace search {
           ++nodes;
           int v = -quiescence<~Us>(p, -pc_beta, -pc_beta + 1, nodes, ply + 1);
           if (v >= pc_beta) // qsearch agrees -> pay for the reduced full verification
-            v = -negamax<~Us>(p, depth - PROBCUT_REDUCTION, ply + 1, -pc_beta, -pc_beta + 1, nodes, true, Move{});
+            v = -negamax<~Us>(p, depth - PROBCUT_REDUCTION, ply + 1, -pc_beta, -pc_beta + 1, nodes, true, !cutNode,
+                              Move{});
           p.undo<Us>(m);
           if (aborted())
             return 0;
@@ -883,7 +886,7 @@ namespace search {
           // window just below the TT score. If none reaches it, the TT move is singular -> extend.
           const int sBeta  = ttScore - SINGULAR_MARGIN * depth;
           const int sDepth = (depth - 1) / 2;
-          const int v      = negamax<Us>(p, sDepth, ply, sBeta - 1, sBeta, nodes, false, m);
+          const int v      = negamax<Us>(p, sDepth, ply, sBeta - 1, sBeta, nodes, false, cutNode, m);
           if (v < sBeta)
             ext = 1;
         }
@@ -905,7 +908,7 @@ namespace search {
         int score;
         if (i == 0) {
           // Principal variation: search the (well-ordered) first move with the full window.
-          score = -negamax<~Us>(p, nd, ply + 1, -beta, -alpha, nodes, true, Move{});
+          score = -negamax<~Us>(p, nd, ply + 1, -beta, -alpha, nodes, true, false, Move{});
         } else {
           // Late move reductions: a late, quiet move is unlikely to beat alpha, so scout it at a
           // reduced depth first; only re-search at full depth if that surprises us (beats alpha).
@@ -919,6 +922,8 @@ namespace search {
               --reduction;
             if (!improving)
               ++reduction; // a stagnant/worsening line reduces its late quiets one ply more
+            if (cutNode)
+              reduction += CUTNODE_R; // expected-fail-high node whose 1st move didn't cut -> reduce late ones more
             // History-informed adjustment: quiets with a strong (signed) history record are reduced
             // less, persistent fail-lows more. Deliberately the butterfly history ONLY: feeding the
             // combined stat (with a rescaled divisor) in here was SPRT-tested together with the
@@ -927,14 +932,15 @@ namespace search {
             reduction -= std::clamp(t_heur->history[Us][m.from()][m.to()] / 8'192, -2, 2);
             reduction = std::clamp(reduction, 0, nd);
           }
-          // PVS scout at the (possibly reduced) depth with a null window.
-          score = -negamax<~Us>(p, nd - reduction, ply + 1, -alpha - 1, -alpha, nodes, true, Move{});
+          // PVS scout at the (possibly reduced) depth with a null window. A scout child is the
+          // opposite node type to its parent (cut <-> all), so it carries !cutNode.
+          score = -negamax<~Us>(p, nd - reduction, ply + 1, -alpha - 1, -alpha, nodes, true, !cutNode, Move{});
           // Reduced scout beat alpha: re-search at full depth (still a null window).
           if (reduction > 0 && score > alpha)
-            score = -negamax<~Us>(p, nd, ply + 1, -alpha - 1, -alpha, nodes, true, Move{});
+            score = -negamax<~Us>(p, nd, ply + 1, -alpha - 1, -alpha, nodes, true, !cutNode, Move{});
           // PVS: inside the window -> re-search with the full window.
           if (score > alpha && score < beta)
-            score = -negamax<~Us>(p, nd, ply + 1, -beta, -alpha, nodes, true, Move{});
+            score = -negamax<~Us>(p, nd, ply + 1, -beta, -alpha, nodes, true, false, Move{});
         }
         p.undo<Us>(m);
 
@@ -1015,11 +1021,12 @@ namespace search {
 
         int score;
         if (i == 0) {
-          score = -negamax<~Us>(p, new_depth, 1, -beta, -alpha, r.nodes, true, Move{});
+          score = -negamax<~Us>(p, new_depth, 1, -beta, -alpha, r.nodes, true, false,
+                                Move{}); // PV child: not a cut node
         } else {
-          score = -negamax<~Us>(p, new_depth, 1, -alpha - 1, -alpha, r.nodes, true, Move{}); // PVS scout
+          score = -negamax<~Us>(p, new_depth, 1, -alpha - 1, -alpha, r.nodes, true, true, Move{}); // scout: cut node
           if (score > alpha && score < beta)
-            score = -negamax<~Us>(p, new_depth, 1, -beta, -alpha, r.nodes, true, Move{}); // re-search
+            score = -negamax<~Us>(p, new_depth, 1, -beta, -alpha, r.nodes, true, false, Move{}); // re-search (PV)
         }
         p.undo<Us>(m);
 
@@ -1136,6 +1143,7 @@ namespace search {
             {"RAZOR_MAX_DEPTH", &RAZOR_MAX_DEPTH, 1, 6},
             {"HISTORY_PRUNE_MARGIN", &HISTORY_PRUNE_MARGIN, 1024, 16384},
             {"HISTORY_PRUNE_MAX_DEPTH", &HISTORY_PRUNE_MAX_DEPTH, 2, 8},
+            {"CUTNODE_R", &CUTNODE_R, 0, 3},
             {"SEE_QUIET_MARGIN", &SEE_QUIET_MARGIN, 20, 150},
             {"SEE_CAPT_MARGIN", &SEE_CAPT_MARGIN, 5, 60},
             {"SEE_PRUNE_MAX_DEPTH", &SEE_PRUNE_MAX_DEPTH, 5, 14},
