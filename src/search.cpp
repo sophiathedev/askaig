@@ -30,38 +30,38 @@ namespace search {
     // Forward-pruning margins for shallow non-PV nodes (futility-pruning family). NOTE: the search
     // tunables below are plain `int` (not constexpr) so they can be exposed as UCI spin options for
     // SPSA tuning (see tunables()); a normal run uses the defaults shown.
-    int RFP_MAX_DEPTH           = 6; // reverse futility (static null move) up to this depth
-    int RFP_MARGIN              = 80; // per-depth eval surplus over beta needed to prune
-    int FUTILITY_MAX_DEPTH      = 4; // move-loop futility up to this depth
-    int FUTILITY_MARGIN         = 100; // per-depth eval deficit below alpha that prunes quiets
-    int LMP_MAX_DEPTH           = 4; // late-move (move-count) pruning up to this depth
-    int RAZOR_MAX_DEPTH         = 3; // razoring up to this depth
-    int RAZOR_MARGIN            = 200; // per-depth eval deficit below alpha that triggers a qsearch verify
-    int HISTORY_PRUNE_MAX_DEPTH = 4; // history pruning up to this depth
-    int HISTORY_PRUNE_MARGIN    = 4096; // per-depth quiet-history floor below which a quiet is skipped
+    int RFP_MAX_DEPTH           = 5; // reverse futility (static null move) up to this depth
+    int RFP_MARGIN              = 25; // per-depth eval surplus over beta needed to prune
+    int FUTILITY_MAX_DEPTH      = 2; // move-loop futility up to this depth
+    int FUTILITY_MARGIN         = 116; // per-depth eval deficit below alpha that prunes quiets
+    int LMP_MAX_DEPTH           = 5; // late-move (move-count) pruning up to this depth
+    int RAZOR_MAX_DEPTH         = 4; // razoring up to this depth
+    int RAZOR_MARGIN            = 248; // per-depth eval deficit below alpha that triggers a qsearch verify
+    int HISTORY_PRUNE_MAX_DEPTH = 3; // history pruning up to this depth
+    int HISTORY_PRUNE_MARGIN    = 5356; // per-depth quiet-history floor below which a quiet is skipped
 
     // SEE pruning in the main search (quiescence has its own): at shallow depths, skip moves that
     // lose material to the exchange on their destination square. Captures get a per-depth^2
     // allowance (a deep node may sacrifice for compensation the search can still find); quiets a
     // stricter per-depth one (a quiet that just hangs the piece rarely justifies itself). Margins
     // are in psqt::VALUE scale (pawn = 100) and are unproven starting values (Ethereal-like).
-    int SEE_PRUNE_MAX_DEPTH = 9;
-    int SEE_QUIET_MARGIN    = 65; // * depth
-    int SEE_CAPT_MARGIN     = 20; // * depth^2
+    int SEE_PRUNE_MAX_DEPTH = 12;
+    int SEE_QUIET_MARGIN    = 41; // * depth
+    int SEE_CAPT_MARGIN     = 18; // * depth^2
 
     // Singular extensions: only attempted from this depth; the verification search excludes the TT
     // move and uses a window `SINGULAR_MARGIN * depth` below the TT score.
-    int SINGULAR_MIN_DEPTH = 8;
-    int SINGULAR_MARGIN    = 2;
+    int SINGULAR_MIN_DEPTH = 7;
+    int SINGULAR_MARGIN    = 3;
 
     // ProbCut: at depth >= PROBCUT_MIN_DEPTH, a capture whose (depth - PROBCUT_REDUCTION) search
     // already beats beta + PROBCUT_MARGIN cuts the node. The margin is in pawn=100 scale and an
     // unproven starting value (engines with this scale commonly use 100..200).
     int PROBCUT_MIN_DEPTH = 5;
-    int PROBCUT_REDUCTION = 4;
-    int PROBCUT_MARGIN    = 150;
+    int PROBCUT_REDUCTION = 3;
+    int PROBCUT_MARGIN    = 114;
 
-    int DELTA_MARGIN = 200; // qsearch delta pruning: safety margin above the captured value
+    int DELTA_MARGIN = 212; // qsearch delta pruning: safety margin above the captured value
 
     // Log-based LMR reduction table, indexed by [depth][move index]: late moves at deep nodes are
     // reduced progressively more (log*log growth) instead of the old flat 1-3 steps. Filled once by
@@ -155,8 +155,8 @@ namespace search {
     // (the knight/bishop/rook/queen bitboards). Positions sharing that structure share an entry.
     constexpr int CORR_SIZE  = 16384; // buckets per side (power of two)
     constexpr int CORR_MASK  = CORR_SIZE - 1;
-    int           CORR_LIMIT = 1024; // gravity cap on a stored entry (tunable, see tunables())
-    int           CORR_GRAIN = 32; // entry / CORR_GRAIN = the cp correction applied (per table; max ±32 cp); tunable
+    int           CORR_LIMIT = 1284; // gravity cap on a stored entry (tunable, see tunables())
+    int           CORR_GRAIN = 17; // entry / CORR_GRAIN = the cp correction applied (per table; max ±64 cp); tunable
 
     struct Heuristics {
       Move    killers[MAX_PLY][2];
