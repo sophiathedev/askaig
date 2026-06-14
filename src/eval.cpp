@@ -13,47 +13,47 @@ namespace eval {
 
     // Penalties (centipawns) and a passed-pawn bonus indexed by the pawn's own rank of advancement
     // (rank 1 = just left home ... rank 6 = one step from promotion).
-    int DOUBLED_PENALTY  = 8; // tunable (see eval::params)
-    int ISOLATED_PENALTY = 10; // tunable
+    int DOUBLED_PENALTY  = 9; // tunable (see eval::params)
+    int ISOLATED_PENALTY = 9; // tunable
     // Passed-pawn bonus, indexed by rank of advancement, tapered: passers are worth far more in the
     // endgame (often decisive) than the middlegame (where pieces blockade/round them up).
-    int PASSED_MG[8] = {0, 0, -35, 0, 29, 35, 91, 0}; // tunable [1..6]
-    int PASSED_EG[8] = {0, -1, 34, 21, 32, 4, -33, 0}; // tunable [1..6]
+    int PASSED_MG[8] = {0, 0, -33, 0, 31, 34, 91, 0}; // tunable [1..6]
+    int PASSED_EG[8] = {0, -1, 32, 21, 34, 3, -33, 0}; // tunable [1..6]
     // Passed-pawn refinements: a blockaded passer (any piece on its stop square) keeps only 2/3 of
     // the bonus, and in the endgame the kings join the race — per square of Chebyshev distance from
     // the stop square, the ENEMY king being far is worth +5 eg and our own king being far costs -2
     // eg, weighted by how advanced the passer is (irrelevant for a pawn still at home, decisive on
     // the 7th). Starting values for SPRT tuning.
     int PASSED_KDIST_W[8] = {0, 0, 0, 1, 3, 8, 8, 0}; // by rank of advancement; tunable [3..6]
-    int CENTERED_BONUS    = -12; // pawn on a central square (d4/e4/d5/e5); tunable
-    int OUTPOST_BONUS     = 15; // knight on a hole, defended by a pawn, in advanced ranks; tunable
+    int CENTERED_BONUS    = -11; // pawn on a central square (d4/e4/d5/e5); tunable
+    int OUTPOST_BONUS     = 13; // knight on a hole, defended by a pawn, in advanced ranks; tunable
     // Connected pawns (part of a phalanx OR defended by a friendly pawn), bonus by rank of
     // advancement — a connected chain is harder to break and far stronger as it nears promotion.
-    int CONNECTED[8]     = {0, -1, 1, 7, 12, 45, 101, 0}; // by relative rank; Texel-tuned, tunable [1..6]
+    int CONNECTED[8]     = {0, -1, 0, 7, 13, 43, 107, 0}; // by relative rank; Texel-tuned, tunable [1..6]
     // Backward pawn: no friendly pawn level-or-behind on an adjacent file to support it, and its
     // advance square is controlled by an enemy pawn — a lasting weakness on a (semi-)open file.
-    int BACKWARD_PENALTY = 18; // Texel-tuned; tunable
+    int BACKWARD_PENALTY = 16; // Texel-tuned; tunable
 
     // King safety: penalty per missing pawn-shield file and per open/semi-open file by the king,
     // scaled by the opponent's attacking material (KS_MAX_POWER = full middlegame) so it fades out
     // in the endgame, where the king should instead be active.
     int           SHIELD_DEFICIT    = -1; // tunable (Texel ~zeroed — safe-check now carries king safety)
-    int           OPEN_FILE_PENALTY = 25; // tunable
+    int           OPEN_FILE_PENALTY = 22; // tunable
     constexpr int KS_MAX_POWER      = 12;
 
     // Mobility: bonus per safe square a piece can move to (not onto own pieces or enemy-pawn-
     // controlled squares), indexed by PieceType and tapered — sliders are worth more per square in
     // the (open) endgame. Pinned: penalty per piece pinned to its own king.
-    int MOB_MG[NPIECE_TYPES] = {0, 7, 5, 4, 1, 0}; // P N B R Q K; tunable [N..Q]
-    int MOB_EG[NPIECE_TYPES] = {0, 6, 3, 3, 2, 0}; // tunable [N..Q]
-    int PIN_PENALTY          = 19; // tunable
+    int MOB_MG[NPIECE_TYPES] = {0, 7, 5, 3, 2, 0}; // P N B R Q K; tunable [N..Q]
+    int MOB_EG[NPIECE_TYPES] = {0, 6, 3, 4, 2, 0}; // tunable [N..Q]
+    int PIN_PENALTY          = 22; // tunable
 
     // Piece bonuses: the bishop pair (worth more in the open endgame), a rook on a fully open or
     // semi-open (no friendly pawn) file, and a rook on the relative 7th rank (decisive in endgames).
     int BISHOP_PAIR_MG = 5; // tunable
-    int BISHOP_PAIR_EG = 76; // tunable
-    int ROOK_OPEN      = 8; // file with no pawns at all; tunable
-    int ROOK_SEMIOPEN  = 4; // file with no friendly pawns; tunable
+    int BISHOP_PAIR_EG = 80; // tunable
+    int ROOK_OPEN      = 9; // file with no pawns at all; tunable
+    int ROOK_SEMIOPEN  = 5; // file with no friendly pawns; tunable
     int ROOK_7TH_MG    = -46; // tunable
     int ROOK_7TH_EG    = 21; // tunable
 
@@ -68,11 +68,17 @@ namespace eval {
     // SHOULD be tuned by SPRT self-play (tools/sprt.sh) — these are reasonable starting points, not
     // proven optima. Indexed by the *threatened* (victim) piece type; bigger victims = bigger threat.
     Score THREAT_BY_PAWN                = {26, 33}; // a pawn attacks any enemy minor/rook/queen; tunable
-    Score THREAT_BY_MINOR[NPIECE_TYPES] = {{0, 0},   {19, 29},  {26, 19},
-                                           {36, -4}, {27, -48}, {0, 0}}; // victim: P N B R Q K; tunable [N..Q]
-    Score THREAT_BY_ROOK[NPIECE_TYPES]  = {{0, 0},      {14, 8}, {19, 12},
-                                           {-410, 582}, {60, 6}, {0, 0}}; // rooks chiefly threaten R/Q; tunable [N..Q]
+    Score THREAT_BY_MINOR[NPIECE_TYPES] = {{0, 0},   {21, 25},  {26, 19},
+                                           {34, -4}, {28, -46}, {0, 0}}; // victim: P N B R Q K; tunable [N..Q]
+    Score THREAT_BY_ROOK[NPIECE_TYPES]  = {{0, 0},      {13, 7}, {21, 12},
+                                           {-388, 582}, {58, 6}, {0, 0}}; // rooks chiefly threaten R/Q; tunable [N..Q]
     Score HANGING                       = {13, 8}; // per undefended enemy piece we attack; tunable
+    Score THREAT_BY_KING                = {0, 20}; // undefended enemy piece our king attacks (eg); tunable
+    Score THREAT_BY_PUSH                = {10, 10}; // enemy piece a safe pawn push would attack; tunable
+    // Rook behind a passed pawn (Tarrasch): a friendly rook on the passer's file behind it supports the
+    // push (+); an enemy rook behind it restrains the passer (−). Mostly an endgame term. Used in
+    // pawn_structure (piece-dependent, so outside the pawn cache).
+    Score ROOK_BEHIND_PASSER            = {3, 23}; // tunable
 
     // King-zone attacks: each knight/bishop/rook/queen attack into the ring around the enemy king
     // (the king's square + its 8 neighbours) earns weight units; the total is then scaled by the
@@ -87,11 +93,11 @@ namespace eval {
     // (so we are not simply recaptured) and we do not already occupy. One of the strongest king-safety
     // signals — counted per checking piece type, in cp, tapered like the king-zone term and NOT gated
     // by attacker count (a lone queen check can be deadly). Starting values for SPRT/Texel tuning.
-    int SAFE_CHECK[NPIECE_TYPES] = {0, 10, 9, 21, 35, 0}; // P N B R Q K; tunable [N..Q]
+    int SAFE_CHECK[NPIECE_TYPES] = {0, 11, 10, 22, 38, 0}; // P N B R Q K; tunable [N..Q]
 
     // Tempo: a small bonus for simply being the side to move (the mover usually has the option to
     // improve their position). Also damps eval oscillation between plies. Starting values for SPRT.
-    Score TEMPO = {8, 4}; // tunable
+    Score TEMPO = {10, 4}; // tunable
 
     [[gnu::const, gnu::always_inline]] inline int taper(Score s, int phase) noexcept {
       return (s.mg * phase + s.eg * (psqt::PHASE_MAX - phase)) / psqt::PHASE_MAX;
@@ -249,6 +255,9 @@ namespace eval {
       const Square   wk  = bsf(pos.bitboard_of(WHITE, KING));
       const Square   bk  = bsf(pos.bitboard_of(BLACK, KING));
 
+      const Bitboard wrooks = pos.bitboard_of(WHITE, ROOK);
+      const Bitboard brooks = pos.bitboard_of(BLACK, ROOK);
+
       Bitboard w = e.wpassed;
       while (w) {
         Square       sq   = pop_lsb(&w);
@@ -259,6 +268,11 @@ namespace eval {
           ps.mg = ps.mg * 2 / 3, ps.eg = ps.eg * 2 / 3; // blockaded: it cannot advance
         ps.eg += (5 * cheb(bk, stop) - 2 * cheb(wk, stop)) * PASSED_KDIST_W[r];
         s += taper(ps, phase);
+        const Bitboard behind = file_bb(file_of(sq)) & (SQUARE_BB[sq] - 1); // file squares below the pawn
+        if (wrooks & behind)
+          s += taper(ROOK_BEHIND_PASSER, phase); // our rook supports the push
+        if (brooks & behind)
+          s -= taper(ROOK_BEHIND_PASSER, phase); // enemy rook restrains it from behind
       }
       Bitboard b = e.bpassed;
       while (b) {
@@ -270,6 +284,11 @@ namespace eval {
           ps.mg = ps.mg * 2 / 3, ps.eg = ps.eg * 2 / 3;
         ps.eg += (5 * cheb(wk, stop) - 2 * cheb(bk, stop)) * PASSED_KDIST_W[r];
         s -= taper(ps, phase);
+        const Bitboard behind = file_bb(file_of(sq)) & ~((SQUARE_BB[sq] - 1) | SQUARE_BB[sq]); // above the pawn
+        if (brooks & behind)
+          s -= taper(ROOK_BEHIND_PASSER, phase);
+        if (wrooks & behind)
+          s += taper(ROOK_BEHIND_PASSER, phase);
       }
 
       // Holes / knight outposts. A square is a hole for one side if no pawn of that side can ever
@@ -457,10 +476,12 @@ namespace eval {
       m.all = m.pawn | m.minor | m.rook | m.queen | attacks<KING>(bsf(pos.bitboard_of(C, KING)), occ);
     }
 
-    // Threat bonus for side C against ~C: pieces of ~C attacked by our pawns / minors / rooks, plus
-    // any enemy piece we attack that ~C does not defend (`theyDefend` = ~C's full attack map).
+    // Threat bonus for side C against ~C: pieces of ~C attacked by our pawns / minors / rooks / king /
+    // safe pawn pushes, plus any enemy piece we attack that ~C does not defend (`theyDefend` = ~C's full
+    // attack map). `occ` = full occupancy, `theirPawnAtt` = ~C's pawn attacks (for safe-push detection).
     template<Color C>
-    [[gnu::pure, gnu::hot]] Score side_threats(const Position &pos, const AttackMap &us, Bitboard theyDefend) noexcept {
+    [[gnu::pure, gnu::hot]] Score side_threats(const Position &pos, const AttackMap &us, Bitboard theyDefend,
+                                               Bitboard occ, Bitboard theirPawnAtt) noexcept {
       const Color    Them        = ~C;
       const Bitboard theirMinors = pos.bitboard_of(Them, KNIGHT) | pos.bitboard_of(Them, BISHOP);
       const Bitboard theirR      = pos.bitboard_of(Them, ROOK);
@@ -484,6 +505,20 @@ namespace eval {
       // Hanging: enemy pieces we attack that they do not defend.
       const int hung = pop_count(theirPieces & us.all & ~theyDefend);
       s.mg += HANGING.mg * hung, s.eg += HANGING.eg * hung;
+
+      // King threats: undefended enemy pieces our king attacks (the king is a real attacker, esp. eg).
+      const int kingThr = pop_count(theirPieces & attacks<KING>(bsf(pos.bitboard_of(C, KING)), occ) & ~theyDefend);
+      s.mg += THREAT_BY_KING.mg * kingThr, s.eg += THREAT_BY_KING.eg * kingThr;
+
+      // Pawn-push threats: a pawn that can safely push (to an empty square no enemy pawn attacks) and
+      // would then attack an enemy piece. Single push, plus the double push from the home rank.
+      constexpr Direction Up    = C == WHITE ? NORTH : SOUTH;
+      const Bitboard      pawns = pos.bitboard_of(C, PAWN);
+      Bitboard            push  = shift<Up>(pawns) & ~occ;
+      push |= shift<Up>(push & (C == WHITE ? MASK_RANK[RANK3] : MASK_RANK[RANK6])) & ~occ;
+      push &= ~theirPawnAtt; // the pushed pawn must not be en-prise to an enemy pawn
+      const int pushThr = pop_count(pawn_attacks<C>(push) & theirPieces);
+      s.mg += THREAT_BY_PUSH.mg * pushThr, s.eg += THREAT_BY_PUSH.eg * pushThr;
       return s;
     }
 
@@ -530,8 +565,8 @@ namespace eval {
       side_mob_att<BLACK>(pos, occ, ~bpieces & ~wPawnAtt, bPawnAtt, wkZone, bmob, bm, bU, bC);
 
       const int   mob = taper({wmob.mg - bmob.mg, wmob.eg - bmob.eg}, phase);
-      const Score sw  = side_threats<WHITE>(pos, wm, bm.all);
-      const Score sb  = side_threats<BLACK>(pos, bm, wm.all);
+      const Score sw  = side_threats<WHITE>(pos, wm, bm.all, occ, bm.pawn);
+      const Score sb  = side_threats<BLACK>(pos, bm, wm.all, occ, wm.pawn);
       const int   thr = taper({sw.mg - sb.mg, sw.eg - sb.eg}, phase);
 
       // King pressure = king-zone attacks (weighted units, scaled by attacker count — a lone attacker
@@ -679,6 +714,12 @@ namespace eval {
       }
       add("HANGING_MG", HANGING.mg);
       add("HANGING_EG", HANGING.eg);
+      add("THREAT_BY_KING_MG", THREAT_BY_KING.mg);
+      add("THREAT_BY_KING_EG", THREAT_BY_KING.eg);
+      add("THREAT_BY_PUSH_MG", THREAT_BY_PUSH.mg);
+      add("THREAT_BY_PUSH_EG", THREAT_BY_PUSH.eg);
+      add("ROOK_BEHIND_PASSER_MG", ROOK_BEHIND_PASSER.mg);
+      add("ROOK_BEHIND_PASSER_EG", ROOK_BEHIND_PASSER.eg);
       for (int pt = KNIGHT; pt <= QUEEN; ++pt)
         add(std::string("KING_ATT_WEIGHT_") + PT[pt], KING_ATT_WEIGHT[pt]);
       add("KING_ATT_UNIT", KING_ATT_UNIT);
