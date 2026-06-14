@@ -384,8 +384,9 @@ namespace {
     }
   }
 
-  constexpr int     DEFAULT_DEPTH    = 8;
-  constexpr int64_t MOVE_OVERHEAD_MS = 30; // safety buffer for GUI/transport lag, reserved from the clock
+  constexpr int     DEFAULT_DEPTH        = 8;
+  constexpr int64_t MOVE_OVERHEAD_MS     = 30; // safety buffer for GUI/transport lag, reserved from the clock
+  constexpr int64_t EMERGENCY_RESERVE_MS = 500; // hard floor: never let our clock fall below this mid-search
 
   // Plays a Move on `p`, dispatching on the side to move (Position::play is templated on Color).
   void play_any(Position &p, Move m) {
@@ -491,6 +492,13 @@ namespace {
       const int64_t opt = std::min<int64_t>(avail / mtg + inc, std::max<int64_t>(avail / 2, 1));
       soft_ms           = std::max<int64_t>(opt, 1);
       hard_ms           = std::max<int64_t>(soft_ms, std::min<int64_t>(opt * 3, std::max<int64_t>(avail / 2, 1)));
+      // Emergency floor: the hard deadline never lets our clock drop below EMERGENCY_RESERVE_MS — an
+      // absolute guarantee on top of the budget caps, so no miscalculation or slow iteration can flag
+      // us. Once the clock is already at/under the reserve this is ~0: abort at once and play the best
+      // move from the last completed depth (the `any_legal_move` fallback covers "before depth 1").
+      const int64_t emergency = std::max<int64_t>(t - EMERGENCY_RESERVE_MS, 1);
+      hard_ms                 = std::min(hard_ms, emergency);
+      soft_ms                 = std::min(soft_ms, hard_ms);
     } else if (infinite) {
       max_depth = search::MAX_DEPTH; // search to the ply ceiling — effectively until "stop"
     } else if (depth > 0) {
