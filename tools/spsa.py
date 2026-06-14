@@ -62,7 +62,8 @@ def find_fastchess():
 
 def discover_params(engine):
     """Run `uci`, return [(name, default, min, max)] for the search tunables (spin options)."""
-    out = subprocess.run([engine], input="uci\nquit\n", capture_output=True, text=True, timeout=30).stdout
+    # --debug exposes the search-tuning spin options (hidden in production); see uci.cpp.
+    out = subprocess.run([engine, "--debug"], input="uci\nquit\n", capture_output=True, text=True, timeout=30).stdout
     pat = re.compile(r"option name (\S+) type spin default (-?\d+) min (-?\d+) max (-?\d+)")
     params = []
     for name, d, lo, hi in pat.findall(out):
@@ -87,10 +88,12 @@ def play_match(fc, engine, book, tc, hash_mb, conc, games, plus, minus):
     def opts(cfg):
         return [f"option.{k}={v}" for k, v in cfg.items()]
 
+    # args=--debug starts each engine in debug mode so the tuning options are settable (a normal
+    # production build hides/rejects them — see uci.cpp); fastchess can't send the `debug on` command.
     cmd = [
         fc,
-        "-engine", f"cmd={engine}", "name=plus", *opts(plus),
-        "-engine", f"cmd={engine}", "name=minus", *opts(minus),
+        "-engine", f"cmd={engine}", "name=plus", "args=--debug", *opts(plus),
+        "-engine", f"cmd={engine}", "name=minus", "args=--debug", *opts(minus),
         "-each", f"tc={tc}", f"option.Hash={hash_mb}", "option.Threads=1", "proto=uci",
         "-openings", f"file={book}", "format=epd", "order=random",
         "-games", "2", "-rounds", str(rounds), "-repeat",

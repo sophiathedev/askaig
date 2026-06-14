@@ -27,6 +27,13 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
+  // `--debug` anywhere on the command line starts in debug mode (exposes the search-tuning options).
+  // A tuning harness that can't send the `debug on` command but can pass args (e.g. fastchess
+  // `args="--debug"`) uses this so the options are settable from the first `uci`.
+  for (int i = 1; i < argc; ++i)
+    if (std::string_view(argv[i]) == "--debug")
+      uci::set_debug(true);
+
   // Allocate the transposition table at its default size (2 GiB).
   tt::resize(tt::DEFAULT_HASH_MB);
 

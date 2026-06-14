@@ -26,6 +26,10 @@ namespace {
   // Number of search threads (the "Threads" UCI option).
   int g_threads = 1;
 
+  // Debug mode (the UCI `debug on|off` command, or the `--debug` CLI flag at startup). Off in
+  // production: the search-tuning options are then hidden from `uci` and rejected by `setoption`.
+  bool g_debug = false;
+
   // Time budget for the current "go" (computed when the command is parsed). On a "ponderhit" these
   // are handed to the search so the clock starts then. Touched only on the UCI thread.
   int64_t g_ponder_soft = 0, g_ponder_hard = 0;
@@ -531,6 +535,8 @@ namespace {
 
 void uci::bench(int depth) { bench_cmd(depth > 0 ? depth : BENCH_DEPTH); }
 
+void uci::set_debug(bool on) { g_debug = on; }
+
 void uci::loop() {
   std::optional<Position> pos;
   pos.emplace();
@@ -548,11 +554,13 @@ void uci::loop() {
       std::cout << "option name Hash type spin default " << tt::DEFAULT_HASH_MB << " min 1 max 65536\n";
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
       std::cout << "option name Ponder type check default false\n"; // enables the GUI to send "go ponder"
-      // SPSA-tunable search constants (pruning margins, depth gates) — advertised so a tuner can set
-      // them; harmless to a normal GUI (it just ignores options it doesn't use).
-      for (const search::Tunable &t: search::tunables())
-        std::cout << "option name " << t.name << " type spin default " << *t.ptr << " min " << t.min << " max " << t.max
-                  << "\n";
+      // SPSA-tunable search constants (pruning margins, depth gates) — advertised ONLY in debug mode
+      // (`debug on`, or the `--debug` CLI flag a tuning harness passes), so a normal production GUI
+      // never sees this clutter and can't set it. See the `debug` and `setoption` handlers.
+      if (g_debug)
+        for (const search::Tunable &t: search::tunables())
+          std::cout << "option name " << t.name << " type spin default " << *t.ptr << " min " << t.min << " max "
+                    << t.max << "\n";
       std::cout << "uciok\n";
     } else if (cmd == "isready") {
       // Must answer even mid-search, so this never touches engine state.
@@ -591,13 +599,21 @@ void uci::loop() {
         int t = 0;
         if (is >> t)
           g_threads = t < 1 ? 1 : (t > 1024 ? 1024 : t);
-      } else {
-        // A search tunable (SPSA): setoption name <X> value <n>. set_tunable clamps to the option's
-        // [min,max] and returns false for an unknown name (silently ignored, per the UCI spec).
+      } else if (g_debug) {
+        // A search tunable (SPSA): setoption name <X> value <n>, accepted ONLY in debug mode so it
+        // can't be poked in production. set_tunable clamps to [min,max] and ignores unknown names.
         int v = 0;
         if (is >> v)
           search::set_tunable(name, v);
       }
+      // (debug off + unknown option: silently ignored, per the UCI spec)
+    } else if (cmd == "debug") {
+      // `debug on|off`: gates the search-tuning options (hidden from `uci` and unsettable unless on).
+      // Off by default so production output stays clean; a tuning harness turns it on (or passes the
+      // --debug CLI flag, which a wrapper like fastchess `args=...` can set before the first `uci`).
+      std::string s;
+      is >> s;
+      g_debug = (s == "on");
     } else if (cmd == "stop") {
       search::request_stop(); // the search thread finishes promptly and prints its bestmove
     } else if (cmd == "ponderhit") {
