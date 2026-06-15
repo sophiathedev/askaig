@@ -29,7 +29,7 @@ namespace eval {
     int OUTPOST_BONUS     = 12; // knight on a hole, defended by a pawn, in advanced ranks; tunable
     // Connected pawns (part of a phalanx OR defended by a friendly pawn), bonus by rank of
     // advancement — a connected chain is harder to break and far stronger as it nears promotion.
-    int CONNECTED[8]     = {0, -2, -1, 6, 13, 48, 120, 0}; // by relative rank; Texel-tuned, tunable [1..6]
+    int CONNECTED[8] = {0, -2, -1, 6, 13, 48, 120, 0}; // by relative rank; Texel-tuned, tunable [1..6]
     // Backward pawn: no friendly pawn level-or-behind on an adjacent file to support it, and its
     // advance square is controlled by an enemy pawn — a lasting weakness on a (semi-)open file.
     int BACKWARD_PENALTY = 16; // Texel-tuned; tunable
@@ -78,14 +78,14 @@ namespace eval {
     // Rook behind a passed pawn (Tarrasch): a friendly rook on the passer's file behind it supports the
     // push (+); an enemy rook behind it restrains the passer (−). Mostly an endgame term. Used in
     // pawn_structure (piece-dependent, so outside the pawn cache).
-    Score ROOK_BEHIND_PASSER            = {4, 28}; // tunable
+    Score ROOK_BEHIND_PASSER = {4, 28}; // tunable
 
     // Restricted squares: squares we attack that the enemy also attacks but does NOT defend with a
     // pawn — contesting them cramps the enemy's pieces. Small per-square bonus (Stockfish-style).
-    Score RESTRICTED     = {2, -3}; // tunable (Texel ~neutralised — kept for re-tuning)
+    Score RESTRICTED = {2, -3}; // tunable (Texel ~neutralised — kept for re-tuning)
     // Space: safe squares in the centre files on our own half of the board (a middlegame term, scaled
     // by our piece count). Squares behind our pawns count double (sheltered territory).
-    int   SPACE_WEIGHT   = -2; // tunable (Texel near-zero on this dataset — space term ~inert)
+    int SPACE_WEIGHT = -2; // tunable (Texel near-zero on this dataset — space term ~inert)
     // Trapped pieces (penalty MAGNITUDES, subtracted from the side that owns the trapped piece):
     // a corner bishop hemmed by an enemy pawn (a7/h7), and a rook boxed in by its own king on the
     // back rank after castling on that side is already lost.
@@ -147,8 +147,8 @@ namespace eval {
       Bitboard passed[NCOLORS][NSQUARES]{};
       Bitboard span[NCOLORS][NSQUARES]{};
       Bitboard king_shield[NCOLORS][NSQUARES]{}; // pawn-shield squares (3 files, 2 ranks in front)
-      Bitboard back[NCOLORS][NSQUARES]{};        // adjacent files at the pawn's rank and behind it
-                                                 // (a friendly pawn here can support/advance — not backward)
+      Bitboard back[NCOLORS][NSQUARES]{}; // adjacent files at the pawn's rank and behind it
+                                          // (a friendly pawn here can support/advance — not backward)
 
       constexpr PawnMasks() {
         for (int f = 0; f < 8; ++f)
@@ -603,10 +603,10 @@ namespace eval {
       // King pressure = king-zone attacks (weighted units, scaled by attacker count — a lone attacker
       // scores nothing) PLUS safe checks (cp, NOT attacker-count gated — a single deadly check counts).
       // Each side attacks the OTHER king. Mostly middlegame — quartered in the endgame.
-      const int kw = wU * KING_ATT_SCALE[wC < 7 ? wC : 7] / 100 * KING_ATT_UNIT +
-                     safe_checks(bk, occ, wm, bm.all, wpieces);
-      const int kb = bU * KING_ATT_SCALE[bC < 7 ? bC : 7] / 100 * KING_ATT_UNIT +
-                     safe_checks(wk, occ, bm, wm.all, bpieces);
+      const int kw =
+              wU * KING_ATT_SCALE[wC < 7 ? wC : 7] / 100 * KING_ATT_UNIT + safe_checks(bk, occ, wm, bm.all, wpieces);
+      const int kb =
+              bU * KING_ATT_SCALE[bC < 7 ? bC : 7] / 100 * KING_ATT_UNIT + safe_checks(wk, occ, bm, wm.all, bpieces);
       const int katt = taper({kw - kb, (kw - kb) / 4}, phase);
 
       // Restricted squares: squares we attack that the enemy attacks but does not protect with a pawn.
@@ -616,8 +616,8 @@ namespace eval {
 
       // Space: safe central squares on our own half, weighted by piece count (a middlegame term).
       const Bitboard wp = pos.bitboard_of(WHITE, PAWN), bp = pos.bitboard_of(BLACK, PAWN);
-      const Bitboard wSafe = SPACE_MASK_W & ~wp & ~bPawnAtt;
-      const Bitboard bSafe = SPACE_MASK_B & ~bp & ~wPawnAtt;
+      const Bitboard wSafe   = SPACE_MASK_W & ~wp & ~bPawnAtt;
+      const Bitboard bSafe   = SPACE_MASK_B & ~bp & ~wPawnAtt;
       Bitboard       wBehind = wp >> 8;
       wBehind |= wBehind >> 8, wBehind |= wBehind >> 16, wBehind |= wBehind >> 32; // squares behind white pawns
       Bitboard bBehind = bp << 8;
@@ -651,8 +651,8 @@ namespace eval {
 
       const Bitboard wR = pos.bitboard_of(WHITE, ROOK), bR = pos.bitboard_of(BLACK, ROOK);
       const Bitboard entry = pos.castle_entry();
-      const Square   wk = bsf(pos.bitboard_of(WHITE, KING));
-      const Square   bk = bsf(pos.bitboard_of(BLACK, KING));
+      const Square   wk    = bsf(pos.bitboard_of(WHITE, KING));
+      const Square   bk    = bsf(pos.bitboard_of(BLACK, KING));
 
       if (rank_of(wk) == RANK1) {
         const int kf = file_of(wk);
@@ -714,6 +714,63 @@ namespace eval {
       return SCALE_NORMAL;
     }
 
+    // --- Mop-up (elementary-mate driving) ----------------------------------------------------
+    // When one side is reduced to a BARE KING (no pawns, no pieces) and the other has mating
+    // material, add a small White-perspective gradient that (1) drives the lone king toward the
+    // edge/corner and (2) brings the winning king closer — so KQK / KRK / KBNK are converted within
+    // the fifty-move rule instead of shuffled. The magnitudes are tiny next to the material they ride
+    // on (Q ≈ 900), so they only shape the PATH to mate and never flip the eval; they are therefore
+    // NOT Texel-tuned (a positional dataset has too few such positions — tuning would zero them like
+    // the space term). SPRT / conversion tests judge them.
+    constexpr int MOPUP_CORNER = 12; // per unit of centre-distance of the lone king (edge/corner drive)
+    constexpr int MOPUP_KBNK   = 16; // per unit toward the bishop-coloured corner (KBNK needs THAT corner)
+    constexpr int MOPUP_CLOSE  = 10; // per unit the winning king is closer to the lone king
+
+    [[gnu::pure]] int mopup(const Position &pos) noexcept {
+      const auto bare = [&](Color c) noexcept {
+        return (pos.bitboard_of(c, PAWN) | pos.bitboard_of(c, KNIGHT) | pos.bitboard_of(c, BISHOP) |
+                pos.bitboard_of(c, ROOK) | pos.bitboard_of(c, QUEEN)) == 0;
+      };
+      Color winner;
+      if (bare(BLACK) && !bare(WHITE))
+        winner = WHITE;
+      else if (bare(WHITE) && !bare(BLACK))
+        winner = BLACK;
+      else
+        return 0;
+
+      const Bitboard wbb = pos.bitboard_of(winner, BISHOP);
+      const int      wN = pop_count(pos.bitboard_of(winner, KNIGHT)), wB = pop_count(wbb);
+      const int      wR = pop_count(pos.bitboard_of(winner, ROOK)), wQ = pop_count(pos.bitboard_of(winner, QUEEN));
+      const bool     hasPawn = pos.bitboard_of(winner, PAWN) != 0;
+      // Pure-piece mate only (a winner WITH pawns is handled by the normal passer/PST eval), and the
+      // material must actually force mate: Q, R, bishop+knight, or two OPPOSITE-coloured bishops (a
+      // lone minor, two knights, or two same-coloured bishops cannot force mate).
+      const bool twoColourB = (wbb & LIGHT_SQUARES) != 0 && (wbb & ~LIGHT_SQUARES) != 0;
+      const bool canMate    = wQ > 0 || wR > 0 || twoColourB || (wB >= 1 && wN >= 1);
+      if (hasPawn || !canMate)
+        return 0;
+
+      const Square lk = bsf(pos.bitboard_of(~winner, KING)); // the lone king
+      const Square wk = bsf(pos.bitboard_of(winner, KING));
+      const int    lf = file_of(lk), lr = rank_of(lk);
+      const int    fd     = lf < 4 ? 3 - lf : lf - 4; // file distance from the centre files (d/e)
+      const int    rd     = lr < 4 ? 3 - lr : lr - 4;
+      int          corner = MOPUP_CORNER * (fd + rd); // 0 at the centre, up to 72 in a corner
+
+      // KBN vs K: the mate only works in a corner of the bishop's colour — steer to THAT corner.
+      if (wQ == 0 && wR == 0 && wB == 1 && wN == 1) {
+        const bool light = (pos.bitboard_of(winner, BISHOP) & LIGHT_SQUARES) != 0;
+        const int  da    = cheb(lk, light ? h1 : a1); // light corners: h1/a8; dark corners: a1/h8
+        const int  db    = cheb(lk, light ? a8 : h8);
+        const int  d     = da < db ? da : db;
+        corner           = MOPUP_KBNK * (7 - d);
+      }
+
+      const int bonus = corner + MOPUP_CLOSE * (7 - cheb(wk, lk));
+      return winner == WHITE ? bonus : -bonus;
+    }
+
   } // namespace
 
   [[gnu::pure]] bool is_passed_pawn(const Position &pos, Color c, Square sq) noexcept {
@@ -742,6 +799,7 @@ namespace eval {
     s += pin_penalty(pos);
     s += piece_bonuses(pos, phase);
     s += trapped_pieces(pos, phase);
+    s += mopup(pos); // elementary-mate driving in bare-king endgames (KQK / KRK / KBNK conversion)
 
     // Drawish-endgame scaling: narrow a nominal material edge toward 0 in dead / near-dead-drawn
     // material configurations (insufficient minors, rook-vs-minor, opposite-coloured bishops) so the
