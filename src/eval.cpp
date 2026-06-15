@@ -1,4 +1,5 @@
 #include "eval.h"
+#include "kpk.h"
 #include "position.h"
 #include "types.h"
 
@@ -759,6 +760,24 @@ namespace eval {
         const bool wLight = (pos.bitboard_of(weak, BISHOP) & LIGHT_SQUARES) != 0;
         if (sLight != wLight)
           return SCALE_OCB;
+      }
+
+      // KPK (king + one pawn vs a lone king): consult the EXACT bitbase. A drawn KPK scores 0 (the
+      // engine won't throw the win by trading into it, nor defend a losing one wrongly); a won one
+      // keeps its full eval. Map to the bitbase's White-pawn-on-files-a-d frame first.
+      if (sP == 1 && sNPM == 0 && wNPM == 0 && cnt(weak, PAWN) == 0) {
+        Square      wk  = bsf(pos.bitboard_of(strong, KING));
+        Square      bk  = bsf(pos.bitboard_of(weak, KING));
+        Square      wp  = bsf(pos.bitboard_of(strong, PAWN));
+        const Color stm = pos.turn() == strong ? WHITE : BLACK; // "is it the pawn side's move"
+        if (strong == BLACK) { // flip ranks so the pawn marches up the board
+          wk = Square(wk ^ 56), bk = Square(bk ^ 56), wp = Square(wp ^ 56);
+        }
+        if (file_of(wp) > DFILE) { // flip files onto a-d
+          wk = Square(wk ^ 7), bk = Square(bk ^ 7), wp = Square(wp ^ 7);
+        }
+        if (!kpk::probe(wk, wp, bk, stm))
+          return 0; // provably drawn
       }
       return SCALE_NORMAL;
     }
