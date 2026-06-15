@@ -45,6 +45,11 @@ if [ -z "${FASTCHESS:-}" ]; then
   done
 fi
 BOOK="${BOOK:-$HERE/books/UHO_4060_v3.epd}"
+# Opening-book format passed to fastchess (epd|pgn). Default epd (UHO). A balanced PGN book
+# (e.g. books/8moves_v3.pgn) reaches endgames far more often — set BOOK_FORMAT=pgn for it. Pair
+# with ADJUDICATE=0 when testing endgame eval, or the resign rule ends won games before they
+# reach the bare-king phase those terms operate in.
+BOOK_FORMAT="${BOOK_FORMAT:-epd}"
 [ -n "${FASTCHESS:-}" ] && [ -x "$FASTCHESS" ] || {
   echo "fastchess not found — set FASTCHESS=/path/to/fastchess (or run 'bash tools/setup.sh')"
   exit 1
@@ -130,7 +135,7 @@ echo
   -engine cmd="$CAND_BIN" name=cand \
   -engine cmd="$BASE_BIN" name=base \
   -each "$LIMIT" option.Hash="$HASH" option.Threads=1 proto=uci \
-  -openings file="$BOOK" format=epd order=random \
+  -openings file="$BOOK" format="$BOOK_FORMAT" order=random \
   -games 2 -rounds "$ROUNDS" -repeat \
   -sprt elo0="$ELO0" elo1="$ELO1" alpha="$ALPHA" beta="$BETA" \
   $ADJ_ARGS \
