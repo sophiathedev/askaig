@@ -164,6 +164,9 @@ public:
   [[nodiscard]] inline int      psqt_mg() const { return psqt_mg_score; } // incremental material+PST, MG table
   [[nodiscard]] inline int      psqt_eg() const { return psqt_eg_score; } // incremental material+PST, EG table
   [[nodiscard]] inline int      fifty() const { return history[game_ply].fifty; } // halfmove clock
+  // Castling "entry" bitboard: squares whose king/rook have moved or been captured on. A side has
+  // lost a castling right when its OO/OOO mask intersects this (used by eval's trapped-rook term).
+  [[nodiscard]] inline Bitboard castle_entry() const { return history[game_ply].entry; }
 
   // True if the current position is a draw by repetition or the fifty-move rule. The repetition
   // scan steps back two plies at a time (same side to move) and is bounded by the halfmove clock:

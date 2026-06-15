@@ -17,6 +17,7 @@
 #include "tables.h"
 #include "tt.h"
 #include "types.h"
+#include "wdl.h"
 
 namespace {
 
@@ -32,6 +33,10 @@ namespace {
   // Debug mode (the UCI `debug on|off` command, or the `--debug` CLI flag at startup). Off in
   // production: the search-tuning options are then hidden from `uci` and rejected by `setoption`.
   bool g_debug = false;
+
+  // Whether to append a `wdl <win> <draw> <loss>` field (permille, from the side-to-move's view) to
+  // each `info` line — the UCI_ShowWDL option. Off by default (most engines only show it on request).
+  bool g_show_wdl = false;
 
   // Time budget for the current "go" (computed when the command is parsed). On a "ponderhit" these
   // are handed to the search so the clock starts then. Touched only on the UCI thread.
@@ -526,8 +531,10 @@ namespace {
                 const uint64_t              nps = ms > 0 ? nodes * 1000 / static_cast<uint64_t>(ms) : nodes * 1000;
                 const std::vector<Move>     pv  = clamp_pv_to_draw(*pp, res.pv); // don't report past a draw
                 std::lock_guard<std::mutex> lk(g_out);
-                std::cout << "info depth " << d << " seldepth " << res.seldepth << " score " << format_score(res.score)
-                          << " nodes " << nodes << " nps " << nps << " time " << ms;
+                std::cout << "info depth " << d << " seldepth " << res.seldepth << " score " << format_score(res.score);
+                if (g_show_wdl)
+                  std::cout << " " << wdl::format(res.score);
+                std::cout << " nodes " << nodes << " nps " << nps << " time " << ms;
                 if (!pv.empty()) {
                   std::cout << " pv";
                   for (Move m: pv)
@@ -570,6 +577,7 @@ void uci::loop() {
       std::cout << "option name Hash type spin default " << tt::DEFAULT_HASH_MB << " min 1 max 65536\n";
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
       std::cout << "option name Ponder type check default false\n"; // enables the GUI to send "go ponder"
+      std::cout << "option name UCI_ShowWDL type check default false\n"; // append wdl W D L to info lines
       // SPSA-tunable search constants (pruning margins, depth gates) — advertised ONLY in debug mode
       // (`debug on`, or the `--debug` CLI flag a tuning harness passes), so a normal production GUI
       // never sees this clutter and can't set it. See the `debug` and `setoption` handlers.
@@ -615,6 +623,10 @@ void uci::loop() {
         int t = 0;
         if (is >> t)
           g_threads = t < 1 ? 1 : (t > 1024 ? 1024 : t);
+      } else if (name == "UCI_ShowWDL") {
+        std::string v;
+        is >> v; // the "value" token was already consumed; v is "true"/"false"
+        g_show_wdl = (v == "true");
       } else if (g_debug) {
         // A search tunable (SPSA): setoption name <X> value <n>, accepted ONLY in debug mode so it
         // can't be poked in production. set_tunable clamps to [min,max] and ignores unknown names.
