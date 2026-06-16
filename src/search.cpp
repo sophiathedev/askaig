@@ -96,6 +96,7 @@ namespace search {
     std::chrono::steady_clock::time_point g_soft_start; // when the soft budget started counting
     int64_t                               g_soft_ms = 0; // base soft budget (ms), scaled per iteration
     std::atomic<bool>                     g_ponder{false}; // searching on the opponent's time
+    std::atomic<uint64_t>                 g_max_nodes{0}; // per-thread node cap (0 = unlimited; for datagen)
     constexpr int                         TIME_CHECK_INTERVAL = 2048; // poll the clock every N nodes
 
     // Arms the time control relative to `from`: a hard deadline `from + hard_ms` (the safety cut-off,
@@ -221,12 +222,21 @@ namespace search {
     // Checked in BOTH negamax and quiescence so a big capture subtree is still interruptible.
     thread_local int t_time_count = 0;
 
-    // Decrement the countdown; every TIME_CHECK_INTERVAL nodes, read the clock and set the global
-    // stop if the hard deadline passed. Returns true if the search should abort now (stop or time up).
+    // Approximate per-thread node count since this search began (advanced in TIME_CHECK_INTERVAL steps
+    // when the countdown fires), for the optional node cap (`g_max_nodes`, used by datagen for uniform
+    // fixed-work searches). Reset to 0 when a thread starts a search.
+    thread_local uint64_t t_nodes = 0;
+
+    // Decrement the countdown; every TIME_CHECK_INTERVAL nodes, read the clock and (if a node cap is
+    // armed) the node count, setting the global stop if the hard deadline passed or the cap is reached.
+    // Returns true if the search should abort now (stop / time up / node cap). Cheap when untimed and
+    // uncapped (the inner block runs once per TIME_CHECK_INTERVAL nodes).
     [[gnu::hot, gnu::always_inline]] inline bool stop_or_time_up() noexcept {
       if (--t_time_count <= 0) {
         t_time_count = TIME_CHECK_INTERVAL;
-        if (time_up())
+        t_nodes += TIME_CHECK_INTERVAL;
+        const uint64_t cap = g_max_nodes.load(std::memory_order_relaxed);
+        if (time_up() || (cap != 0 && t_nodes >= cap))
           g_stop.store(true, std::memory_order_relaxed);
       }
       return aborted();
@@ -1199,7 +1209,7 @@ namespace search {
   }
 
   Result think(const Position &pos, int max_depth, int threads, const InfoCallback &on_iteration, int64_t soft_ms,
-               int64_t hard_ms, bool ponder) {
+               int64_t hard_ms, bool ponder, uint64_t max_nodes) {
     if (is_illegal(pos))
       return Result{Move{}, 0, 0}; // refuse to search -> caller emits "bestmove 0000"
     if (max_depth < 1)
@@ -1222,6 +1232,7 @@ namespace search {
       g_soft.store(false, std::memory_order_relaxed);
     } else
       arm_time(t0, soft_ms, hard_ms);
+    g_max_nodes.store(ponder ? 0 : max_nodes, std::memory_order_relaxed); // node cap (unbounded while pondering)
 
     // Persistent per-thread heuristics: make sure a slot exists for every thread index. Done before
     // any helper spawns (and "go" is serialised by uci.cpp), so the vector never grows while a
@@ -1242,6 +1253,7 @@ namespace search {
     for (int t = 1; t < threads; ++t)
       helpers.emplace_back([&pos, max_depth, t, &total_nodes]() {
         t_stop          = &g_stop; // abort promptly when a stop is requested
+        t_nodes         = 0; // fresh node count for the node cap
         t_heur          = g_heur[static_cast<size_t>(t)].get(); // this thread's persistent slot
         Position  local = clone(pos);
         const int start = 1 + (t % 2); // stagger start depth so helpers don't march in lockstep
@@ -1252,6 +1264,7 @@ namespace search {
 
     // Main thread: iterative deepening, reporting each completed depth.
     t_stop              = &g_stop; // the main search thread is interruptible too
+    t_nodes             = 0; // fresh node count for the node cap
     t_heur              = g_heur[0].get();
     Position main_pos   = clone(pos);
     int      prev_score = 0;

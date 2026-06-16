@@ -38,9 +38,10 @@ namespace nnue {
   // Returns the number of mismatches (0 = pass).
   int verify_incremental();
 
-  // Self-play training-data generation (the `datagen` CLI subcommand): `games` self-play games at fixed
-  // search `depth`, writing `<FEN> | <score_cp_stm> | <wdl_stm>` lines to `out` for the bullet trainer.
-  // `seed` seeds the opening RNG — use distinct seeds for parallel shards so they produce distinct data.
-  void datagen(const char *out, int games, int depth, uint64_t seed);
+  // Self-play training-data generation (the `datagen` CLI subcommand): `games` self-play games writing
+  // `<FEN> | <score_cp_stm> | <wdl_stm>` lines to `out` for the trainer. Each move searches `nodes` nodes
+  // when `nodes` > 0 (uniform fixed work — faster, more even), otherwise fixed `depth`. `seed` seeds the
+  // opening RNG — use distinct seeds for parallel shards so they produce distinct data.
+  void datagen(const char *out, int games, int depth, uint64_t seed, uint64_t nodes);
 
 } // namespace nnue

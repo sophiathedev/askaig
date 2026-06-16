@@ -47,7 +47,7 @@ namespace search {
   // applied) and does not return a move until `request_ponderhit()` or `request_stop()` is called —
   // it is thinking on the opponent's clock about a predicted move.
   Result think(const Position &pos, int max_depth, int threads, const InfoCallback &on_iteration, int64_t soft_ms = 0,
-               int64_t hard_ms = 0, bool ponder = false);
+               int64_t hard_ms = 0, bool ponder = false, uint64_t max_nodes = 0);
 
   // Asks an in-progress `think()` to stop as soon as possible (the UCI "stop" command). Safe to
   // call from another thread; cleared automatically at the start of the next `think()`.

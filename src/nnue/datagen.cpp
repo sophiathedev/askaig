@@ -22,13 +22,14 @@ namespace nnue {
 
   namespace {
 
-    constexpr int OPENING_RANDOM = 8; // random plies at the start of each game (diversity)
-    constexpr int MAX_PLY        = 320; // hard cap on game length
-    constexpr int RESIGN_SCORE   = 2000; // |white-cp| at/above which a side is considered winning
-    constexpr int RESIGN_PLIES   = 6; // consecutive such plies -> adjudicate the win
-    constexpr int MATE_BOUND     = 20000; // skip recording mate-coded scores (not centipawns)
-    constexpr int ADJ_DRAW_BAND  = 300; // |white-cp| below this at the ply cap -> call it a draw
-    constexpr int MOVE_HARD_MS   = 5000; // per-move search cap (ms): a runaway position can't stall a game
+    constexpr int OPENING_RANDOM  = 8; // random plies at the start of each game (diversity)
+    constexpr int MAX_PLY         = 320; // hard cap on game length
+    constexpr int RESIGN_SCORE    = 2000; // |white-cp| at/above which a side is considered winning
+    constexpr int RESIGN_PLIES    = 6; // consecutive such plies -> adjudicate the win
+    constexpr int MATE_BOUND      = 20000; // skip recording mate-coded scores (not centipawns)
+    constexpr int ADJ_DRAW_BAND   = 300; // |white-cp| below this at the ply cap -> call it a draw
+    constexpr int MOVE_HARD_MS    = 5000; // per-move search cap (ms): a runaway position can't stall a game
+    constexpr int NODES_DEPTH_CAP = 24; // depth ceiling when limiting by nodes (so a thin position stops)
 
     // Runtime colour dispatch over the colour-templated Position methods.
     int legal_moves(Position &p, Move *list) {
@@ -78,7 +79,7 @@ namespace nnue {
 
   } // namespace
 
-  void datagen(const char *out, int games, int depth, uint64_t seed) {
+  void datagen(const char *out, int games, int depth, uint64_t seed, uint64_t nodes) {
     std::ofstream os(out);
     if (!os) {
       std::fprintf(stderr, "datagen: cannot open %s\n", out);
@@ -96,8 +97,12 @@ namespace nnue {
       return std::chrono::duration<double>(b - a).count();
     };
 
-    std::fprintf(stderr, "datagen: %d games, depth %d, seed %llu -> %s\n", games, depth,
-                 static_cast<unsigned long long>(seed), out);
+    if (nodes > 0)
+      std::fprintf(stderr, "datagen: %d games, %llu nodes/move, seed %llu -> %s\n", games,
+                   static_cast<unsigned long long>(nodes), static_cast<unsigned long long>(seed), out);
+    else
+      std::fprintf(stderr, "datagen: %d games, depth %d, seed %llu -> %s\n", games, depth,
+                   static_cast<unsigned long long>(seed), out);
 
     // Live progress redrawn in place ('\r'), throttled to ~5 updates/sec. Called BOTH per ply (so a
     // long game never freezes the line) and at the end; `done_games` is games fully completed so far.
@@ -160,7 +165,11 @@ namespace nnue {
           break;
         }
 
-        const search::Result r  = search::think(pos, depth, 1, nullcb, 0, MOVE_HARD_MS, false);
+        // Node mode (uniform fixed work per move) when `nodes` > 0, else fixed depth. Both keep the
+        // wall-clock safety cap so no single move stalls a game.
+        const search::Result r = nodes > 0
+                                         ? search::think(pos, NODES_DEPTH_CAP, 1, nullcb, 0, MOVE_HARD_MS, false, nodes)
+                                         : search::think(pos, depth, 1, nullcb, 0, MOVE_HARD_MS, false);
         const int            ws = pos.turn() == WHITE ? r.score : -r.score;
         last_white              = ws;
         total_nodes += r.nodes;
