@@ -19,16 +19,42 @@ namespace nnue {
     alignas(64) int16_t v[NCOLORS][L1];
   };
 
-  // acc[P] += / -= the feature column `f` (one contiguous L1 vector of FT weights).
+  // acc[P] += / -= the feature column `f` (one contiguous L1 vector of FT weights). int16 wraps
+  // identically (2's complement) in scalar and SIMD, so the three branches are bit-identical. L1 is a
+  // multiple of 16, so no scalar tail is needed.
   inline void add_feature(Accumulator &a, Color P, int f) noexcept {
-    const int16_t *w = g_net->ft_weights + size_t(f) * L1;
+    const int16_t *w   = g_net->ft_weights + size_t(f) * L1;
+    int16_t       *acc = a.v[P];
+#if defined(SIMD) && defined(ARCH_AVX2)
+    for (int i = 0; i < L1; i += 16) {
+      const __m256i s = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(acc + i));
+      const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + i));
+      _mm256_storeu_si256(reinterpret_cast<__m256i *>(acc + i), _mm256_add_epi16(s, x));
+    }
+#elif defined(SIMD) && defined(ARCH_ARM_NEON)
+    for (int i = 0; i < L1; i += 8)
+      vst1q_s16(acc + i, vaddq_s16(vld1q_s16(acc + i), vld1q_s16(w + i)));
+#else
     for (int i = 0; i < L1; ++i)
-      a.v[P][i] += w[i];
+      acc[i] += w[i];
+#endif
   }
   inline void sub_feature(Accumulator &a, Color P, int f) noexcept {
-    const int16_t *w = g_net->ft_weights + size_t(f) * L1;
+    const int16_t *w   = g_net->ft_weights + size_t(f) * L1;
+    int16_t       *acc = a.v[P];
+#if defined(SIMD) && defined(ARCH_AVX2)
+    for (int i = 0; i < L1; i += 16) {
+      const __m256i s = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(acc + i));
+      const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(w + i));
+      _mm256_storeu_si256(reinterpret_cast<__m256i *>(acc + i), _mm256_sub_epi16(s, x));
+    }
+#elif defined(SIMD) && defined(ARCH_ARM_NEON)
+    for (int i = 0; i < L1; i += 8)
+      vst1q_s16(acc + i, vsubq_s16(vld1q_s16(acc + i), vld1q_s16(w + i)));
+#else
     for (int i = 0; i < L1; ++i)
-      a.v[P][i] -= w[i];
+      acc[i] -= w[i];
+#endif
   }
 
 } // namespace nnue

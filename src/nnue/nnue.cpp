@@ -40,24 +40,60 @@ namespace nnue {
     }
   }
 
-  // --- forward pass (portable reference) --------------------------------------------------------
-  // SCReLU: a = clamp(acc, 0, QA)^2; output = sum(a * out_w) over [us L1][them L1]; descale to cp.
-  // M3 adds ARCH_AVX2 / ARCH_ARM_NEON branches that MUST return this exact integer.
-  static int forward(const Accumulator &acc, Color stm) {
-    const int16_t *us     = acc.v[stm];
-    const int16_t *them   = acc.v[~stm];
-    const int16_t *w_us   = g_net->out_weights;
-    const int16_t *w_them = g_net->out_weights + L1;
-
+  // --- forward pass ----------------------------------------------------------------------------
+  // SCReLU dot for one perspective: sum over i of clamp(a[i],0,QA)^2 * w[i]. Each product fits int32
+  // (x^2 <= 65025, |w| <= 32767 -> < 2^31), and integer addition is associative, so the SIMD branches
+  // (int32 products, int64-lane accumulation) return a value IDENTICAL to the portable reference. This
+  // is the eval analogue of perft: AVX2 == NEON == portable, bit-for-bit. L1 is a multiple of 8/16.
+  [[gnu::hot]] static int64_t screlu_dot(const int16_t *a, const int16_t *w) noexcept {
+#if defined(SIMD) && defined(ARCH_AVX2)
+    __m256i       acc0 = _mm256_setzero_si256(); // 4 x int64
+    __m256i       acc1 = _mm256_setzero_si256();
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i qa   = _mm_set1_epi16(int16_t(QA));
+    for (int i = 0; i < L1; i += 8) {
+      __m128i a16       = _mm_loadu_si128(reinterpret_cast<const __m128i *>(a + i)); // 8 int16
+      a16               = _mm_min_epi16(_mm_max_epi16(a16, zero), qa); // clamp [0, QA]
+      const __m256i x   = _mm256_cvtepi16_epi32(a16); // 8 int32
+      const __m256i xsq = _mm256_mullo_epi32(x, x); // x^2 (<= 65025)
+      const __m256i wv  = _mm256_cvtepi16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i *>(w + i)));
+      const __m256i p   = _mm256_mullo_epi32(xsq, wv); // 8 int32 products
+      acc0              = _mm256_add_epi64(acc0, _mm256_cvtepi32_epi64(_mm256_castsi256_si128(p)));
+      acc1              = _mm256_add_epi64(acc1, _mm256_cvtepi32_epi64(_mm256_extracti128_si256(p, 1)));
+    }
+    const __m256i s = _mm256_add_epi64(acc0, acc1);
+    int64_t       buf[4];
+    _mm256_storeu_si256(reinterpret_cast<__m256i *>(buf), s);
+    return buf[0] + buf[1] + buf[2] + buf[3];
+#elif defined(SIMD) && defined(ARCH_ARM_NEON)
+    int64x2_t       acc  = vdupq_n_s64(0);
+    const int16x4_t zero = vdup_n_s16(0);
+    const int16x4_t qa   = vdup_n_s16(int16_t(QA));
+    for (int i = 0; i < L1; i += 4) {
+      int16x4_t a16       = vld1_s16(a + i);
+      a16                 = vmin_s16(vmax_s16(a16, zero), qa); // clamp [0, QA]
+      const int32x4_t x   = vmovl_s16(a16);
+      const int32x4_t xsq = vmulq_s32(x, x);
+      const int32x4_t wv  = vmovl_s16(vld1_s16(w + i));
+      const int32x4_t p   = vmulq_s32(xsq, wv); // 4 int32 products
+      acc                 = vaddq_s64(acc, vmovl_s32(vget_low_s32(p)));
+      acc                 = vaddq_s64(acc, vmovl_s32(vget_high_s32(p)));
+    }
+    return vgetq_lane_s64(acc, 0) + vgetq_lane_s64(acc, 1);
+#else
     int64_t sum = 0;
     for (int i = 0; i < L1; ++i) {
-      int x = us[i];
+      int x = a[i];
       x     = x < 0 ? 0 : (x > QA ? QA : x);
-      int y = them[i];
-      y     = y < 0 ? 0 : (y > QA ? QA : y);
-      sum += int64_t(x) * x * w_us[i] + int64_t(y) * y * w_them[i];
+      sum += int64_t(x) * x * w[i];
     }
-    const int out = int(sum / QA) + g_net->out_bias;
+    return sum;
+#endif
+  }
+
+  static int forward(const Accumulator &acc, Color stm) {
+    const int64_t sum = screlu_dot(acc.v[stm], g_net->out_weights) + screlu_dot(acc.v[~stm], g_net->out_weights + L1);
+    const int     out = int(sum / QA) + g_net->out_bias;
     return out * SCALE / (QA * QB);
   }
 
