@@ -2,6 +2,7 @@
 #include <string_view>
 #include <thread>
 #include "kpk.h"
+#include "nnue/nnue.h"
 #include "position.h"
 #include "tables.h"
 #include "tt.h"
@@ -13,6 +14,11 @@ int main(int argc, char *argv[]) {
   initialise_all_databases();
   zobrist::initialise_zobrist_keys();
   kpk::init(); // KPK win/draw bitbase (needs the attack tables above)
+  nnue::init(); // load the (placeholder) NNUE network
+
+  // `askaig nnuetest`: run the NNUE self-test (mirror symmetry; SIMD==portable later) and exit.
+  if (argc > 1 && std::string_view(argv[1]) == "nnuetest")
+    return nnue::self_test() == 0 ? 0 : 1;
 
   // `askaig bench [depth]`: run the fixed benchmark and exit (the OpenBench-style CLI convention).
   // bench allocates its own fixed-size TT, so the 2 GiB default is skipped on this path.
