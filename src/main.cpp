@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <random>
 #include <string_view>
 #include <thread>
 #include "kpk.h"
@@ -25,11 +26,20 @@ int main(int argc, char *argv[]) {
     return nnue::verify_incremental() == 0 ? 0 : 1;
 
   // `askaig datagen <out> [games] [depth] [seed]`: self-play NNUE training data. Needs a TT for the
-  // search. Pass distinct seeds to parallel shards so they generate distinct games.
+  // search. With no explicit seed a RANDOM one is drawn, so repeated runs produce DISTINCT data (the
+  // chosen seed is logged, so a good run is reproducible by passing it back); an explicit seed is
+  // honoured for reproducibility / parallel-shard control.
   if (argc > 1 && std::string_view(argv[1]) == "datagen") {
     tt::resize(64);
+    uint64_t seed;
+    if (argc > 5) {
+      seed = std::strtoull(argv[5], nullptr, 10);
+    } else {
+      std::random_device rd;
+      seed = (static_cast<uint64_t>(rd()) << 32) ^ rd();
+    }
     nnue::datagen(argc > 2 ? argv[2] : "data.txt", argc > 3 ? std::atoi(argv[3]) : 100,
-                  argc > 4 ? std::atoi(argv[4]) : 8, argc > 5 ? std::strtoull(argv[5], nullptr, 10) : 0xC0FFEEULL);
+                  argc > 4 ? std::atoi(argv[4]) : 8, seed);
     return 0;
   }
 
