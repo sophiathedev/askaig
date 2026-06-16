@@ -1,5 +1,6 @@
 #include "nnue.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +48,33 @@ namespace nnue {
       Color       stm;
     };
 
+    // Compact human-readable count (1234 -> "1.2K", 2.08e6 -> "2.08M", 1.5e9 -> "1.50B").
+    std::string human_count(uint64_t n) {
+      char buf[32];
+      if (n >= 1000000000ULL)
+        std::snprintf(buf, sizeof(buf), "%.2fB", double(n) / 1e9);
+      else if (n >= 1000000ULL)
+        std::snprintf(buf, sizeof(buf), "%.2fM", double(n) / 1e6);
+      else if (n >= 1000ULL)
+        std::snprintf(buf, sizeof(buf), "%.1fK", double(n) / 1e3);
+      else
+        std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(n));
+      return buf;
+    }
+
+    // Seconds -> "H:MM:SS" (or "M:SS" under an hour).
+    std::string fmt_time(double sec) {
+      if (sec < 0 || sec > 1e8)
+        sec = 0;
+      const int t = int(sec);
+      char      buf[32];
+      if (t >= 3600)
+        std::snprintf(buf, sizeof(buf), "%d:%02d:%02d", t / 3600, (t % 3600) / 60, t % 60);
+      else
+        std::snprintf(buf, sizeof(buf), "%d:%02d", t / 60, t % 60);
+      return buf;
+    }
+
   } // namespace
 
   void datagen(const char *out, int games, int depth, uint64_t seed) {
@@ -58,6 +86,17 @@ namespace nnue {
     PRNG       rng(seed); // distinct seeds -> distinct games (run parallel shards with different seeds)
     const auto nullcb  = [](int, const search::Result &, uint64_t, long long) {};
     uint64_t   written = 0;
+
+    using clock            = std::chrono::steady_clock;
+    const auto t0          = clock::now();
+    auto       last_print  = t0;
+    uint64_t   total_nodes = 0;
+    const auto secs_since  = [](clock::time_point a, clock::time_point b) {
+      return std::chrono::duration<double>(b - a).count();
+    };
+
+    std::fprintf(stderr, "datagen: %d games, depth %d, seed %llu -> %s\n", games, depth,
+                 static_cast<unsigned long long>(seed), out);
 
     for (int g = 0; g < games; ++g) {
       Position pos;
@@ -101,6 +140,7 @@ namespace nnue {
         const search::Result r  = search::think(pos, depth, 1, nullcb, 0, 0, false);
         const int            ws = pos.turn() == WHITE ? r.score : -r.score;
         last_white              = ws;
+        total_nodes += r.nodes;
 
         const bool noisy = r.best.is_capture() || (r.best.flags() >= PR_KNIGHT && r.best.flags() <= PR_QUEEN);
         if (!in_check_now(pos) && !noisy && std::abs(r.score) < MATE_BOUND)
@@ -128,15 +168,29 @@ namespace nnue {
         ++written;
       }
 
-      if ((g + 1) % 50 == 0) {
+      // Live progress, throttled to ~5 updates/sec, redrawn in place with '\r'.
+      const auto now = clock::now();
+      if (secs_since(last_print, now) >= 0.2 || g + 1 == games) {
+        last_print             = now;
+        const double elapsed   = secs_since(t0, now);
+        const double done      = g + 1;
+        const double frac      = done / games;
+        const double pos_per_s = elapsed > 0 ? written / elapsed : 0;
+        const double g_per_s   = elapsed > 0 ? done / elapsed : 0;
+        const double nps       = elapsed > 0 ? total_nodes / elapsed : 0;
+        const double eta       = g_per_s > 0 ? (games - done) / g_per_s : 0;
         os.flush();
-        std::fprintf(stderr, "datagen: %d/%d games, %llu positions\n", g + 1, games,
-                     static_cast<unsigned long long>(written));
+        std::fprintf(stderr, "\r[%5.1f%%] %d/%d games | %s pos | %s pos/s | %.1f g/s | %s nps | up %s | eta %s    ",
+                     frac * 100.0, g + 1, games, human_count(written).c_str(), human_count(uint64_t(pos_per_s)).c_str(),
+                     g_per_s, human_count(uint64_t(nps)).c_str(), fmt_time(elapsed).c_str(), fmt_time(eta).c_str());
+        std::fflush(stderr);
       }
     }
 
     os.flush();
-    std::fprintf(stderr, "datagen done: %llu positions -> %s\n", static_cast<unsigned long long>(written), out);
+    const double elapsed = secs_since(t0, clock::now());
+    std::fprintf(stderr, "\ndatagen done: %s positions in %s (%s pos/s) -> %s\n", human_count(written).c_str(),
+                 fmt_time(elapsed).c_str(), human_count(uint64_t(elapsed > 0 ? written / elapsed : 0)).c_str(), out);
   }
 
 } // namespace nnue
