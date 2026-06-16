@@ -59,6 +59,11 @@ namespace tt {
   // overwritten by concurrent/descendant stores — copy the fields needed later, don't re-read.
   [[nodiscard]] Entry *probe(uint64_t key) noexcept;
 
+  // Hints the CPU to start pulling `key`'s 64-byte bucket into cache. Call right after make-move (the
+  // child key is known) so the cache-line fetch overlaps the recursion setup before the child probes —
+  // hiding the random multi-hundred-MB access latency that is the table's dominant cost.
+  void prefetch(uint64_t key) noexcept;
+
   // Stores an entry. Same-key: depth-preferred (a deeper analysis of the position is kept, only
   // refreshed). Otherwise the bucket's least valuable entry — empty first, then lowest
   // depth - 8*age — is evicted. `score` must already be node-relative; `eval` is the node's static

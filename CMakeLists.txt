@@ -19,6 +19,7 @@ add_executable(askaig
     src/tune.cpp
     src/uci.cpp
     src/wdl.cpp
+    src/kpk.cpp
     src/main.cpp)
 
 target_include_directories(askaig PRIVATE src)

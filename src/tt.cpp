@@ -100,6 +100,11 @@ namespace tt {
 
   void new_search() noexcept { g_gen = (g_gen + 1) & 63; }
 
+  [[gnu::hot]] void prefetch(uint64_t key) noexcept {
+    if (g_table != nullptr)
+      __builtin_prefetch(bucket_of(key), 0, 1); // rw=0 (read), locality=1 (low temporal locality)
+  }
+
   [[gnu::hot]] Entry *probe(uint64_t key) noexcept {
     if (g_table == nullptr)
       return nullptr;

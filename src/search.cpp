@@ -913,6 +913,7 @@ namespace search {
         t_move_stack[ply] = pt_idx;
 
         p.play<Us>(m);
+        tt::prefetch(p.get_hash()); // start the child's TT cache-line fetch before it probes
         ++nodes;
 
         int score;
@@ -1027,6 +1028,7 @@ namespace search {
         Move m          = moves[i];
         t_move_stack[0] = piece_to_index(p.at(m.from()), m.to()); // root move: continuation context for ply 1
         p.play<Us>(m);
+        tt::prefetch(p.get_hash()); // start the child's TT cache-line fetch before it probes
         ++r.nodes;
 
         int score;

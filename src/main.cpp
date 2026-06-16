@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <string_view>
 #include <thread>
+#include "kpk.h"
 #include "position.h"
 #include "tables.h"
 #include "tt.h"
@@ -11,6 +12,7 @@ int main(int argc, char *argv[]) {
   // Initialise the attack/magic databases and Zobrist keys before any move generation.
   initialise_all_databases();
   zobrist::initialise_zobrist_keys();
+  kpk::init(); // KPK win/draw bitbase (needs the attack tables above)
 
   // `askaig bench [depth]`: run the fixed benchmark and exit (the OpenBench-style CLI convention).
   // bench allocates its own fixed-size TT, so the 2 GiB default is skipped on this path.
