@@ -17,6 +17,10 @@ namespace nnue {
   // is kept).
   bool load(const char *path);
 
+  // Writes the currently-loaded network to `path` (raw struct bytes). Used to dump the placeholder net
+  // so the PyTorch trainer's integer forward can be checked against the engine. Returns false on failure.
+  bool dump(const char *path);
+
   // True once a network is loaded.
   bool active();
 

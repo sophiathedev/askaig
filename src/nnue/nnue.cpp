@@ -137,6 +137,17 @@ namespace nnue {
     return true;
   }
 
+  bool dump(const char *path) {
+    if (g_net == nullptr)
+      return false;
+    std::FILE *f = std::fopen(path, "wb");
+    if (f == nullptr)
+      return false;
+    const size_t n = std::fwrite(g_net, 1, sizeof(Network), f);
+    std::fclose(f);
+    return n == sizeof(Network);
+  }
+
   // --- self-test (mirror symmetry) --------------------------------------------------------------
   // A side-to-move-relative eval must satisfy eval(pos) == eval(color-mirrored pos): mirroring swaps
   // which physical colour is "us" but the perspective-relative computation is identical. This holds by

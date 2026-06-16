@@ -25,6 +25,10 @@ int main(int argc, char *argv[]) {
   if (argc > 1 && std::string_view(argv[1]) == "nnueverify")
     return nnue::verify_incremental() == 0 ? 0 : 1;
 
+  // `askaig nnuedump <file>`: write the current net to a .nnue file (for the trainer contract check).
+  if (argc > 2 && std::string_view(argv[1]) == "nnuedump")
+    return nnue::dump(argv[2]) ? 0 : 1;
+
   // `askaig datagen <out> [games] [depth] [seed]`: self-play NNUE training data. Needs a TT for the
   // search. With no explicit seed a RANDOM one is drawn, so repeated runs produce DISTINCT data (the
   // chosen seed is logged, so a good run is reproducible by passing it back); an explicit seed is
