@@ -24,6 +24,15 @@ int main(int argc, char *argv[]) {
   if (argc > 1 && std::string_view(argv[1]) == "nnueverify")
     return nnue::verify_incremental() == 0 ? 0 : 1;
 
+  // `askaig datagen <out> [games] [depth] [seed]`: self-play NNUE training data. Needs a TT for the
+  // search. Pass distinct seeds to parallel shards so they generate distinct games.
+  if (argc > 1 && std::string_view(argv[1]) == "datagen") {
+    tt::resize(64);
+    nnue::datagen(argc > 2 ? argv[2] : "data.txt", argc > 3 ? std::atoi(argv[3]) : 100,
+                  argc > 4 ? std::atoi(argv[4]) : 8, argc > 5 ? std::strtoull(argv[5], nullptr, 10) : 0xC0FFEEULL);
+    return 0;
+  }
+
   // `askaig bench [depth]`: run the fixed benchmark and exit (the OpenBench-style CLI convention).
   // bench allocates its own fixed-size TT, so the 2 GiB default is skipped on this path.
   if (argc > 1 && std::string_view(argv[1]) == "bench") {

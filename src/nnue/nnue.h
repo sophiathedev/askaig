@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 // Public NNUE interface. The implementation lives in nnue.cpp; the network shape / feature indexing /
 // accumulator are in network.h / features.h / accumulator.h.
 class Position;
@@ -31,5 +33,10 @@ namespace nnue {
   // Position accumulator equals a from-scratch refresh at every node (M2). Used by `nnueverify`.
   // Returns the number of mismatches (0 = pass).
   int verify_incremental();
+
+  // Self-play training-data generation (the `datagen` CLI subcommand): `games` self-play games at fixed
+  // search `depth`, writing `<FEN> | <score_cp_stm> | <wdl_stm>` lines to `out` for the bullet trainer.
+  // `seed` seeds the opening RNG — use distinct seeds for parallel shards so they produce distinct data.
+  void datagen(const char *out, int games, int depth, uint64_t seed);
 
 } // namespace nnue
