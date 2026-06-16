@@ -20,7 +20,12 @@
 #
 # Tunables via env: TC (5+0.05), HASH (16), CONCURRENCY (P-cores - 1), ELO0/ELO1 (0/10),
 #                   ALPHA/BETA (0.1), ROUNDS (5000), BOOK (UHO_4060_v3.epd), ADJUDICATE (1),
-#                   DEPTH (unset).
+#                   DEPTH (unset), CAND_EVALFILE / BASE_EVALFILE (unset).
+#
+# NNUE A/B: set CAND_EVALFILE (and/or BASE_EVALFILE) to a .nnue file to give that side the NNUE eval;
+# the other side stays on the hand-crafted eval (HCE). To test a net against HCE on the SAME code,
+# commit (so the tree == HEAD) and compare against HEAD:
+#     CAND_EVALFILE=askaig-nnue-20260616.nnue tools/sprt.sh HEAD     # cand=NNUE  vs  base=HCE
 #
 # DEPTH=<n> plays FIXED-DEPTH games (both engines search exactly n plies, no clock). This removes
 # every speed effect — nps, cache pressure, time management — and measures ONLY the quality of the
@@ -72,6 +77,22 @@ ELO1="${ELO1:-10}"
 ALPHA="${ALPHA:-0.1}"
 BETA="${BETA:-0.1}"
 ROUNDS="${ROUNDS:-5000}"
+
+# NNUE A/B: give a side the NNUE eval by pointing CAND_EVALFILE / BASE_EVALFILE at a .nnue (the other
+# side stays HCE). Paths are resolved to absolute so the engine finds the net regardless of its cwd.
+abspath() { case "$1" in /*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' "$(pwd)" "$1" ;; esac; }
+CAND_OPT=""
+BASE_OPT=""
+if [ -n "${CAND_EVALFILE:-}" ]; then
+  CAND_EVALFILE="$(abspath "$CAND_EVALFILE")"
+  [ -f "$CAND_EVALFILE" ] || { echo "CAND_EVALFILE not found: $CAND_EVALFILE"; exit 1; }
+  CAND_OPT="option.EvalFile=$CAND_EVALFILE"
+fi
+if [ -n "${BASE_EVALFILE:-}" ]; then
+  BASE_EVALFILE="$(abspath "$BASE_EVALFILE")"
+  [ -f "$BASE_EVALFILE" ] || { echo "BASE_EVALFILE not found: $BASE_EVALFILE"; exit 1; }
+  BASE_OPT="option.EvalFile=$BASE_EVALFILE"
+fi
 
 BASE_REF="${1:-HEAD}"
 
@@ -129,11 +150,12 @@ BASE_BIN="$ROOT/build/askaig"
 if [ -n "$DEPTH" ]; then LIMIT="depth=$DEPTH"; else LIMIT="tc=$TC"; fi
 
 echo ">> SPRT  cand vs base   $LIMIT  Hash=$HASH  concurrency=$CONCURRENCY  H1=elo in ($ELO0,$ELO1)  alpha=$ALPHA beta=$BETA"
+[ -n "$CAND_OPT$BASE_OPT" ] && echo ">> NNUE  cand=${CAND_EVALFILE:-HCE}  base=${BASE_EVALFILE:-HCE}"
 echo
 
 "$FASTCHESS" \
-  -engine cmd="$CAND_BIN" name=cand \
-  -engine cmd="$BASE_BIN" name=base \
+  -engine cmd="$CAND_BIN" name=cand $CAND_OPT \
+  -engine cmd="$BASE_BIN" name=base $BASE_OPT \
   -each "$LIMIT" option.Hash="$HASH" option.Threads=1 proto=uci \
   -openings file="$BOOK" format="$BOOK_FORMAT" order=random \
   -games 2 -rounds "$ROUNDS" -repeat \
