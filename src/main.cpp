@@ -20,6 +20,10 @@ int main(int argc, char *argv[]) {
   if (argc > 1 && std::string_view(argv[1]) == "nnuetest")
     return nnue::self_test() == 0 ? 0 : 1;
 
+  // `askaig nnueverify`: assert the incremental accumulator == from-scratch over a make/unmake walk.
+  if (argc > 1 && std::string_view(argv[1]) == "nnueverify")
+    return nnue::verify_incremental() == 0 ? 0 : 1;
+
   // `askaig bench [depth]`: run the fixed benchmark and exit (the OpenBench-style CLI convention).
   // bench allocates its own fixed-size TT, so the 2 GiB default is skipped on this path.
   if (argc > 1 && std::string_view(argv[1]) == "bench") {

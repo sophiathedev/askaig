@@ -27,4 +27,9 @@ namespace nnue {
   // Returns the number of failures (0 = pass).
   int self_test();
 
+  // Walks make/unmake over a few positions (all move types) and asserts the incrementally-maintained
+  // Position accumulator equals a from-scratch refresh at every node (M2). Used by `nnueverify`.
+  // Returns the number of mismatches (0 = pass).
+  int verify_incremental();
+
 } // namespace nnue

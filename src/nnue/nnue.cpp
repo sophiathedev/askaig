@@ -165,4 +165,53 @@ namespace nnue {
     return fails;
   }
 
+  // --- incremental == from-scratch (M2) ---------------------------------------------------------
+  // Recursively make/unmake every legal move; at each node assert the Position's incrementally-
+  // maintained accumulator equals a fresh from-scratch refresh. This proves the put/remove/move hooks
+  // (incl. king-refresh, castling, promotions, ep, captures) and undo-reversal are all correct.
+  template<Color C>
+  static void verify_walk(Position &pos, int depth, int &bad) {
+    Accumulator scratch;
+    refresh(pos, scratch);
+    if (std::memcmp(scratch.v, pos.nnue_acc.v, sizeof(scratch.v)) != 0)
+      ++bad;
+    if (depth == 0)
+      return;
+    Move        list[256];
+    Move *const end = pos.generate_legals<C>(list);
+    for (Move *m = list; m != end; ++m) {
+      pos.play<C>(*m);
+      verify_walk<~C>(pos, depth - 1, bad);
+      pos.undo<C>(*m);
+    }
+  }
+
+  int verify_incremental() {
+    struct Case {
+      const char *fen;
+      int         depth;
+    };
+    static const Case cases[] = {
+            {"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -", 4}, // quiets / double push / captures
+            {"r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -", 3}, // castling + captures
+            {"n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - -", 4}, // promotions + promotion-captures
+            {"rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6", 3}, // en passant available
+    };
+    int total = 0;
+    for (const Case &c: cases) {
+      Position p;
+      Position::set(c.fen, p);
+      int bad = 0;
+      if (p.turn() == WHITE)
+        verify_walk<WHITE>(p, c.depth, bad);
+      else
+        verify_walk<BLACK>(p, c.depth, bad);
+      std::printf("%-58s depth %d : %s\n", c.fen, c.depth, bad ? "MISMATCH" : "ok");
+      total += bad;
+    }
+    std::printf(total ? "\nNNUE incremental: %d MISMATCH(ES)\n" : "\nNNUE incremental == from-scratch (all nodes)\n",
+                total);
+    return total;
+  }
+
 } // namespace nnue

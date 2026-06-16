@@ -130,11 +130,17 @@ void Position::set(const std::string &fen, Position &p) {
 
   // Seed the root position's hash (now fully built) for repetition detection.
   p.history[p.game_ply].hash = p.hash;
+
+  // Build the NNUE accumulator from scratch now that the board is complete (the per-piece updates in
+  // put_piece were skipped while the kings were not yet both on the board).
+  p.nnue_refresh();
 }
 
 
 // Moves a piece to a (possibly empty) square on the board and updates the hash
 void Position::move_piece(Square from, Square to) {
+  const Piece pc     = board[from]; // mover
+  const Piece victim = board[to]; // captured (NO_PIECE-safe: this primitive is only used for captures)
   psqt_mg_score += psqt::score_mg(board[from], to) - psqt::score_mg(board[from], from) - psqt::score_mg(board[to], to);
   psqt_eg_score += psqt::score_eg(board[from], to) - psqt::score_eg(board[from], from) - psqt::score_eg(board[to], to);
   hash ^= zobrist::zobrist_table[board[from]][from] ^ zobrist::zobrist_table[board[from]][to] ^
@@ -144,14 +150,62 @@ void Position::move_piece(Square from, Square to) {
   piece_bb[board[to]] &= ~mask;
   board[to]   = board[from];
   board[from] = NO_PIECE;
+
+  // NNUE: drop the captured piece, then relocate the mover. A king mover re-indexes its own
+  // perspective (refresh); the other side sees the king move like any piece.
+  nnue_sub_all(victim, to);
+  if (type_of(pc) == KING) {
+    const Color kc = color_of(pc);
+    nnue_refresh_perspective(kc);
+    nnue_sub_one(~kc, pc, from);
+    nnue_add_one(~kc, pc, to);
+  } else {
+    nnue_sub_all(pc, from);
+    nnue_add_all(pc, to);
+  }
 }
 
 // Moves a piece to an empty square. Note that it is an error if the <to> square contains a piece
 void Position::move_piece_quiet(Square from, Square to) {
+  const Piece pc = board[from]; // mover
   psqt_mg_score += psqt::score_mg(board[from], to) - psqt::score_mg(board[from], from);
   psqt_eg_score += psqt::score_eg(board[from], to) - psqt::score_eg(board[from], from);
   hash ^= zobrist::zobrist_table[board[from]][from] ^ zobrist::zobrist_table[board[from]][to];
   piece_bb[board[from]] ^= (SQUARE_BB[from] | SQUARE_BB[to]);
   board[to]   = board[from];
   board[from] = NO_PIECE;
+
+  // NNUE (see move_piece). A king mover refreshes its own perspective; the other side updates it as a
+  // normal piece. This also covers castling (king + rook are two separate move_piece_quiet calls).
+  if (type_of(pc) == KING) {
+    const Color kc = color_of(pc);
+    nnue_refresh_perspective(kc);
+    nnue_sub_one(~kc, pc, from);
+    nnue_add_one(~kc, pc, to);
+  } else {
+    nnue_sub_all(pc, from);
+    nnue_add_all(pc, to);
+  }
+}
+
+// --- NNUE accumulator refresh (from scratch) --------------------------------------------------
+void Position::nnue_refresh_perspective(Color P) {
+  if (nnue::g_net == nullptr)
+    return;
+  const Bitboard kb = piece_bb[make_piece(P, KING)];
+  if (!kb)
+    return;
+  const Square ksq = bsf(kb);
+  for (int i = 0; i < nnue::L1; ++i)
+    nnue_acc.v[P][i] = nnue::g_net->ft_bias[i];
+  for (int s = 0; s < NSQUARES; ++s) {
+    const Piece pc = board[s];
+    if (pc != NO_PIECE)
+      nnue::add_feature(nnue_acc, P, nnue::feature_index(P, pc, Square(s), ksq));
+  }
+}
+
+void Position::nnue_refresh() {
+  nnue_refresh_perspective(WHITE);
+  nnue_refresh_perspective(BLACK);
 }
