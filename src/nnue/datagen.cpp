@@ -28,6 +28,7 @@ namespace nnue {
     constexpr int RESIGN_PLIES   = 6; // consecutive such plies -> adjudicate the win
     constexpr int MATE_BOUND     = 20000; // skip recording mate-coded scores (not centipawns)
     constexpr int ADJ_DRAW_BAND  = 300; // |white-cp| below this at the ply cap -> call it a draw
+    constexpr int MOVE_HARD_MS   = 5000; // per-move search cap (ms): a runaway position can't stall a game
 
     // Runtime colour dispatch over the colour-templated Position methods.
     int legal_moves(Position &p, Move *list) {
@@ -98,6 +99,28 @@ namespace nnue {
     std::fprintf(stderr, "datagen: %d games, depth %d, seed %llu -> %s\n", games, depth,
                  static_cast<unsigned long long>(seed), out);
 
+    // Live progress redrawn in place ('\r'), throttled to ~5 updates/sec. Called BOTH per ply (so a
+    // long game never freezes the line) and at the end; `done_games` is games fully completed so far.
+    const auto print_progress = [&](int done_games) {
+      const auto now = clock::now();
+      if (done_games != games && secs_since(last_print, now) < 0.2)
+        return;
+      last_print             = now;
+      const double elapsed   = secs_since(t0, now);
+      const double done      = done_games;
+      const double frac      = games > 0 ? done / games : 0;
+      const double pos_per_s = elapsed > 0 ? written / elapsed : 0;
+      const double g_per_s   = elapsed > 0 ? done / elapsed : 0;
+      const double nps       = elapsed > 0 ? total_nodes / elapsed : 0;
+      const double eta       = g_per_s > 0 ? (games - done) / g_per_s : 0;
+      os.flush();
+      std::fprintf(stderr, "\r[%5.1f%%] %d/%d games | %s pos | %s pos/s | %.1f g/s | %s nps | up %s | eta %s    ",
+                   frac * 100.0, done_games, games, human_count(written).c_str(),
+                   human_count(uint64_t(pos_per_s)).c_str(), g_per_s, human_count(uint64_t(nps)).c_str(),
+                   fmt_time(elapsed).c_str(), fmt_time(eta).c_str());
+      std::fflush(stderr);
+    };
+
     for (int g = 0; g < games; ++g) {
       Position pos;
       Position::set(DEFAULT_FEN, pos);
@@ -137,10 +160,11 @@ namespace nnue {
           break;
         }
 
-        const search::Result r  = search::think(pos, depth, 1, nullcb, 0, 0, false);
+        const search::Result r  = search::think(pos, depth, 1, nullcb, 0, MOVE_HARD_MS, false);
         const int            ws = pos.turn() == WHITE ? r.score : -r.score;
         last_white              = ws;
         total_nodes += r.nodes;
+        print_progress(g); // keep the line alive within a long game
 
         const bool noisy = r.best.is_capture() || (r.best.flags() >= PR_KNIGHT && r.best.flags() <= PR_QUEEN);
         if (!in_check_now(pos) && !noisy && std::abs(r.score) < MATE_BOUND)
@@ -168,23 +192,7 @@ namespace nnue {
         ++written;
       }
 
-      // Live progress, throttled to ~5 updates/sec, redrawn in place with '\r'.
-      const auto now = clock::now();
-      if (secs_since(last_print, now) >= 0.2 || g + 1 == games) {
-        last_print             = now;
-        const double elapsed   = secs_since(t0, now);
-        const double done      = g + 1;
-        const double frac      = done / games;
-        const double pos_per_s = elapsed > 0 ? written / elapsed : 0;
-        const double g_per_s   = elapsed > 0 ? done / elapsed : 0;
-        const double nps       = elapsed > 0 ? total_nodes / elapsed : 0;
-        const double eta       = g_per_s > 0 ? (games - done) / g_per_s : 0;
-        os.flush();
-        std::fprintf(stderr, "\r[%5.1f%%] %d/%d games | %s pos | %s pos/s | %.1f g/s | %s nps | up %s | eta %s    ",
-                     frac * 100.0, g + 1, games, human_count(written).c_str(), human_count(uint64_t(pos_per_s)).c_str(),
-                     g_per_s, human_count(uint64_t(nps)).c_str(), fmt_time(elapsed).c_str(), fmt_time(eta).c_str());
-        std::fflush(stderr);
-      }
+      print_progress(g + 1); // game finished
     }
 
     os.flush();
