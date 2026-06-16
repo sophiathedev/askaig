@@ -59,11 +59,24 @@ std::string Position::fen() const {
       fen << '/';
   }
 
-  fen << (side_to_play == WHITE ? " w " : " b ") << (history[game_ply].entry & WHITE_OO_MASK ? "" : "K")
-      << (history[game_ply].entry & WHITE_OOO_MASK ? "" : "Q") << (history[game_ply].entry & BLACK_OO_MASK ? "" : "k")
-      << (history[game_ply].entry & BLACK_OOO_MASK ? "" : "q")
-      << (history[game_ply].entry & ALL_CASTLING_MASK ? "- " : "")
-      << (history[game_ply].epsq == NO_SQUARE ? " -" : SQSTR[history[game_ply].epsq]);
+  // Castling field: the available rights (a set bit in `entry` means that right was lost), or "-" when
+  // none remain — a standard FEN castling field (the old code appended a stray "-" whenever ANY single
+  // right was lost, producing e.g. "KQq- " for a partial-rights position).
+  const Bitboard entry = history[game_ply].entry;
+  std::string    castle;
+  if (!(entry & WHITE_OO_MASK))
+    castle += 'K';
+  if (!(entry & WHITE_OOO_MASK))
+    castle += 'Q';
+  if (!(entry & BLACK_OO_MASK))
+    castle += 'k';
+  if (!(entry & BLACK_OOO_MASK))
+    castle += 'q';
+  if (castle.empty())
+    castle = "-";
+
+  fen << (side_to_play == WHITE ? " w " : " b ") << castle << ' '
+      << (history[game_ply].epsq == NO_SQUARE ? "-" : SQSTR[history[game_ply].epsq]);
 
   return fen.str();
 }
