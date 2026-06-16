@@ -15,19 +15,27 @@ int main(int argc, char *argv[]) {
   initialise_all_databases();
   zobrist::initialise_zobrist_keys();
   kpk::init(); // KPK win/draw bitbase (needs the attack tables above)
-  nnue::init(); // load the (placeholder) NNUE network
+  // NOTE: the engine does NOT auto-load a net — eval defaults to HCE; a real net is loaded on demand via
+  // the UCI `EvalFile` option (then eval routes to NNUE). The NNUE test subcommands below install a
+  // deterministic PLACEHOLDER net (nnue::init) so the inference path is exercisable without a trained net.
 
-  // `askaig nnuetest`: run the NNUE self-test (mirror symmetry; SIMD==portable later) and exit.
-  if (argc > 1 && std::string_view(argv[1]) == "nnuetest")
+  // `askaig nnuetest`: NNUE self-test (mirror symmetry; SIMD==portable) and exit.
+  if (argc > 1 && std::string_view(argv[1]) == "nnuetest") {
+    nnue::init();
     return nnue::self_test() == 0 ? 0 : 1;
+  }
 
   // `askaig nnueverify`: assert the incremental accumulator == from-scratch over a make/unmake walk.
-  if (argc > 1 && std::string_view(argv[1]) == "nnueverify")
+  if (argc > 1 && std::string_view(argv[1]) == "nnueverify") {
+    nnue::init();
     return nnue::verify_incremental() == 0 ? 0 : 1;
+  }
 
   // `askaig nnuedump <file>`: write the current net to a .nnue file (for the trainer contract check).
-  if (argc > 2 && std::string_view(argv[1]) == "nnuedump")
+  if (argc > 2 && std::string_view(argv[1]) == "nnuedump") {
+    nnue::init();
     return nnue::dump(argv[2]) ? 0 : 1;
+  }
 
   // `askaig datagen <out> [games] [depth] [seed]`: self-play NNUE training data. Needs a TT for the
   // search. With no explicit seed a RANDOM one is drawn, so repeated runs produce DISTINCT data (the

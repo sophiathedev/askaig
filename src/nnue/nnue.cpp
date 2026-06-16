@@ -98,9 +98,9 @@ namespace nnue {
   }
 
   int evaluate(const Position &pos) {
-    Accumulator acc;
-    refresh(pos, acc);
-    return forward(acc, pos.turn());
+    // Use the accumulator the make/unmake primitives maintain incrementally (refreshed by Position::set
+    // and verified == from-scratch in M2); this is the whole point of Option A — no per-eval refresh.
+    return forward(pos.nnue_acc, pos.turn());
   }
 
   // --- net loading ------------------------------------------------------------------------------

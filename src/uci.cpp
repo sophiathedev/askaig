@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 #include "eval.h"
+#include "nnue/nnue.h"
 #include "position.h"
 #include "search.h"
 #include "tables.h"
@@ -597,6 +598,7 @@ void uci::loop() {
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
       std::cout << "option name Ponder type check default false\n"; // enables the GUI to send "go ponder"
       std::cout << "option name UCI_ShowWDL type check default false\n"; // append wdl W D L to info lines
+      std::cout << "option name EvalFile type string default <none>\n"; // load a .nnue net -> NNUE eval
       // SPSA-tunable search constants (pruning margins, depth gates) — advertised ONLY in debug mode
       // (`debug on`, or the `--debug` CLI flag a tuning harness passes), so a normal production GUI
       // never sees this clutter and can't set it. See the `debug` and `setoption` handlers.
@@ -646,6 +648,16 @@ void uci::loop() {
         std::string v;
         is >> v; // the "value" token was already consumed; v is "true"/"false"
         g_show_wdl = (v == "true");
+      } else if (name == "EvalFile") {
+        // Load a .nnue net -> eval routes to NNUE (HCE is the fallback when none is loaded). Refresh the
+        // current position's accumulator so the net is live immediately (the next `position` would too).
+        std::string path;
+        is >> path;
+        const bool ok = nnue::load(path.c_str());
+        if (ok && pos)
+          pos->nnue_refresh();
+        std::lock_guard<std::mutex> lk(g_out);
+        std::cout << "info string " << (ok ? "NNUE loaded: " : "NNUE load failed: ") << path << "\n" << std::flush;
       } else if (g_debug) {
         // A search tunable (SPSA): setoption name <X> value <n>, accepted ONLY in debug mode so it
         // can't be poked in production. set_tunable clamps to [min,max] and ignores unknown names.

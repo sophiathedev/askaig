@@ -42,7 +42,9 @@ Together these cut the searched node count by **~95%+** on quiet positions versu
 
 ## Evaluation
 
-A **tapered** (middlegame ↔ endgame) evaluation, interpolated by game phase from the remaining material. All tunable constants were **Texel-tuned** (coordinate descent on self-play positions with L2 regularisation and per-parameter hard bounds):
+Two evaluations are available. When a **NNUE network** is loaded (the `EvalFile` UCI option, a `.nnue` file), it **replaces** the hand-crafted evaluation below entirely (only the fifty-move damping is kept); otherwise the engine uses the hand-crafted eval (HCE), which is also what `bench`/`tune` operate on. The NNUE is a HalfKA + horizontal-mirror perspective net (single king bucket, L1=1024, SCReLU), with the accumulator maintained incrementally in the make/unmake primitives. Train one yourself with [`tools/train`](tools/train) — the engine is MIT and uses no third-party net.
+
+The hand-crafted evaluation is a **tapered** (middlegame ↔ endgame) evaluation, interpolated by game phase from the remaining material. All tunable constants were **Texel-tuned** (coordinate descent on self-play positions with L2 regularisation and per-parameter hard bounds):
 
 - **Material + piece-square tables** — [**PeSTO's Evaluation Function**](https://www.chessprogramming.org/PeSTO%27s_Evaluation_Function) (Ronald Friederich's tuned tables), with separate MG/EG material values and tables for every piece. Maintained **incrementally** in the make/unmake primitives (two running MG/EG accumulators) and interpolated by game phase.
 - **Pawn structure** — doubled / isolated penalties, a **tapered passed-pawn** bonus (reduced when **blockaded**, plus an endgame **king-distance race** term), centered pawns, and knight **outposts** (a knight on an enemy "hole" defended by a pawn). Evaluated via a **per-thread pawn cache** (exact `(wp, bp)` match, ~8k entries) so most positions pay O(1) for the pawn terms.
@@ -84,6 +86,7 @@ Supported commands: `uci`, `isready`, `ucinewgame`, `position [startpos | fen <f
 `go [depth <n>]`, `go movetime <ms>`, `go wtime <ms> btime <ms> [winc <ms>] [binc <ms>] [movestogo <n>]`
 (clock-based time management), `go ponder` + `ponderhit` (think on the opponent's time), `go infinite`
 (search until `stop`), `go perft <depth> [nonbulk]`, `setoption name Hash value <MB>`, `setoption name Threads value <n>`,
+`setoption name EvalFile value <path.nnue>` (load a NNUE network — eval then uses NNUE; omit for the hand-crafted eval),
 `d` / `display`, `eval` (static evaluation of the current position), `stop`, `quit`.
 
 ### Benchmark
