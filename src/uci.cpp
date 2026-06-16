@@ -395,6 +395,11 @@ namespace {
   constexpr int     DEFAULT_DEPTH        = 8;
   constexpr int64_t MOVE_OVERHEAD_MS     = 30; // safety buffer for GUI/transport lag, reserved from the clock
   constexpr int64_t EMERGENCY_RESERVE_MS = 500; // hard floor: never let our clock fall below this mid-search
+  // Fast (bullet/blitz) time-control threshold on the Lichess-style estimated game length
+  // (remaining + 40*increment, ms). Below this the budget is more conservative (see go_cmd): a 3-min
+  // game estimates ~260s, a 10-min game exactly 600s — so this cleanly separates blitz from rapid.
+  constexpr int64_t TC_FAST_MAX_MS   = 600000; // <=~10 min estimated -> bullet/blitz
+  constexpr int64_t BLITZ_RESERVE_MS = 1000; // larger clock floor in blitz: keep a usable endgame buffer
 
   // Plays a Move on `p`, dispatching on the side to move (Position::play is templated on Color).
   void play_any(Position &p, Move m) {
@@ -483,28 +488,42 @@ namespace {
       hard_ms   = std::max<int64_t>(movetime - MOVE_OVERHEAD_MS, 1);
       soft_ms   = 0; // a fixed move time: run the whole budget, no adaptive early stop
     } else if (wtime > 0 || btime > 0) {
-      max_depth           = search::MAX_DEPTH;
-      const int64_t t     = pos.turn() == WHITE ? wtime : btime; // our remaining time
-      const int64_t inc   = pos.turn() == WHITE ? winc : binc; // our increment
-      const int     mtg   = movestogo > 0 ? movestogo : 40; // assume 40 moves to go under sudden death
+      max_depth         = search::MAX_DEPTH;
+      const int64_t t   = pos.turn() == WHITE ? wtime : btime; // our remaining time
+      const int64_t inc = pos.turn() == WHITE ? winc : binc; // our increment
+      // Detect a fast (bullet/blitz) control from the estimated game length (Lichess convention:
+      // remaining + 40*increment). Using the CURRENT remaining makes it self-tightening — as the clock
+      // runs low the estimate drops into the fast bucket, so the engine automatically banks more time in
+      // time trouble. Fast controls budget more conservatively: more assumed moves (so a smaller per-move
+      // share), a tighter single-move ceiling, and a larger reserve. Rapid/classical keep the looser
+      // budget. No game-state needed (no base-time capture / ucinewgame dependency).
+      const bool    fast  = (t + 40 * inc) < TC_FAST_MAX_MS;
+      const int     mtg   = movestogo > 0 ? movestogo : (fast ? 50 : 40); // moves-to-go under sudden death
       const int64_t avail = std::max<int64_t>(t - MOVE_OVERHEAD_MS, 1);
-      // Optimum slice of the clock for this move (a share of the remaining time plus the increment);
-      // the search scales it by best-move stability. The hard cap bounds a single move to 3x the
-      // optimum and never more than HALF of what we have left — a long final iteration can't drain
-      // the bank and leave us scraping by 2s in the middlegame. (Was 5x / 75%, which front-loaded.)
+      // Optimum slice of the clock for this move (a share of the remaining time plus the increment); the
+      // search scales it by best-move stability. The hard cap bounds a single move to `hard_mult` x the
+      // optimum (2x in blitz — a long final iteration can't drain the bank and leave us scrambling on the
+      // increment in the endgame; 3x in rapid/classical) and never more than HALF of what we have left.
       // The optimum is itself capped at HALF the clock: with a low main time and a big increment,
       // `avail/mtg + inc` can exceed what we have — committing nearly all of it would leave only the
       // MOVE_OVERHEAD buffer and risk flagging on lag. Half keeps a safe reserve; the increment
-      // replenishes it next move. This only bites in time trouble (inc dwarfing the clock); normal
-      // play is unaffected (there `avail/mtg + inc` is far below avail/2).
-      const int64_t opt = std::min<int64_t>(avail / mtg + inc, std::max<int64_t>(avail / 2, 1));
-      soft_ms           = std::max<int64_t>(opt, 1);
-      hard_ms           = std::max<int64_t>(soft_ms, std::min<int64_t>(opt * 3, std::max<int64_t>(avail / 2, 1)));
-      // Emergency floor: the hard deadline never lets our clock drop below EMERGENCY_RESERVE_MS — an
-      // absolute guarantee on top of the budget caps, so no miscalculation or slow iteration can flag
-      // us. Once the clock is already at/under the reserve this is ~0: abort at once and play the best
-      // move from the last completed depth (the `any_legal_move` fallback covers "before depth 1").
-      const int64_t emergency = std::max<int64_t>(t - EMERGENCY_RESERVE_MS, 1);
+      // replenishes it next move (this cap only bites in time trouble; normal play is far below avail/2).
+      const int64_t opt       = std::min<int64_t>(avail / mtg + inc, std::max<int64_t>(avail / 2, 1));
+      const int64_t hard_mult = fast ? 2 : 3;
+      soft_ms                 = std::max<int64_t>(opt, 1);
+      hard_ms = std::max<int64_t>(soft_ms, std::min<int64_t>(opt * hard_mult, std::max<int64_t>(avail / 2, 1)));
+      // Emergency floor: the hard deadline never lets our clock drop below the reserve (larger in blitz so
+      // a usable thinking buffer survives into the endgame) — an absolute guarantee on top of the budget
+      // caps, so no miscalculation or slow iteration can flag us. Once the clock is already at/under the
+      // reserve this is ~0: abort at once and play the best move from the last completed depth (the
+      // `any_legal_move` fallback covers "before depth 1").
+      // Cap the reserve at a fraction of the clock so it stays a small safety margin, not a big slice: at
+      // the 3+2 deployment target 1000ms is ~0.5% of the clock, but in ultra-bullet (a few seconds total)
+      // a flat 1s would be a fifth of it — there t/10 keeps the reserve proportionate (floored at the lag
+      // buffer so we never flag).
+      const int64_t reserve   = std::clamp<int64_t>(fast ? BLITZ_RESERVE_MS : EMERGENCY_RESERVE_MS, MOVE_OVERHEAD_MS,
+                                                    std::max<int64_t>(t / 10, MOVE_OVERHEAD_MS));
+      const int64_t emergency = std::max<int64_t>(t - reserve, 1);
       hard_ms                 = std::min(hard_ms, emergency);
       soft_ms                 = std::min(soft_ms, hard_ms);
     } else if (infinite) {
