@@ -199,6 +199,7 @@ def check_int(net_path, fen):
 
 
 def main():
+    global L1
     ap = argparse.ArgumentParser()
     ap.add_argument('--data')
     ap.add_argument('--out', default='askaig-v1.nnue')
@@ -206,10 +207,16 @@ def main():
     ap.add_argument('--epochs', type=int, default=30)
     ap.add_argument('--batch', type=int, default=16384)
     ap.add_argument('--lr', type=float, default=1e-3)
+    ap.add_argument('--wd', type=float, default=1e-7, help='weight decay (L2 regularisation against overfit)')
     ap.add_argument('--wdl', type=float, default=0.5, help='lambda: score vs game-result blend')
+    ap.add_argument('--val', type=float, default=0.05, help='held-out validation fraction (overfit signal)')
+    ap.add_argument('--patience', type=int, default=6, help='early-stop after N epochs without val improvement (0=off)')
+    ap.add_argument('--l1', type=int, default=L1,
+                    help='hidden width — MUST equal src/nnue/network.h L1 (rebuild the engine if you change it)')
     ap.add_argument('--device', default='auto')
     ap.add_argument('--check', nargs=2, metavar=('NET', 'FEN'), help='int-eval a FEN with a .nnue and exit')
     args = ap.parse_args()
+    L1 = args.l1  # used by the model / export / check_int
 
     if args.check:
         check_int(args.check[0], args.check[1])
@@ -219,7 +226,7 @@ def main():
     dev = args.device
     if dev == 'auto':
         dev = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
-    print(f"device: {dev}")
+    print(f"device: {dev}  L1: {L1}")
 
     cache = args.cache or (args.data + '.npz')
     us_np, them_np, score_np, wdl_np = load_data(args.data, cache)
@@ -230,25 +237,53 @@ def main():
     # training target = lambda*sigmoid(score/SCALE) + (1-lambda)*wdl  (win-prob space)
     target = args.wdl * torch.sigmoid(torch.from_numpy(score_np) / SCALE) + (1 - args.wdl) * torch.from_numpy(wdl_np)
 
+    # Held-out validation split (shuffled, fixed seed): val loss is the HONEST signal — when it stops
+    # falling (or rises) while train loss keeps dropping, the net is overfitting. We export the
+    # BEST-val-loss net, not the last epoch (which is the most overfit).
+    g = torch.Generator().manual_seed(0)
+    perm = torch.randperm(N, generator=g)
+    n_val = int(N * args.val)
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    print(f"train {len(train_idx)}  val {len(val_idx)}")
+
     model = build_model(torch).to(dev)
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
-    for ep in range(args.epochs):
-        perm = torch.randperm(N)
+    def run_epoch(idx, train):
+        model.train(train)
         total = 0.0
-        for i in range(0, N, args.batch):
-            idx = perm[i:i + args.batch]
-            u = us_t[idx].to(dev); t = them_t[idx].to(dev); y = target[idx].to(dev)
-            pred = torch.sigmoid(model(u, t))
-            loss = ((pred - y) ** 2).mean()
-            opt.zero_grad(); loss.backward(); opt.step()
-            total += loss.item() * len(idx)
-        sched.step()
-        print(f"epoch {ep+1}/{args.epochs}  loss {total/N:.6f}  lr {sched.get_last_lr()[0]:.2e}")
-        export_nnue(model, args.out)   # checkpoint each epoch (also the final net)
+        for i in range(0, len(idx), args.batch):
+            b = idx[i:i + args.batch]
+            u = us_t[b].to(dev); t = them_t[b].to(dev); y = target[b].to(dev)
+            with torch.set_grad_enabled(train):
+                pred = torch.sigmoid(model(u, t))
+                loss = ((pred - y) ** 2).mean()
+            if train:
+                opt.zero_grad(); loss.backward(); opt.step()
+            total += loss.item() * len(b)
+        return total / max(1, len(idx))
 
-    print(f"done -> {args.out}")
+    best_val, bad = float('inf'), 0
+    for ep in range(args.epochs):
+        tr = run_epoch(train_idx[torch.randperm(len(train_idx), generator=g)], True)
+        va = run_epoch(val_idx, False) if n_val else tr
+        sched.step()
+        if va < best_val - 1e-6:
+            best_val, bad = va, 0
+            export_nnue(model, args.out)
+            flag = '  <- best (exported)'
+        else:
+            bad += 1
+            flag = f'  (no val improve {bad}/{args.patience})'
+        print(f"epoch {ep+1}/{args.epochs}  train {tr:.6f}  val {va:.6f}  lr {sched.get_last_lr()[0]:.2e}{flag}")
+        if args.patience and bad >= args.patience:
+            print("early stop — val loss plateaued (overfitting); the best net is already exported")
+            break
+
+    if best_val == float('inf'):  # no validation set -> nothing exported above
+        export_nnue(model, args.out)
+    print(f"done -> {args.out}  (best val loss {best_val:.6f})")
 
 
 if __name__ == '__main__':
