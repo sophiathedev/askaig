@@ -229,21 +229,17 @@ namespace {
   // perft (move-generation node count) — used by "go perft <depth>". Memoised by the exact perft
   // hash above when the calling thread has a table and the depth is worth caching.
   template<Color Us>
-  uint64_t perft(Position &p, int depth, bool bulk) {
-    // Bulk counting: at the last ply return the legal-move count directly, skipping a make/unmake of
-    // every leaf (the bulk of the tree) — far faster, identical total. Non-bulk recurses to depth 0
-    // and counts 1 per leaf, so play/undo runs on every move; it is the "go perft <d> nonbulk" mode
-    // (a full make/unmake stress test, and the node count other engines report when not bulk-counting).
-    if (bulk) {
-      if (depth <= 1) {
-        MoveList<Us> list(p);
-        return static_cast<uint64_t>(list.size());
-      }
-    } else if (depth == 0)
-      return 1;
+  uint64_t perft(Position &p, int depth, bool use_cache) {
+    // Bulk counting (always on): at the last ply return the legal-move count directly, skipping a
+    // make/unmake of every leaf (the bulk of the tree) — far faster, identical total.
+    if (depth <= 1) {
+      MoveList<Us> list(p);
+      return static_cast<uint64_t>(list.size());
+    }
 
-    // The perft hash is a memoisation; non-bulk deliberately skips it so the whole tree is walked.
-    const bool use_hash = bulk && !t_perft_tt.empty() && depth >= PERFT_HASH_MIN_DEPTH;
+    // The perft hash is a memoisation of subtree counts; `go perft <d> noncache` skips it so every
+    // subtree is recomputed (the tree is still bulk-counted at the leaves).
+    const bool use_hash = use_cache && !t_perft_tt.empty() && depth >= PERFT_HASH_MIN_DEPTH;
     PerftEntry key{{0, 0, 0, 0}, 0, 0, NO_SQUARE, 0, -1};
     size_t     idx = 0;
     if (use_hash) {
@@ -258,7 +254,7 @@ namespace {
     MoveList<Us> list(p);
     for (Move m: list) {
       p.play<Us>(m);
-      nodes += perft<~Us>(p, depth - 1, bulk);
+      nodes += perft<~Us>(p, depth - 1, use_cache);
       p.undo<Us>(m);
     }
 
@@ -287,7 +283,7 @@ namespace {
   // root moves from a shared atomic counter and accumulate into per-move slots on their own board
   // clone; the divide lines are then printed in move-generation order.
   template<Color Us>
-  void perft_divide(Position &p, int depth, bool bulk) {
+  void perft_divide(Position &p, int depth, bool use_cache) {
     std::vector<Move> moves;
     {
       MoveList<Us> list(p);
@@ -301,8 +297,8 @@ namespace {
       nthreads = static_cast<int>(n == 0 ? 1 : n);
 
     // The exact perft hash pays off only for deep subtrees; allocate it then (per worker thread).
-    // Non-bulk skips the hash (and bulk counting) on purpose — it walks every node.
-    const bool hash = bulk && depth - 1 >= PERFT_HASH_MIN_DEPTH;
+    // `noncache` skips the hash on purpose — every subtree is recomputed.
+    const bool hash = use_cache && depth - 1 >= PERFT_HASH_MIN_DEPTH;
 
     const auto start = std::chrono::steady_clock::now();
 
@@ -312,7 +308,7 @@ namespace {
           ensure_perft_tt();
         for (size_t i = 0; i < n; ++i) {
           p.play<Us>(moves[i]);
-          counts[i] = perft<~Us>(p, depth - 1, bulk);
+          counts[i] = perft<~Us>(p, depth - 1, use_cache);
           p.undo<Us>(moves[i]);
         }
       } else {
@@ -324,7 +320,7 @@ namespace {
           size_t   i;
           while ((i = next.fetch_add(1, std::memory_order_relaxed)) < n) {
             local.play<Us>(moves[i]);
-            counts[i] = perft<~Us>(local, depth - 1, bulk);
+            counts[i] = perft<~Us>(local, depth - 1, use_cache);
             local.undo<Us>(moves[i]);
           }
         };
@@ -353,11 +349,11 @@ namespace {
               << " nodes/s\n";
   }
 
-  void run_perft(Position &pos, int depth, bool bulk) {
+  void run_perft(Position &pos, int depth, bool use_cache) {
     if (pos.turn() == WHITE)
-      perft_divide<WHITE>(pos, depth, bulk);
+      perft_divide<WHITE>(pos, depth, use_cache);
     else
-      perft_divide<BLACK>(pos, depth, bulk);
+      perft_divide<BLACK>(pos, depth, use_cache);
   }
 
   // Handles "position [startpos | fen <fen>] [moves <m1> ...]".
@@ -452,11 +448,11 @@ namespace {
       if (token == "perft") {
         int d = 1;
         is >> d;
-        // Optional trailing "nonbulk": disable bulk counting (recurse to depth 0, make/unmake every
-        // leaf) — slower, same total, exercises the full play/undo path. Default is bulk counting.
+        // Optional trailing "noncache": skip the perft-hash memoisation so every subtree is
+        // recomputed (the whole tree is walked, still bulk-counted at the leaves). Default uses the cache.
         std::string opt;
-        const bool  bulk = !(is >> opt && opt == "nonbulk");
-        run_perft(pos, d, bulk); // synchronous: perft is a debug node count, not a game move
+        const bool  use_cache = !(is >> opt && opt == "noncache");
+        run_perft(pos, d, use_cache); // synchronous: perft is a debug node count, not a game move
         return;
       }
       if (token == "depth")
