@@ -1,0 +1,5 @@
+build/
+cmake-build-*/
+*.o
+*.d
+.DS_Store
