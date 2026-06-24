@@ -7,3 +7,4 @@ cmake-build-*/
 /.sprt/
 /config.json
 /_archive_rewrite/
+/tools/
