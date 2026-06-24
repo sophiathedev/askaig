@@ -605,6 +605,33 @@ namespace search {
           alpha = stand_pat;
       }
 
+      // Big-delta pruning (whole-node): if even capturing the most valuable enemy piece — plus the
+      // delta margin — cannot raise the stand-pat to alpha, then no capture here can, and the
+      // per-move delta below would `continue` past every one and return this same stand-pat. Bail
+      // out now to skip generating, scoring and sorting captures that are all hopeless. This is
+      // behaviour- AND node-neutral (no capture is ever played either way, so the node count is
+      // unchanged) — a pure time saving, not a search change. The guards mirror the per-move delta's
+      // exemptions: only out of check, and disabled when a promotion is possible (a pawn on the
+      // relative 7th can swing by a queen regardless of the victim, and promotions skip delta).
+      if (!in_check && !(p.bitboard_of(Us, PAWN) & MASK_RANK[Us == WHITE ? RANK7 : RANK2])) {
+        const Color them = ~Us;
+        int         maxGain; // value of the most valuable enemy piece on the board (an upper bound on any victim)
+        if (p.bitboard_of(them, QUEEN))
+          maxGain = psqt::VALUE[QUEEN];
+        else if (p.bitboard_of(them, ROOK))
+          maxGain = psqt::VALUE[ROOK];
+        else
+          maxGain = std::max({psqt::VALUE[PAWN], p.bitboard_of(them, BISHOP) ? psqt::VALUE[BISHOP] : 0,
+                              p.bitboard_of(them, KNIGHT) ? psqt::VALUE[KNIGHT] : 0});
+        // Only fires when stand_pat <= alpha_orig (else alpha was already raised to stand_pat and the
+        // test cannot pass), so the node is a fail-low -> store an UPPER bound, exactly as the loop would.
+        if (stand_pat + maxGain + DELTA_MARGIN <= alpha) {
+          if (!aborted())
+            tt::store(key, Move{}, score_to_tt(stand_pat, ply), 0, tt::UPPER, raw_eval);
+          return stand_pat;
+        }
+      }
+
       Move moves[MAX_MOVES];
       int  scores[MAX_MOVES];
       int  n = 0;
