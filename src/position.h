@@ -175,7 +175,7 @@ public:
   // in a search line either side can force the threefold, so it is treated as a draw immediately.
   [[gnu::hot, nodiscard]] inline bool is_draw() const {
     const int f = history[game_ply].fifty;
-    if (f >= 100)
+    if (f >= 100) [[unlikely]]
       return true; // fifty-move rule (100 halfmoves)
     const int end = game_ply - f; // nothing before the last irreversible move can match
     for (int i = game_ply - 4; i >= end && i >= 0; i -= 2)

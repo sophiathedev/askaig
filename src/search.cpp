@@ -232,7 +232,7 @@ namespace search {
     // Returns true if the search should abort now (stop / time up / node cap). Cheap when untimed and
     // uncapped (the inner block runs once per TIME_CHECK_INTERVAL nodes).
     [[gnu::hot, gnu::always_inline]] inline bool stop_or_time_up() noexcept {
-      if (--t_time_count <= 0) {
+      if (--t_time_count <= 0) [[unlikely]] { // the clock poll fires once per TIME_CHECK_INTERVAL nodes
         t_time_count = TIME_CHECK_INTERVAL;
         t_nodes += TIME_CHECK_INTERVAL;
         const uint64_t cap = g_max_nodes.load(std::memory_order_relaxed);
@@ -460,7 +460,7 @@ namespace search {
     // "recapture" if the opponent has no attacker left to answer.
     [[gnu::hot]] bool see_ge(const Position &p, Move m, int threshold) noexcept {
       const MoveFlags fl = m.flags();
-      if (fl != CAPTURE && fl != QUIET && fl != DOUBLE_PUSH)
+      if (fl != CAPTURE && fl != QUIET && fl != DOUBLE_PUSH) [[unlikely]]
         return 0 >= threshold;
       const Square from = m.from();
       const Square to   = m.to();
@@ -550,9 +550,9 @@ namespace search {
     // stored static eval replaces evaluate(), the dominant qsearch cost, on every revisit.
     template<Color Us>
     [[gnu::hot]] int quiescence(Position &p, int alpha, int beta, uint64_t &nodes, int ply) {
-      if (stop_or_time_up())
+      if (stop_or_time_up()) [[unlikely]]
         return alpha; // stop / time up: the value is discarded (whole iteration thrown away)
-      if (p.ply() >= Position::MAX_HISTORY - 2)
+      if (p.ply() >= Position::MAX_HISTORY - 2) [[unlikely]]
         return eval::evaluate(p); // absolute undo-stack backstop (see Position::MAX_HISTORY)
       if (ply > t_seldepth)
         t_seldepth = ply; // quiescence reaches beyond the nominal depth -> it sets the selective depth
@@ -579,7 +579,7 @@ namespace search {
       // nominal depth could be "evaluated away".
       MoveList<Us> list(p);
       const bool   in_check = p.checkers != 0;
-      if (in_check && list.size() == 0)
+      if (in_check && list.size() == 0) [[unlikely]]
         return -(MATE - ply); // checkmated at the horizon
 
       // Fail-soft: track and return the true best score even outside (alpha, beta) — the TT then
@@ -673,7 +673,7 @@ namespace search {
     template<Color Us>
     [[gnu::hot]] int negamax(Position &p, int depth, int ply, int alpha, int beta, uint64_t &nodes, bool null_ok,
                              bool cutNode, Move excluded = Move{}) {
-      if (stop_or_time_up())
+      if (stop_or_time_up()) [[unlikely]]
         return 0; // stop requested / hard deadline hit: value is discarded, last completed depth kept
 
       // Clear this node's PV row BEFORE any other return path. A row left over from a previous
@@ -685,7 +685,7 @@ namespace search {
 
       if (ply > t_seldepth)
         t_seldepth = ply; // track the deepest ply reached, for the reported selective depth
-      if (ply >= MAX_PLY || p.ply() >= Position::MAX_HISTORY - MAX_PLY)
+      if (ply >= MAX_PLY || p.ply() >= Position::MAX_HISTORY - MAX_PLY) [[unlikely]]
         return eval::evaluate(p); // hard cap: bound runaway extensions, and never index history[] OOB
                                   // (the search stacks its plies onto game_ply; in a very long game
                                   //  that could otherwise overrun the undo stack — reserve MAX_PLY for
@@ -695,7 +695,7 @@ namespace search {
       // a move must still be returned). This collapses shuffling/perpetual lines instead of searching
       // them to the depth ceiling — it both plays draws correctly (no repeating in won positions) and
       // is what keeps the PV short (an unbounded repetition PV could otherwise flood stdout).
-      if (ply > 0 && p.is_draw())
+      if (ply > 0 && p.is_draw()) [[unlikely]]
         return 0;
 
       const uint64_t key        = p.get_hash();
@@ -742,7 +742,7 @@ namespace search {
       MoveList<Us> list(p);
       const int    n = static_cast<int>(list.size());
 
-      if (n == 0)
+      if (n == 0) [[unlikely]]
         return p.checkers ? -(MATE - ply) : 0; // checkmate (lose) : stalemate (draw)
       if (depth == 0)
         return quiescence<Us>(p, alpha, beta, nodes, ply);
@@ -760,7 +760,7 @@ namespace search {
       int        raw_eval    = INF;
       int        static_eval = INF;
       const bool can_prune   = !is_pv && !in_check && beta < MATE - MAX_MATE_PLY && beta > -(MATE - MAX_MATE_PLY);
-      if (!in_check) {
+      if (!in_check) [[likely]] { // the vast majority of interior nodes are not in check
         // Reuse the static eval stored in the TT when the position was seen before — evaluate() is
         // the dominant cost at these nodes. (The stored eval may have been computed at a different
         // halfmove clock — the hash omits it — so the fifty-move damping can be slightly off; the
@@ -832,7 +832,7 @@ namespace search {
             v = -negamax<~Us>(p, depth - PROBCUT_REDUCTION, ply + 1, -pc_beta, -pc_beta + 1, nodes, true, !cutNode,
                               Move{});
           p.undo<Us>(m);
-          if (aborted())
+          if (aborted()) [[unlikely]]
             return 0;
           if (v >= pc_beta) {
             tt::store(key, m, score_to_tt(v, ply), depth - (PROBCUT_REDUCTION - 1), tt::LOWER,
@@ -860,7 +860,7 @@ namespace search {
       for (int i = 0; i < n; ++i) {
         pick(moves, scores, i, n);
         Move m = moves[i];
-        if (m == excluded)
+        if (m == excluded) [[unlikely]]
           continue; // singular verification search: skip the move being tested
 
         // Forward pruning of late, quiet moves at shallow non-PV nodes (best already set => at

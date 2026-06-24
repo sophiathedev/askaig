@@ -241,7 +241,7 @@ namespace eval {
       const Bitboard bp = pos.bitboard_of(BLACK, PAWN);
 
       PawnEntry &e = t_pawn_cache[pawn_cache_index(wp, bp)];
-      if (e.wp != wp || e.bp != bp) { // miss: recompute the pawn-only parts into this slot
+      if (e.wp != wp || e.bp != bp) [[unlikely]] { // miss: recompute the pawn-only parts into this slot
         e.wp      = wp;
         e.bp      = bp;
         e.wpassed = e.bpassed = 0;
