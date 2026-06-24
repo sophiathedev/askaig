@@ -3,3 +3,6 @@ cmake-build-*/
 *.o
 *.d
 .DS_Store
+/sprt.sh
+/.sprt/
+/config.json
