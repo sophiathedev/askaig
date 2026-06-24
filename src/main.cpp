@@ -3,7 +3,6 @@
 #include <string_view>
 #include <thread>
 #include "kpk.h"
-#include "nnue/nnue.h"
 #include "position.h"
 #include "tables.h"
 #include "tt.h"
@@ -15,46 +14,6 @@ int main(int argc, char *argv[]) {
   initialise_all_databases();
   zobrist::initialise_zobrist_keys();
   kpk::init(); // KPK win/draw bitbase (needs the attack tables above)
-  // NOTE: the engine does NOT auto-load a net — eval defaults to HCE; a real net is loaded on demand via
-  // the UCI `EvalFile` option (then eval routes to NNUE). The NNUE test subcommands below install a
-  // deterministic PLACEHOLDER net (nnue::init) so the inference path is exercisable without a trained net.
-
-  // `askaig nnuetest`: NNUE self-test (mirror symmetry; SIMD==portable) and exit.
-  if (argc > 1 && std::string_view(argv[1]) == "nnuetest") {
-    nnue::init();
-    return nnue::self_test() == 0 ? 0 : 1;
-  }
-
-  // `askaig nnueverify`: assert the incremental accumulator == from-scratch over a make/unmake walk.
-  if (argc > 1 && std::string_view(argv[1]) == "nnueverify") {
-    nnue::init();
-    return nnue::verify_incremental() == 0 ? 0 : 1;
-  }
-
-  // `askaig nnuedump <file>`: write the current net to a .nnue file (for the trainer contract check).
-  if (argc > 2 && std::string_view(argv[1]) == "nnuedump") {
-    nnue::init();
-    return nnue::dump(argv[2]) ? 0 : 1;
-  }
-
-  // `askaig datagen <out> [games] [depth] [seed] [nodes]`: self-play NNUE training data. Needs a TT for
-  // the search. With no explicit seed a RANDOM one is drawn, so repeated runs produce DISTINCT data (the
-  // chosen seed is logged, so a good run is reproducible by passing it back). `nodes` > 0 searches a
-  // fixed node count per move (uniform, faster) instead of fixed `depth`.
-  if (argc > 1 && std::string_view(argv[1]) == "datagen") {
-    tt::resize(64);
-    uint64_t seed;
-    if (argc > 5) {
-      seed = std::strtoull(argv[5], nullptr, 10);
-    } else {
-      std::random_device rd;
-      seed = (static_cast<uint64_t>(rd()) << 32) ^ rd();
-    }
-    const uint64_t nodes = argc > 6 ? std::strtoull(argv[6], nullptr, 10) : 0;
-    nnue::datagen(argc > 2 ? argv[2] : "data.txt", argc > 3 ? std::atoi(argv[3]) : 100,
-                  argc > 4 ? std::atoi(argv[4]) : 8, seed, nodes);
-    return 0;
-  }
 
   // `askaig bench [depth]`: run the fixed benchmark and exit (the OpenBench-style CLI convention).
   // bench allocates its own fixed-size TT, so the 2 GiB default is skipped on this path.

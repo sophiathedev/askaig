@@ -3,7 +3,6 @@
 #include <ostream>
 #include <string>
 #include <utility>
-#include "nnue/accumulator.h"
 #include "psqt.h"
 #include "tables.h"
 #include "types.h"
@@ -129,7 +128,6 @@ public:
     hash ^= zobrist::zobrist_table[pc][s];
     psqt_mg_score += psqt::score_mg(pc, s);
     psqt_eg_score += psqt::score_eg(pc, s);
-    nnue_add_all(pc, s); // put_piece never places a king during play (only set(), which refreshes)
   }
 
   // Removes a piece from a particular square and updates the hash.
@@ -140,59 +138,10 @@ public:
     hash ^= zobrist::zobrist_table[pc][s];
     piece_bb[pc] &= ~SQUARE_BB[s];
     board[s] = NO_PIECE;
-    nnue_sub_all(pc, s); // remove_piece never removes a king during play
   }
 
   void move_piece(Square from, Square to);
   void move_piece_quiet(Square from, Square to);
-
-  // --- NNUE incremental accumulator (Option A) -------------------------------------------------
-  // Maintained by the same put/remove/move primitives that keep psqt_*_score above; undo reverses it
-  // by replaying the primitives. A king move re-indexes its WHOLE perspective (every feature is
-  // relative to that king), so move_piece / move_piece_quiet refresh that side when the mover is a
-  // king; the other side updates the king like any piece. All guarded by a loaded net AND both kings
-  // present, so during set() — which builds the board via put_piece, then refreshes from scratch — the
-  // partial updates are harmlessly skipped/overwritten.
-  nnue::Accumulator nnue_acc;
-
-  void nnue_refresh(); // rebuild both perspectives from the board (position.cpp)
-  void nnue_refresh_perspective(Color c); // rebuild one perspective from the board
-
-  inline void nnue_add_all(Piece pc, Square s) {
-    if (nnue::g_net == nullptr)
-      return;
-    const Bitboard wk = piece_bb[WHITE_KING], bk = piece_bb[BLACK_KING];
-    if (!wk || !bk)
-      return;
-    nnue::add_feature(nnue_acc, WHITE, nnue::feature_index(WHITE, pc, s, bsf(wk)));
-    nnue::add_feature(nnue_acc, BLACK, nnue::feature_index(BLACK, pc, s, bsf(bk)));
-  }
-  inline void nnue_sub_all(Piece pc, Square s) {
-    if (nnue::g_net == nullptr)
-      return;
-    const Bitboard wk = piece_bb[WHITE_KING], bk = piece_bb[BLACK_KING];
-    if (!wk || !bk)
-      return;
-    nnue::sub_feature(nnue_acc, WHITE, nnue::feature_index(WHITE, pc, s, bsf(wk)));
-    nnue::sub_feature(nnue_acc, BLACK, nnue::feature_index(BLACK, pc, s, bsf(bk)));
-  }
-  inline void nnue_add_one(Color P, Piece pc, Square s) {
-    if (nnue::g_net == nullptr)
-      return;
-    const Bitboard kb = piece_bb[make_piece(P, KING)];
-    if (!kb)
-      return;
-    nnue::add_feature(nnue_acc, P, nnue::feature_index(P, pc, s, bsf(kb)));
-  }
-  inline void nnue_sub_one(Color P, Piece pc, Square s) {
-    if (nnue::g_net == nullptr)
-      return;
-    const Bitboard kb = piece_bb[make_piece(P, KING)];
-    if (!kb)
-      return;
-    nnue::sub_feature(nnue_acc, P, nnue::feature_index(P, pc, s, bsf(kb)));
-  }
-
 
   friend std::ostream      &operator<<(std::ostream &os, const Position &p);
   static void               set(const std::string &fen, Position &p);

@@ -1,6 +1,5 @@
 #include "eval.h"
 #include "kpk.h"
-#include "nnue/nnue.h"
 #include "position.h"
 #include "types.h"
 
@@ -852,12 +851,6 @@ namespace eval {
   // than its ~5% hit rate saved — removing it measured +6-8% nps with identical node counts. So the
   // eval is recomputed every call.
   [[gnu::hot]] int evaluate(const Position &pos) noexcept {
-    // NNUE evaluation, when a network is loaded (UCI `EvalFile`). It REPLACES the whole hand-crafted
-    // pipeline below; only the fifty-move damping is kept (a rule the net cannot see from one position).
-    // The HCE is the fallback when no net is loaded — and remains what `tune`/`bench` operate on.
-    if (nnue::active())
-      return nnue::evaluate(pos) * (200 - pos.fifty()) / 200;
-
     // Taper the (incremental) material + piece-square score between the middlegame and endgame
     // tables by the game phase (full board -> middlegame, few pieces -> endgame).
     int phase = pop_count(pos.bitboard_of(WHITE, KNIGHT) | pos.bitboard_of(BLACK, KNIGHT)) +

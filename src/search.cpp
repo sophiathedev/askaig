@@ -96,7 +96,7 @@ namespace search {
     std::chrono::steady_clock::time_point g_soft_start; // when the soft budget started counting
     int64_t                               g_soft_ms = 0; // base soft budget (ms), scaled per iteration
     std::atomic<bool>                     g_ponder{false}; // searching on the opponent's time
-    std::atomic<uint64_t>                 g_max_nodes{0}; // per-thread node cap (0 = unlimited; for datagen)
+    std::atomic<uint64_t>                 g_max_nodes{0}; // per-thread node cap (0 = unlimited)
     constexpr int                         TIME_CHECK_INTERVAL = 2048; // poll the clock every N nodes
 
     // Arms the time control relative to `from`: a hard deadline `from + hard_ms` (the safety cut-off,
@@ -223,8 +223,8 @@ namespace search {
     thread_local int t_time_count = 0;
 
     // Approximate per-thread node count since this search began (advanced in TIME_CHECK_INTERVAL steps
-    // when the countdown fires), for the optional node cap (`g_max_nodes`, used by datagen for uniform
-    // fixed-work searches). Reset to 0 when a thread starts a search.
+    // when the countdown fires), for the optional node cap (`g_max_nodes`). Reset to 0 when a thread
+    // starts a search.
     thread_local uint64_t t_nodes = 0;
 
     // Decrement the countdown; every TIME_CHECK_INTERVAL nodes, read the clock and (if a node cap is

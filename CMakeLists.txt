@@ -20,8 +20,6 @@ add_executable(askaig
     src/uci.cpp
     src/wdl.cpp
     src/kpk.cpp
-    src/nnue/nnue.cpp
-    src/nnue/datagen.cpp
     src/main.cpp)
 
 target_include_directories(askaig PRIVATE src)
