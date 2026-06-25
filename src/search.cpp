@@ -172,6 +172,10 @@ namespace search {
       // refining the ordering WITHIN an MVV victim tier (LVA alone knows nothing about position).
       // Victims indexed P..Q (a king is never captured); same gravity/cap as `cont` (~10 KiB).
       int16_t capt[NPIECES][NSQUARES][5];
+      // Capture CONTINUATION history (counter-capture): how often a capture flattened to (attacker,
+      // to) cuts off given the move ONE ply back — the capture analogue of cont[0]. Keyed
+      // [prev (piece,to)][this capture's (piece,to)]; same gravity/cap as `cont` (~1.8 MiB/thread).
+      int16_t capt_cont[NPIECE_TO][NPIECE_TO];
       // Correction history (see above): four material-structure tables [side][structure-hash bucket]
       // (pawn skeleton / all non-pawn / minor pieces N+B / major pieces R+Q) plus a continuation
       // correction keyed by the move one ply back ([prev (piece,to) index] — the piece encodes the
@@ -354,14 +358,23 @@ namespace search {
     void update_heuristics(const Position &p, Color c, int ply, Move m, int depth, const Move *quiets, int nq,
                            const Move *capts, int nc) noexcept {
       const int bonus = depth * depth;
+      // Move one ply back — the counter-capture continuation key (-1 = none / right after a null move).
+      const int prev_pt = ply >= 1 ? t_move_stack[ply - 1] : -1;
 
-      // Capture history: bonus for a capture that cut off, malus for every capture searched
-      // before the cut-off move (whatever kind that move was).
-      if (m.is_capture())
+      // Capture history: bonus for a capture that cut off, malus for every capture searched before the
+      // cut-off move (whatever kind that move was). The same bonus/malus also feeds the counter-capture
+      // continuation table, conditioned on the move one ply back.
+      if (m.is_capture()) {
         cont_update(t_heur->capt[p.at(m.from())][m.to()][victim_type_of(p, m)], bonus);
+        if (prev_pt >= 0)
+          cont_update(t_heur->capt_cont[prev_pt][piece_to_index(p.at(m.from()), m.to())], bonus);
+      }
       for (int j = 0; j < nc; ++j)
-        if (!(capts[j] == m))
+        if (!(capts[j] == m)) {
           cont_update(t_heur->capt[p.at(capts[j].from())][capts[j].to()][victim_type_of(p, capts[j])], -bonus);
+          if (prev_pt >= 0)
+            cont_update(t_heur->capt_cont[prev_pt][piece_to_index(p.at(capts[j].from()), capts[j].to())], -bonus);
+        }
 
       if (!is_quiet(m))
         return;
@@ -426,6 +439,11 @@ namespace search {
           // = ±1875 < the 3520 gap between adjacent victim values ×16): the victim hierarchy stays
           // absolute, the history breaks LVA ties by what actually cut off here before.
           score += t_heur->capt[pos.at(m.from())][m.to()][victim_type] / 16;
+          // Counter-capture continuation: refine further by how this capture fared after the move one
+          // ply back. Scaled /32 (±937) so the combined capture history (±1875 + ±937 = ±2812) still
+          // stays under the 3520 victim-tier gap — the MVV hierarchy remains absolute.
+          if (ply >= 1 && t_move_stack[ply - 1] >= 0)
+            score += t_heur->capt_cont[t_move_stack[ply - 1]][piece_to_index(pos.at(m.from()), m.to())] / 32;
         }
         if (promo)
           score += psqt::VALUE[KNIGHT + (static_cast<int>(f) & 0b11)];
