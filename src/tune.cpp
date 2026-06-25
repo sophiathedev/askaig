@@ -356,21 +356,24 @@ namespace tune {
       for (auto &w: ws)
         w.join();
 
-      // Adam update (gradient averaged over the training set; optional L2 pull toward the defaults).
+      // Adam update (gradient averaged over the training set) + decoupled weight decay toward the
+      // defaults (AdamW). The decay is what keeps the COLLINEAR blocks sane: the imbalance quadratic
+      // and the king-safety terms have many near-degenerate directions, so an unregularized fit drifts
+      // them into huge mutually-cancelling values that lower MSE but lose Elo. Decay pulls weak-signal
+      // (collinear) weights back toward their SF-derived defaults while letting strong-signal weights
+      // (passers, threats, mobility) move freely. lambda = per-epoch decay fraction (0 = off).
       const double bc1 = 1.0 - std::pow(b1, epoch), bc2 = 1.0 - std::pow(b2, epoch);
       for (int i = 0; i < NP; ++i) {
         double gi = 0.0;
         for (int t = 0; t < threads; ++t)
           gi += tgrad[static_cast<size_t>(t)][static_cast<size_t>(i)];
         gi /= static_cast<double>(ntrain);
-        if (lambda > 0.0) {
-          const double sc = std::max(std::abs(static_cast<double>(w0[i])), 10.0);
-          gi += 2.0 * lambda * (theta[i] - w0[i]) / (sc * sc);
-        }
         m[i]              = b1 * m[i] + (1 - b1) * gi;
         vmom[i]           = b2 * vmom[i] + (1 - b2) * gi * gi;
         const double mhat = m[i] / bc1, vhat = vmom[i] / bc2;
         theta[i] -= lr * mhat / (std::sqrt(vhat) + eps);
+        if (lambda > 0.0)
+          theta[i] -= lambda * (theta[i] - w0[i]);
       }
 
       // Validation error on the linear model (cheap) — the early-stopping signal.

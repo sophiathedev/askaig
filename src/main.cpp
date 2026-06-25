@@ -24,11 +24,11 @@ int main(int argc, char *argv[]) {
 
   // `askaig tune <book> [threads] [lambda]`: gradient-tune the eval constants against a labeled
   // position book (tools/extract.py output) and exit. No TT needed — only the static eval runs.
-  // lambda is an optional L2 pull toward the defaults (0 = off; the joint gradient + early stopping
-  // usually make it unnecessary). Adam knobs via env: EPOCHS, RELIN, PATIENCE, LR.
+  // lambda is the AdamW weight-decay toward the defaults (regularizes the collinear imbalance /
+  // king-safety blocks; default 1e-3, 0 = off). Adam knobs via env: EPOCHS, RELIN, PATIENCE, LR.
   if (argc > 2 && std::string_view(argv[1]) == "tune") {
     const int hw = static_cast<int>(std::thread::hardware_concurrency());
-    tune::run(argv[2], argc > 3 ? std::atoi(argv[3]) : (hw > 2 ? hw - 1 : 1), argc > 4 ? std::atof(argv[4]) : 0.0);
+    tune::run(argv[2], argc > 3 ? std::atoi(argv[3]) : (hw > 2 ? hw - 1 : 1), argc > 4 ? std::atof(argv[4]) : 1e-3);
     return 0;
   }
 

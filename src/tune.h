@@ -16,9 +16,11 @@ namespace tune {
   //      (the joint gradient avoids the collinearity artifacts of the old coordinate descent), with a
   //      90/10 train/validation split for early stopping and periodic re-linearization of the bilinear
   //      king-attack weights.
-  // `lambda` is an optional L2 pull toward the compiled-in defaults (0 = off). Adam hyper-parameters are
-  // env knobs: EPOCHS (5000), RELIN (50), PATIENCE (60), LR (1.0). Prints progress and a paste-ready
-  // dump of the tuned values (also written to <book>.tuned).
-  void run(const std::string &book_path, int threads, double lambda = 0.0);
+  // `lambda` is the AdamW weight-decay toward the compiled-in defaults (per-epoch decay fraction; 0 =
+  // off). It regularizes the collinear blocks (the imbalance quadratic and king-safety terms), which an
+  // unregularized fit drives into large mutually-cancelling values that lower MSE but lose Elo. Adam
+  // hyper-parameters are env knobs: EPOCHS (5000), RELIN (50), PATIENCE (60), LR (1.0). Prints progress
+  // and a paste-ready dump of the tuned values (also written to <book>.tuned).
+  void run(const std::string &book_path, int threads, double lambda = 1e-3);
 
 } // namespace tune
