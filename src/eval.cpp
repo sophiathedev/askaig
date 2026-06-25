@@ -70,7 +70,7 @@ namespace eval {
     int BISHOP_PAIR_EG = 78; // tunable
     int ROOK_OPEN      = 16; // file with no pawns at all; tunable
     int ROOK_SEMIOPEN  = 12; // file with no friendly pawns; tunable
-    int ROOK_7TH_MG    = -42; // tunable
+    int ROOK_7TH_MG    = 28; // tunable (was -42: Texel small-sample artifact — a rook on the 7th is an MG asset)
     int ROOK_7TH_EG    = 25; // tunable
 
     // Imbalance (Stockfish-style): a quadratic form over the two sides' piece counts — the marginal
