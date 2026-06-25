@@ -38,9 +38,24 @@ namespace eval {
     // King safety: penalty per missing pawn-shield file and per open/semi-open file by the king,
     // scaled by the opponent's attacking material (KS_MAX_POWER = full middlegame) so it fades out
     // in the endgame, where the king should instead be active.
-    int           SHIELD_DEFICIT    = 9; // tunable (Texel ~zeroed — safe-check now carries king safety)
-    int           OPEN_FILE_PENALTY = 22; // tunable
+    int           OPEN_FILE_PENALTY = 22; // danger per (semi-)open file beside the king (no shield pawn); tunable
     constexpr int KS_MAX_POWER      = 12;
+    // King pawn shelter & storm (a GRADED refinement of the old binary shield-deficit count). For each
+    // of the three files around the king, SHELTER_DIST grades the danger by how far ahead the nearest
+    // FRIENDLY shield pawn sits, and STORM_DIST adds danger for the nearest ENEMY pawn storming down
+    // that file (closer = worse), halved when a friendly pawn blocks its path. Indexed by rank-distance
+    // ahead of the king (0..7); a missing shield pawn costs OPEN_FILE_PENALTY. Danger units, later
+    // scaled by the enemy's attacking material in king_safety().
+    //
+    // PENALTY-ONLY, anchored at d=1 (a pawn right in front of a castled king) = 0 — i.e. a fully
+    // castled king scores exactly the old baseline (0 danger), never a bonus. This is deliberate: the
+    // engine's safe-check + king-zone terms already carry most king safety (the old shield-deficit was
+    // Texel-zeroed for that reason), so an over-large or baseline-shifting shelter term double-counts
+    // and tested slightly negative. These conservative starts make the term a small complement; SPRT/
+    // Texel decide whether the graded shelter + storm earns its keep on top of safe-checks.
+    int           SHELTER_DIST[8] = {3, 0, 4, 9, 13, 15, 15, 15}; // by friendly shield-pawn distance; tunable [0..5]
+    int           STORM_DIST[8]   = {0, 16, 10, 5, 2, 0, 0, 0}; // by enemy storm-pawn distance; tunable [1..5]
+    constexpr int STORM_BLOCKED   = 2; // storm-danger divisor when a friendly pawn blocks the file
 
     // Mobility: bonus per safe square a piece can move to (not onto own pieces or enemy-pawn-
     // controlled squares), indexed by PieceType and tapered — sliders are worth more per square in
@@ -374,21 +389,48 @@ namespace eval {
              2 * pop_count(pos.bitboard_of(c, ROOK)) + 4 * pop_count(pos.bitboard_of(c, QUEEN));
     }
 
-    // Unscaled danger for `c`'s king: missing pawn-shield files and open/semi-open files beside it.
-    [[gnu::pure]] int king_danger(Square ks, Bitboard pawns, Color c) noexcept {
-      const int kf      = file_of(ks);
-      const int shield  = pop_count(pawns & PM.king_shield[c][ks]);
-      int       penalty = SHIELD_DEFICIT * (shield < 3 ? 3 - shield : 0);
-      const int lo      = kf > 0 ? kf - 1 : 0;
-      const int hi      = kf < 7 ? kf + 1 : 7;
-      for (int f = lo; f <= hi; ++f)
-        if (!(pawns & file_bb(f)))
-          penalty += OPEN_FILE_PENALTY;
-      return penalty;
+    // Unscaled danger for `c`'s king: graded pawn shelter + enemy pawn storm over the three files
+    // around the king (clamped to a full B..G window, as Stockfish does). Higher = more exposed.
+    [[gnu::pure]] int king_danger(Square ks, Bitboard ourPawns, Bitboard theirPawns, Color c) noexcept {
+      int kf = file_of(ks);
+      if (kf < 1)
+        kf = 1;
+      if (kf > 6)
+        kf = 6;
+      const int kr = c == WHITE ? rank_of(ks) : 7 - rank_of(ks); // king's relative rank
+
+      // Distance ahead of the king (in its relative frame) of the nearest pawn of `pawns` on a file;
+      // -1 if none sit at/ahead of the king. King safety runs once per eval, so the tiny per-file
+      // scan is cheaper than maintaining a reverse bit-scan for the "nearest toward the enemy" pawn.
+      const auto nearestDist = [&](Bitboard pawns) noexcept {
+        int best = -1;
+        for (Bitboard b = pawns; b;) {
+          const Square s  = pop_lsb(&b);
+          const int    rr = (c == WHITE ? rank_of(s) : 7 - rank_of(s)) - kr;
+          if (rr >= 0 && (best < 0 || rr < best))
+            best = rr;
+        }
+        return best;
+      };
+
+      int danger = 0;
+      for (int f = kf - 1; f <= kf + 1; ++f) {
+        const Bitboard fbb = file_bb(f);
+        const int      sd  = nearestDist(ourPawns & fbb); // nearest friendly shield pawn
+        const int      td  = nearestDist(theirPawns & fbb); // nearest enemy storm pawn
+        danger += sd < 0 ? OPEN_FILE_PENALTY : SHELTER_DIST[sd];
+        if (td >= 0) {
+          int st = STORM_DIST[td];
+          if (sd >= 0 && sd < td) // a friendly pawn stands between the king and the storm pawn
+            st /= STORM_BLOCKED;
+          danger += st;
+        }
+      }
+      return danger;
     }
 
-    // King safety from White's perspective: each king's danger scaled by the opponent's attacking
-    // material (so it vanishes once the heavy pieces are traded off).
+    // King safety from White's perspective: each king's shelter/storm danger scaled by the opponent's
+    // attacking material (so it vanishes once the heavy pieces are traded off and the king turns active).
     [[gnu::pure, gnu::hot]] int king_safety(const Position &pos) noexcept {
       const Square   wk    = bsf(pos.bitboard_of(WHITE, KING));
       const Square   bk    = bsf(pos.bitboard_of(BLACK, KING));
@@ -400,8 +442,8 @@ namespace eval {
       const int      bScal = wPow < KS_MAX_POWER ? wPow : KS_MAX_POWER;
 
       int s = 0;
-      s -= king_danger(wk, wp, WHITE) * wScal / KS_MAX_POWER;
-      s += king_danger(bk, bp, BLACK) * bScal / KS_MAX_POWER;
+      s -= king_danger(wk, wp, bp, WHITE) * wScal / KS_MAX_POWER;
+      s += king_danger(bk, bp, wp, BLACK) * bScal / KS_MAX_POWER;
       return s;
     }
 
@@ -908,8 +950,11 @@ namespace eval {
       for (int r = 1; r <= 6; ++r)
         add("CONNECTED_" + std::to_string(r), CONNECTED[r]);
       add("BACKWARD_PENALTY", BACKWARD_PENALTY);
-      add("SHIELD_DEFICIT", SHIELD_DEFICIT);
       add("OPEN_FILE_PENALTY", OPEN_FILE_PENALTY);
+      for (int d = 0; d <= 5; ++d)
+        add("SHELTER_DIST_" + std::to_string(d), SHELTER_DIST[d]);
+      for (int d = 1; d <= 5; ++d)
+        add("STORM_DIST_" + std::to_string(d), STORM_DIST[d]);
       static const char *PT = "PNBRQK";
       for (int pt = KNIGHT; pt <= QUEEN; ++pt) {
         add(std::string("MOB_MG_") + PT[pt], MOB_MG[pt]);
