@@ -64,3 +64,27 @@ endif()
 target_compile_options(askaig PRIVATE -flto)
 target_link_options(askaig PRIVATE -flto)
 
+# Profile-guided optimization (two-stage; drive it with the pgo-generate / pgo-use presets, or
+# tools/build_pgo.sh which orchestrates the train+merge between them):
+#   -DPGO=generate                              -> instrumented build (writes .profraw when run)
+#   -DPGO=use  [-DPGO_PROFILE=<merged.profdata>] -> rebuild optimised with that profile
+# Empty (default) = a normal build. PGO is behaviour-neutral — it only improves code layout / speed,
+# never what the engine searches. Clang-only here (Apple/LLVM clang; merged with llvm-profdata).
+set(PGO "" CACHE STRING "Profile-guided optimization: 'generate', 'use', or empty (off)")
+set(PGO_PROFILE "${CMAKE_BINARY_DIR}/pgo.profdata" CACHE FILEPATH "merged profile data for -DPGO=use")
+if(NOT PGO STREQUAL "")
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "PGO here is wired for Clang (-fprofile-instr-*); compiler is ${CMAKE_CXX_COMPILER_ID}")
+    endif()
+    if(PGO STREQUAL "generate")
+        target_compile_options(askaig PRIVATE -fprofile-instr-generate)
+        target_link_options(askaig PRIVATE -fprofile-instr-generate)
+    elseif(PGO STREQUAL "use")
+        target_compile_options(askaig PRIVATE -fprofile-instr-use=${PGO_PROFILE})
+        target_link_options(askaig PRIVATE -fprofile-instr-use=${PGO_PROFILE})
+    else()
+        message(FATAL_ERROR "PGO must be 'generate', 'use', or empty (got '${PGO}')")
+    endif()
+    message(STATUS "PGO: ${PGO}")
+endif()
+

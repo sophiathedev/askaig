@@ -24,6 +24,27 @@
         "CMAKE_BUILD_TYPE": "Release",
         "SIMD": "ON"
       }
+    },
+    {
+      "name": "pgo-generate",
+      "displayName": "PGO stage 1 (instrument)",
+      "description": "release-simd + instrumentation; run it to emit .profraw, then merge",
+      "inherits": "release-simd",
+      "binaryDir": "${sourceDir}/build-pgo",
+      "cacheVariables": {
+        "PGO": "generate"
+      }
+    },
+    {
+      "name": "pgo-use",
+      "displayName": "PGO stage 2 (optimize)",
+      "description": "release-simd rebuilt with build-pgo/pgo.profdata (behaviour-neutral speed win)",
+      "inherits": "release-simd",
+      "binaryDir": "${sourceDir}/build-pgo",
+      "cacheVariables": {
+        "PGO": "use",
+        "PGO_PROFILE": "${sourceDir}/build-pgo/pgo.profdata"
+      }
     }
   ],
   "buildPresets": [
@@ -34,6 +55,14 @@
     {
       "name": "release-simd",
       "configurePreset": "release-simd"
+    },
+    {
+      "name": "pgo-generate",
+      "configurePreset": "pgo-generate"
+    },
+    {
+      "name": "pgo-use",
+      "configurePreset": "pgo-use"
     }
   ]
 }
