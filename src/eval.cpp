@@ -247,6 +247,11 @@ namespace eval {
     constexpr size_t       PAWN_CACHE_SIZE = 8192; // entries (power of two), ~0.5 MiB per thread
     thread_local PawnEntry t_pawn_cache[PAWN_CACHE_SIZE];
 
+    // Set by the gradient tuner only (see eval::set_tuning): force the pawn cache to always recompute,
+    // so perturbing a pawn weight and re-evaluating the same position is not answered from a stale
+    // entry. Default false → the cache behaves exactly as before in normal play (bench unchanged).
+    bool g_tuning = false;
+
     [[gnu::const, gnu::always_inline]] inline size_t pawn_cache_index(Bitboard wp, Bitboard bp) noexcept {
       return ((wp ^ (bp * UINT64_C(0x9E3779B97F4A7C15))) * UINT64_C(0xC2B2AE3D27D4EB4F)) >> 51; // top 13 bits
     }
@@ -258,7 +263,7 @@ namespace eval {
       const Bitboard bp = pos.bitboard_of(BLACK, PAWN);
 
       PawnEntry &e = t_pawn_cache[pawn_cache_index(wp, bp)];
-      if (e.wp != wp || e.bp != bp) [[unlikely]] { // miss: recompute the pawn-only parts into this slot
+      if (g_tuning || e.wp != wp || e.bp != bp) [[unlikely]] { // miss: recompute the pawn-only parts into this slot
         e.wp      = wp;
         e.bp      = bp;
         e.wpassed = e.bpassed = 0;
@@ -1027,5 +1032,7 @@ namespace eval {
       }
     return false;
   }
+
+  void set_tuning(bool on) noexcept { g_tuning = on; }
 
 } // namespace eval

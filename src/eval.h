@@ -25,6 +25,12 @@ namespace eval {
   // shelter/storm) through `setoption` in debug mode. A normal game never calls this.
   bool set_param(const std::string &name, int value) noexcept;
 
+  // Tuning mode: bypass the thread-local pawn-structure cache so the eval re-reads the (mutated)
+  // weights every call. ONLY the gradient tuner sets this (it perturbs weights and re-evaluates the
+  // same position, which would otherwise hit a stale cache entry). Default off → normal play and the
+  // bench node signature are byte-for-byte unchanged.
+  void set_tuning(bool on) noexcept;
+
   // Static evaluation (material + PST + pawn structure + king safety + mobility + pins) from the
   // side-to-move's perspective (negamax convention: positive means the side to move is better).
   [[nodiscard]] int evaluate(const Position &pos) noexcept;
