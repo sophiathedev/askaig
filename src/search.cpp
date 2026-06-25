@@ -41,6 +41,7 @@ namespace search {
     int HISTORY_PRUNE_MARGIN    = 5356; // per-depth quiet-history floor below which a quiet is skipped
     int CUTNODE_R               = 0; // extra LMR reduction at expected-fail-high (cut) nodes; tunable, SPSA-explore
                        // (default 0: at +1 it grew the tree ~15% here, like IIR — let SPSA decide)
+    int NMP_EVAL_DIV            = 200; // null-move R gains +1 per this many cp of static eval above beta (cap +3); tunable
 
     // SEE pruning in the main search (quiescence has its own): at shallow depths, skip moves that
     // lose material to the exchange on their destination square. Captures get a per-depth^2
@@ -843,10 +844,20 @@ namespace search {
       bool mate_threat = false;
       if (null_ok && excluded == Move{} && depth >= 3 && !in_check && beta < MATE - MAX_MATE_PLY &&
           has_non_pawn_material(p, Us)) {
-        const int R = 2 + depth / 6;
+        // Null-move reduction: the depth-scaled base, plus a bonus when the static eval already sits
+        // comfortably above beta — the more the position looks won without moving, the safer it is to
+        // reduce the verification harder (capped at +3). static_eval is valid here (this branch is
+        // !in_check, where it was computed above).
+        int R = 2 + depth / 6;
+        if (static_eval >= beta)
+          R += std::min((static_eval - beta) / NMP_EVAL_DIV, 3);
+        // Clamp the reduced null-search depth to >= 0: the eval bonus can push R past depth-1 (e.g. at
+        // depth 3, base 2 + bonus 3 = 5), and a negative depth would skip the `depth == 0` quiescence
+        // dispatch in the child and recurse to the ply cap (a node blow-up — see the LMR clamp note).
+        const int null_depth = depth - 1 - R > 0 ? depth - 1 - R : 0;
         p.play_null();
         t_move_stack[ply] = -1; // a pass carries no (piece, to) to condition continuation history on
-        int score         = -negamax<~Us>(p, depth - 1 - R, ply + 1, -beta, -beta + 1, nodes, false, !cutNode, Move{});
+        int score         = -negamax<~Us>(p, null_depth, ply + 1, -beta, -beta + 1, nodes, false, !cutNode, Move{});
         p.undo_null();
         if (score >= beta) // fail-high: prune this node (fail-soft, except a reduced null-window
           return score >= MATE - MAX_MATE_PLY ? beta : score; // result is never trusted as a MATE bound)
@@ -1219,6 +1230,7 @@ namespace search {
             {"HISTORY_PRUNE_MARGIN", &HISTORY_PRUNE_MARGIN, 1024, 16384},
             {"HISTORY_PRUNE_MAX_DEPTH", &HISTORY_PRUNE_MAX_DEPTH, 2, 8},
             {"CUTNODE_R", &CUTNODE_R, 0, 3},
+            {"NMP_EVAL_DIV", &NMP_EVAL_DIV, 80, 400},
             {"SEE_QUIET_MARGIN", &SEE_QUIET_MARGIN, 20, 150},
             {"SEE_CAPT_MARGIN", &SEE_CAPT_MARGIN, 5, 60},
             {"SEE_PRUNE_MAX_DEPTH", &SEE_PRUNE_MAX_DEPTH, 5, 14},
