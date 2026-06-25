@@ -954,6 +954,14 @@ namespace search {
             if (!is_pv && v < sBeta - DOUBLE_EXT_MARGIN)
               ext = 2;
           }
+          // Multi-cut pruning: the TT move is NOT singular (v >= sBeta, so some OTHER move also reached
+          // the singular threshold) and that threshold already sits at/above beta. Two distinct moves
+          // therefore fail high here, so this expected cut-node is genuinely a cut-node — prune the
+          // whole subtree, returning the (fail-soft) bound. Reuses the singular verification search just
+          // done, at no extra cost (the capture-only ProbCut above is a separate, complementary prune).
+          // Non-PV only: a PV node is searched to full depth rather than cut on a reduced result.
+          else if (!is_pv && sBeta >= beta)
+            return sBeta;
         }
         if (!ext && type_of(p.at(m.from())) == PAWN &&
             ((Us == WHITE && rank_of(m.to()) == RANK7) || (Us == BLACK && rank_of(m.to()) == RANK2)) &&
