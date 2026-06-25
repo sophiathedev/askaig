@@ -111,7 +111,9 @@ namespace eval {
     Score THREAT_BY_MINOR[NPIECE_TYPES] = {{0, 0},   {29, 18},  {32, 26},
                                            {49, -2}, {44, -32}, {0, 0}}; // victim: P N B R Q K; tunable [N..Q]
     Score THREAT_BY_ROOK[NPIECE_TYPES]  = {{0, 0},      {15, 9}, {22, 12},
-                                           {-310, 479}, {63, 6}, {0, 0}}; // rooks chiefly threaten R/Q; tunable [N..Q]
+                                           {18, 20},    {63, 6}, {0, 0}}; // rooks chiefly threaten R/Q; tunable [N..Q]
+    // (THREAT_BY_ROOK vs a ROOK victim was {-310,479} — an 8-pawn phase swing on a standalone threat
+    //  term, a small-sample Texel artifact since rook-attacks-rook is rare; reset to a sane modest value.)
     Score HANGING                       = {15, 10}; // per undefended enemy piece we attack; tunable
     Score THREAT_BY_KING                = {0, 18}; // undefended enemy piece our king attacks (eg); tunable
     Score THREAT_BY_PUSH                = {12, 9}; // enemy piece a safe pawn push would attack; tunable
