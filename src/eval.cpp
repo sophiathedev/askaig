@@ -923,7 +923,13 @@ namespace eval {
   const std::vector<Param> &params() noexcept {
     static const std::vector<Param> P = [] {
       std::vector<Param> v;
-      const auto         add = [&v](std::string name, int &x) { v.push_back({std::move(name), &x}); };
+      // Bounds for the UCI spin exposure (tools/spsa.py): a symmetric window around the compiled
+      // default, half-width max(16, |default|). Wide enough for SPSA to explore, tight enough to stay
+      // sane. (The Texel tuner derives its own bounds and ignores these.)
+      const auto add = [&v](std::string name, int &x) {
+        const int s = (x < 0 ? -x : x) > 16 ? (x < 0 ? -x : x) : 16;
+        v.push_back({std::move(name), &x, x - s, x + s});
+      };
 
       add("DOUBLED_PENALTY", DOUBLED_PENALTY);
       add("ISOLATED_PENALTY", ISOLATED_PENALTY);
@@ -997,6 +1003,15 @@ namespace eval {
       return v;
     }();
     return P;
+  }
+
+  bool set_param(const std::string &name, int value) noexcept {
+    for (const auto &p: params())
+      if (name == p.name) {
+        *p.value = value < p.min ? p.min : (value > p.max ? p.max : value);
+        return true;
+      }
+    return false;
   }
 
 } // namespace eval

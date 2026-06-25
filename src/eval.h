@@ -16,8 +16,14 @@ namespace eval {
   struct Param {
     std::string name;
     int        *value;
+    int         min, max; // [min, max] range, exposed as the UCI spin bounds (for tools/spsa.py)
   };
   [[nodiscard]] const std::vector<Param> &params() noexcept;
+
+  // Set a registered eval parameter by name (clamped to its [min, max]); returns true if matched.
+  // Mirrors search::set_tunable — lets tools/spsa.py drive the eval constants (e.g. king-safety
+  // shelter/storm) through `setoption` in debug mode. A normal game never calls this.
+  bool set_param(const std::string &name, int value) noexcept;
 
   // Static evaluation (material + PST + pawn structure + king safety + mobility + pins) from the
   // side-to-move's perspective (negamax convention: positive means the side to move is better).

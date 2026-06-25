@@ -596,10 +596,17 @@ void uci::loop() {
       // SPSA-tunable search constants (pruning margins, depth gates) — advertised ONLY in debug mode
       // (`debug on`, or the `--debug` CLI flag a tuning harness passes), so a normal production GUI
       // never sees this clutter and can't set it. See the `debug` and `setoption` handlers.
-      if (g_debug)
+      if (g_debug) {
         for (const search::Tunable &t: search::tunables())
           std::cout << "option name " << t.name << " type spin default " << *t.ptr << " min " << t.min << " max "
                     << t.max << "\n";
+        // Eval constants too (king-safety shelter/storm, threats, …) so SPSA can tune them; bounds are
+        // a symmetric window around each compiled default (see eval::params). Filter to a subset in
+        // tools/spsa.py (PARAMS=…) — there are too many to tune all at once.
+        for (const eval::Param &p: eval::params())
+          std::cout << "option name " << p.name << " type spin default " << *p.value << " min " << p.min << " max "
+                    << p.max << "\n";
+      }
       std::cout << "uciok\n";
     } else if (cmd == "isready") {
       // Must answer even mid-search, so this never touches engine state.
@@ -643,11 +650,12 @@ void uci::loop() {
         is >> v; // the "value" token was already consumed; v is "true"/"false"
         g_show_wdl = (v == "true");
       } else if (g_debug) {
-        // A search tunable (SPSA): setoption name <X> value <n>, accepted ONLY in debug mode so it
-        // can't be poked in production. set_tunable clamps to [min,max] and ignores unknown names.
+        // A search tunable OR eval param (SPSA): setoption name <X> value <n>, accepted ONLY in debug
+        // mode so it can't be poked in production. Both clamp to [min,max] and ignore unknown names;
+        // try search first, then the eval constants (no name collisions between the two registries).
         int v = 0;
-        if (is >> v)
-          search::set_tunable(name, v);
+        if (is >> v && !search::set_tunable(name, v))
+          eval::set_param(name, v);
       }
       // (debug off + unknown option: silently ignored, per the UCI spec)
     } else if (cmd == "debug") {
