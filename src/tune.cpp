@@ -138,9 +138,13 @@ namespace tune {
         }
         pk.stm = (i + 1 < line.size() && line[i + 1] == 'b') ? BLACK : WHITE;
         {
+          // The label: a game result (1/0.5/0) OR a SOFT label in [0,1] — e.g. a win-probability
+          // distilled from a stronger engine's eval (tools/sf_label.py). The logistic MSE handles a
+          // continuous target unchanged, and a low-noise soft label tunes far more stably than binary
+          // WDL (the king-safety / imbalance terms especially).
           const size_t sp = line.find_last_of(' ');
           const double r  = std::strtod(line.c_str() + sp + 1, nullptr);
-          if (r != 0.0 && r != 0.5 && r != 1.0) {
+          if (!(r >= 0.0 && r <= 1.0)) {
             ++bad;
             continue;
           }
