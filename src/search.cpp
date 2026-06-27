@@ -1111,6 +1111,7 @@ namespace search {
         p.play<Us>(m);
         tt::prefetch(p.get_hash()); // start the child's TT cache-line fetch before it probes
         ++r.nodes;
+        const uint64_t nodes_before = r.nodes; // attribute this move's subtree to the effort count
 
         int score;
         if (i == 0) {
@@ -1124,8 +1125,9 @@ namespace search {
         p.undo<Us>(m);
 
         if (score > r.score) {
-          r.score = score;
-          r.best  = m;
+          r.score      = score;
+          r.best       = m;
+          r.best_nodes = r.nodes - nodes_before; // nodes this (new best) move's subtree consumed
           if (score > alpha) {
             alpha = score;
             update_pv(0, m); // a new best root move -> record the PV
@@ -1376,6 +1378,11 @@ namespace search {
         double scale = 1.2 - 0.07 * stable; // 1.2 (just changed) down to ~0.5 (stable for ~10 iters)
         if (have_prev_sc && best.score + 30 < prev_iter_sc)
           scale += 0.3; // the position got worse — look harder for something better
+        // Node-effort: a best move that consumed a large share of this iteration's nodes is clearly
+        // best -> bank time; a small share (the choice was contested or needed aspiration re-searches)
+        // -> spend more. Centred near the typical effort (~0.30) so the average move is left unchanged.
+        const double effort = r.nodes ? static_cast<double>(r.best_nodes) / static_cast<double>(r.nodes) : 0.30;
+        scale *= std::clamp(1.0 + 0.6 * (0.30 - effort), 0.85, 1.20);
         // Tighter ceiling than before (was 1.4 base / 1.8 cap): the opening is full of unstable
         // best moves, and spending ~1.8x on each of those front-loaded the clock and left the engine
         // on increment by the middlegame. A 1.5 cap banks that time for later instead.

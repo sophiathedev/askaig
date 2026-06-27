@@ -23,6 +23,7 @@ namespace search {
     Move              best; // the chosen move (a null Move{} if there are no legal moves)
     int               score; // score in centipawns from the side-to-move's perspective (or a mate score)
     uint64_t          nodes; // nodes searched
+    uint64_t          best_nodes = 0; // of `nodes`, those spent in the best root move's subtree (effort)
     int               seldepth = 0; // selective depth: the deepest ply reached this iteration (incl. quiescence)
     std::vector<Move> pv; // principal variation (best line), starting with `best`
   };
