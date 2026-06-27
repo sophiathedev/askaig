@@ -898,6 +898,13 @@ namespace search {
         }
       }
 
+      // Internal iterative reductions: with no TT move the move ordering has no best-move hint and is
+      // unreliable, so a full-depth search is wasteful — reduce by one ply. The shallower search fills
+      // the TT move, so the (re-)visit is better ordered. PV and expected-cut nodes of sufficient depth
+      // only; never in check or during singular verification (which already has its excluded TT move).
+      if (depth >= 4 && ttMove == Move{} && excluded == Move{} && !in_check && (is_pv || cutNode))
+        --depth;
+
       Move moves[MAX_MOVES];
       int  scores[MAX_MOVES];
       score_moves(p, list.begin(), moves, scores, n, ttMove, ply);
