@@ -14,26 +14,26 @@ namespace eval {
 
     // Penalties (centipawns) and a passed-pawn bonus indexed by the pawn's own rank of advancement
     // (rank 1 = just left home ... rank 6 = one step from promotion).
-    int DOUBLED_PENALTY  = 18; // tunable (see eval::params)
-    int ISOLATED_PENALTY = 8; // tunable
+    int DOUBLED_PENALTY  = 19; // tunable (see eval::params)
+    int ISOLATED_PENALTY = 12; // tunable
     // Passed-pawn bonus, indexed by rank of advancement, tapered: passers are worth far more in the
     // endgame (often decisive) than the middlegame (where pieces blockade/round them up).
-    int PASSED_MG[8] = {0, 5, -19, 1, 28, 41, 91, 0}; // tunable [1..6]
-    int PASSED_EG[8] = {0, 6, 23, 23, 28, 1, -39, 0}; // tunable [1..6]
+    int PASSED_MG[8] = {0, -15, -35, -6, 17, 77, 195, 0}; // tunable [1..6]
+    int PASSED_EG[8] = {0, 32, 26, 28, 45, 18, -72, 0}; // tunable [1..6]
     // Passed-pawn refinements: a blockaded passer (any piece on its stop square) keeps only 2/3 of
     // the bonus, and in the endgame the kings join the race — per square of Chebyshev distance from
     // the stop square, the ENEMY king being far is worth +5 eg and our own king being far costs -2
     // eg, weighted by how advanced the passer is (irrelevant for a pawn still at home, decisive on
     // the 7th). Starting values for SPRT tuning.
-    int PASSED_KDIST_W[8] = {0, 0, 0, 2, 4, 8, 7, 0}; // by rank of advancement; tunable [3..6]
-    int CENTERED_BONUS    = -6; // pawn on a central square (d4/e4/d5/e5); tunable
-    int OUTPOST_BONUS     = 13; // knight on a hole, defended by a pawn, in advanced ranks; tunable
+    int PASSED_KDIST_W[8] = {0, 0, 0, 3, 5, 7, 14, 0}; // by rank of advancement; tunable [3..6]
+    int CENTERED_BONUS    = -10; // pawn on a central square (d4/e4/d5/e5); tunable
+    int OUTPOST_BONUS     = 19; // knight on a hole, defended by a pawn, in advanced ranks; tunable
     // Connected pawns (part of a phalanx OR defended by a friendly pawn), bonus by rank of
     // advancement — a connected chain is harder to break and far stronger as it nears promotion.
-    int CONNECTED[8] = {0, 0, 3, 9, 17, 51, 118, 0}; // by relative rank; Texel-tuned, tunable [1..6]
+    int CONNECTED[8] = {0, -1, 3, 8, 16, 50, 48, 0}; // by relative rank; Texel-tuned, tunable [1..6]
     // Backward pawn: no friendly pawn level-or-behind on an adjacent file to support it, and its
     // advance square is controlled by an enemy pawn — a lasting weakness on a (semi-)open file.
-    int BACKWARD_PENALTY = 15; // Texel-tuned; tunable
+    int BACKWARD_PENALTY = 16; // Texel-tuned; tunable
 
     // King safety: penalty per missing pawn-shield file and per open/semi-open file by the king,
     // scaled by the opponent's attacking material (KS_MAX_POWER = full middlegame) so it fades out
@@ -60,18 +60,18 @@ namespace eval {
     // Mobility: bonus per safe square a piece can move to (not onto own pieces or enemy-pawn-
     // controlled squares), indexed by PieceType and tapered — sliders are worth more per square in
     // the (open) endgame. Pinned: penalty per piece pinned to its own king.
-    int MOB_MG[NPIECE_TYPES] = {0, 6, 8, 4, 3, 0}; // P N B R Q K; tunable [N..Q]
-    int MOB_EG[NPIECE_TYPES] = {0, 4, 4, 4, 4, 0}; // tunable [N..Q]
-    int PIN_PENALTY          = 21; // tunable
+    int MOB_MG[NPIECE_TYPES] = {0, 7, 6, 4, 4, 0}; // P N B R Q K; tunable [N..Q]
+    int MOB_EG[NPIECE_TYPES] = {0, 4, 3, 4, -1, 0}; // tunable [N..Q]
+    int PIN_PENALTY          = 18; // tunable
 
     // Piece bonuses: the bishop pair (worth more in the open endgame), a rook on a fully open or
     // semi-open (no friendly pawn) file, and a rook on the relative 7th rank (decisive in endgames).
-    int BISHOP_PAIR_MG = 18; // tunable
-    int BISHOP_PAIR_EG = 78; // tunable
-    int ROOK_OPEN      = 16; // file with no pawns at all; tunable
-    int ROOK_SEMIOPEN  = 12; // file with no friendly pawns; tunable
+    int BISHOP_PAIR_MG = -8; // tunable
+    int BISHOP_PAIR_EG = 1; // tunable
+    int ROOK_OPEN      = 14; // file with no pawns at all; tunable
+    int ROOK_SEMIOPEN  = 18; // file with no friendly pawns; tunable
     int ROOK_7TH_MG    = 28; // tunable (was -42: Texel small-sample artifact — a rook on the 7th is an MG asset)
-    int ROOK_7TH_EG    = 25; // tunable
+    int ROOK_7TH_EG    = 13; // tunable
 
     // Imbalance (Stockfish-style): a quadratic form over the two sides' piece counts — the marginal
     // value of a piece depends on the rest of the material (knights like having pawns, a second rook is
@@ -81,20 +81,8 @@ namespace eval {
     // count of p2 in p1's bonus, IMB_THEIRS[p1][p2] the enemy's. Starting values are SF's (divided by
     // IMB_SCALE at the end); Texel-tuned for this engine. SF's bishop-pair pseudo-piece is dropped — the
     // existing tapered BISHOP_PAIR term already carries it.
-    int IMB_OURS[5][5] = {
-            {55, 0, 0, 0, 0}, // P:  P
-            {109, 0, 0, 0, 0}, // N:  P  N
-            {38, 5, 0, 0, 0}, // B:  P  N  B
-            {14, 79, 178, 141, 0}, // R:  P  N  B  R
-            {68, 61, 149, 43, -5}, // Q:  P  N  B  R  Q
-    };
-    int IMB_THEIRS[5][5] = {
-            {0, 0, 0, 0, 0}, // P
-            {87, 0, 0, 0, 0}, // N:  P
-            {79, 25, 0, 0, 0}, // B:  P  N
-            {149, 32, -26, 0, 0}, // R:  P  N  B
-            {305, -12, 247, 207, 0}, // Q:  P  N  B  R
-    };
+    int IMB_OURS[5][5] = {{34, 0, 0, 0, 0}, {178, -144, 0, 0, 0}, {116, -305, 50, 0, 0}, {208, 63, -293, -145, 0}, {237, -413, -362, -586, -327}};
+    int IMB_THEIRS[5][5] = {{0, 0, 0, 0, 0}, {205, 0, 0, 0, 0}, {150, 356, 0, 0, 0}, {183, 145, -223, 0, 0}, {484, 387, 651, 73, 0}};
     constexpr int IMB_SCALE = 16; // final divisor (SF convention)
 
     // A middlegame/endgame score pair and its interpolation by game phase (PHASE_MAX = middlegame).
@@ -107,31 +95,29 @@ namespace eval {
     // piece we attack that the enemy does not defend). Tapered. Values are deliberately modest and
     // SHOULD be tuned by SPRT self-play (tools/sprt.sh) — these are reasonable starting points, not
     // proven optima. Indexed by the *threatened* (victim) piece type; bigger victims = bigger threat.
-    Score THREAT_BY_PAWN                = {42, 45}; // a pawn attacks any enemy minor/rook/queen; tunable
-    Score THREAT_BY_MINOR[NPIECE_TYPES] = {{0, 0},   {29, 18},  {32, 26},
-                                           {49, -2}, {44, -32}, {0, 0}}; // victim: P N B R Q K; tunable [N..Q]
-    Score THREAT_BY_ROOK[NPIECE_TYPES]  = {{0, 0},      {15, 9}, {22, 12},
-                                           {18, 20},    {63, 6}, {0, 0}}; // rooks chiefly threaten R/Q; tunable [N..Q]
+    Score THREAT_BY_PAWN                = {61, 41}; // a pawn attacks any enemy minor/rook/queen; tunable
+    Score THREAT_BY_MINOR[NPIECE_TYPES] = {{0, 0}, {41, 40}, {47, 5}, {61, 33}, {69, 10}, {0, 0}}; // victim: P N B R Q K; tunable [N..Q]
+    Score THREAT_BY_ROOK[NPIECE_TYPES]  = {{0, 0}, {-2, 33}, {39, 1}, {-170, -191}, {57, 120}, {0, 0}}; // rooks chiefly threaten R/Q; tunable [N..Q]
     // (THREAT_BY_ROOK vs a ROOK victim was {-310,479} — an 8-pawn phase swing on a standalone threat
     //  term, a small-sample Texel artifact since rook-attacks-rook is rare; reset to a sane modest value.)
-    Score HANGING                       = {15, 10}; // per undefended enemy piece we attack; tunable
-    Score THREAT_BY_KING                = {0, 18}; // undefended enemy piece our king attacks (eg); tunable
-    Score THREAT_BY_PUSH                = {12, 9}; // enemy piece a safe pawn push would attack; tunable
+    Score HANGING                       = {10, 2}; // per undefended enemy piece we attack; tunable
+    Score THREAT_BY_KING                = {173, -32}; // undefended enemy piece our king attacks (eg); tunable
+    Score THREAT_BY_PUSH                = {10, 17}; // enemy piece a safe pawn push would attack; tunable
     // Rook behind a passed pawn (Tarrasch): a friendly rook on the passer's file behind it supports the
     // push (+); an enemy rook behind it restrains the passer (−). Mostly an endgame term. Used in
     // pawn_structure (piece-dependent, so outside the pawn cache).
-    Score ROOK_BEHIND_PASSER = {1, 28}; // tunable
+    Score ROOK_BEHIND_PASSER = {-13, 38}; // tunable
 
     // Restricted squares: squares we attack that the enemy also attacks but does NOT defend with a
     // pawn — contesting them cramps the enemy's pieces. Small per-square bonus (Stockfish-style).
-    Score RESTRICTED = {4, -7}; // tunable (Texel ~neutralised — kept for re-tuning)
+    Score RESTRICTED = {3, -7}; // tunable (Texel ~neutralised — kept for re-tuning)
     // Space: safe squares in the centre files on our own half of the board (a middlegame term, scaled
     // by our piece count). Squares behind our pawns count double (sheltered territory).
-    int SPACE_WEIGHT = 2; // tunable (Texel near-zero on this dataset — space term ~inert)
+    int SPACE_WEIGHT = 1; // tunable (Texel near-zero on this dataset — space term ~inert)
     // Trapped pieces (penalty MAGNITUDES, subtracted from the side that owns the trapped piece):
     // a corner bishop hemmed by an enemy pawn (a7/h7), and a rook boxed in by its own king on the
     // back rank after castling on that side is already lost.
-    Score TRAPPED_BISHOP = {56, 68}; // tunable
+    Score TRAPPED_BISHOP = {154, -59}; // tunable
     Score TRAPPED_ROOK   = {40, 20}; // tunable
 
     // King-zone attacks: each knight/bishop/rook/queen attack into the ring around the enemy king
@@ -139,19 +125,19 @@ namespace eval {
     // NUMBER of distinct attacking pieces — one piece alone cannot mate, so danger grows steeply as
     // attackers join (0% for <2 attackers). Score = units * scale% * KING_ATT_UNIT cp, mostly a
     // middlegame term (quartered in the endgame). Starting values — to be SPRT-tuned like threats.
-    int           KING_ATT_WEIGHT[NPIECE_TYPES] = {0, 2, 2, 3, 11, 0}; // P N B R Q K (per zone square); tunable [N..Q]
+    int           KING_ATT_WEIGHT[NPIECE_TYPES] = {0, 0, 0, 1, 1, 0}; // P N B R Q K (per zone square); tunable [N..Q]
     constexpr int KING_ATT_SCALE[8]             = {0, 0, 50, 75, 88, 94, 97, 99}; // % by attacker count
-    int           KING_ATT_UNIT                 = 6; // cp per weighted unit (after the % scale); tunable
+    int           KING_ATT_UNIT                 = 39; // cp per weighted unit (after the % scale); tunable
 
     // Safe checks: a square from which we could check the enemy king that the enemy does NOT defend
     // (so we are not simply recaptured) and we do not already occupy. One of the strongest king-safety
     // signals — counted per checking piece type, in cp, tapered like the king-zone term and NOT gated
     // by attacker count (a lone queen check can be deadly). Starting values for SPRT/Texel tuning.
-    int SAFE_CHECK[NPIECE_TYPES] = {0, 30, 24, 35, 49, 0}; // P N B R Q K; tunable [N..Q]
+    int SAFE_CHECK[NPIECE_TYPES] = {0, 66, 36, 55, 64, 0}; // P N B R Q K; tunable [N..Q]
 
     // Tempo: a small bonus for simply being the side to move (the mover usually has the option to
     // improve their position). Also damps eval oscillation between plies. Starting values for SPRT.
-    Score TEMPO = {13, 4}; // tunable
+    Score TEMPO = {19, 2}; // tunable
 
     [[gnu::const, gnu::always_inline]] inline int taper(Score s, int phase) noexcept {
       return (s.mg * phase + s.eg * (psqt::PHASE_MAX - phase)) / psqt::PHASE_MAX;
