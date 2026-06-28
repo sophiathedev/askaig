@@ -9,3 +9,4 @@ cmake-build-*/
 /_archive_rewrite/
 /tools/
 build-tune/
+build-pgo/
