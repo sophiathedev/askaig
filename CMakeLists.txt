@@ -66,25 +66,40 @@ target_link_options(askaig PRIVATE -flto)
 
 # Profile-guided optimization (two-stage; drive it with the pgo-generate / pgo-use presets, or
 # tools/build_pgo.sh which orchestrates the train+merge between them):
-#   -DPGO=generate                              -> instrumented build (writes .profraw when run)
+#   -DPGO=generate                              -> instrumented build (writes a profile when run)
 #   -DPGO=use  [-DPGO_PROFILE=<merged.profdata>] -> rebuild optimised with that profile
 # Empty (default) = a normal build. PGO is behaviour-neutral — it only improves code layout / speed,
-# never what the engine searches. Clang-only here (Apple/LLVM clang; merged with llvm-profdata).
+# never what the engine searches. Both compilers are supported so the release can PGO every native
+# target it can run: Clang uses -fprofile-instr-* (.profraw -> llvm-profdata merge -> .profdata);
+# GCC uses -fprofile-generate/-use (.gcda written into the build tree, so STAGE 'use' must reuse the
+# same build dir the 'generate' run wrote into — PGO_PROFILE is ignored for GCC).
 set(PGO "" CACHE STRING "Profile-guided optimization: 'generate', 'use', or empty (off)")
-set(PGO_PROFILE "${CMAKE_BINARY_DIR}/pgo.profdata" CACHE FILEPATH "merged profile data for -DPGO=use")
+set(PGO_PROFILE "${CMAKE_BINARY_DIR}/pgo.profdata" CACHE FILEPATH "merged profile data for -DPGO=use (Clang only)")
 if(NOT PGO STREQUAL "")
-    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        message(FATAL_ERROR "PGO here is wired for Clang (-fprofile-instr-*); compiler is ${CMAKE_CXX_COMPILER_ID}")
-    endif()
-    if(PGO STREQUAL "generate")
-        target_compile_options(askaig PRIVATE -fprofile-instr-generate)
-        target_link_options(askaig PRIVATE -fprofile-instr-generate)
-    elseif(PGO STREQUAL "use")
-        target_compile_options(askaig PRIVATE -fprofile-instr-use=${PGO_PROFILE})
-        target_link_options(askaig PRIVATE -fprofile-instr-use=${PGO_PROFILE})
-    else()
+    if(NOT (PGO STREQUAL "generate" OR PGO STREQUAL "use"))
         message(FATAL_ERROR "PGO must be 'generate', 'use', or empty (got '${PGO}')")
     endif()
-    message(STATUS "PGO: ${PGO}")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        if(PGO STREQUAL "generate")
+            target_compile_options(askaig PRIVATE -fprofile-instr-generate)
+            target_link_options(askaig PRIVATE -fprofile-instr-generate)
+        else()
+            target_compile_options(askaig PRIVATE -fprofile-instr-use=${PGO_PROFILE})
+            target_link_options(askaig PRIVATE -fprofile-instr-use=${PGO_PROFILE})
+        endif()
+    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        if(PGO STREQUAL "generate")
+            target_compile_options(askaig PRIVATE -fprofile-generate)
+            target_link_options(askaig PRIVATE -fprofile-generate)
+        else()
+            # partial-training/missing-profile: don't pessimise or warn about code the training run
+            # never exercised (UCI parsing, tune); correction: tolerate the threaded counters.
+            target_compile_options(askaig PRIVATE -fprofile-use -fprofile-correction -fprofile-partial-training -Wno-missing-profile)
+            target_link_options(askaig PRIVATE -fprofile-use -fprofile-correction)
+        endif()
+    else()
+        message(FATAL_ERROR "PGO needs Clang or GCC (compiler is ${CMAKE_CXX_COMPILER_ID})")
+    endif()
+    message(STATUS "PGO: ${PGO} (${CMAKE_CXX_COMPILER_ID})")
 endif()
 

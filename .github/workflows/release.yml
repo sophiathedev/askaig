@@ -45,14 +45,16 @@ jobs:
           - name: linux-x86_64
             runner: ubuntu-24.04
             arch: AVX2
+            pgo: gcc          # native x86_64 host -> can run the instrumented binary to profile
           - name: macos-x86_64
             runner: macos-15
             arch: AVX2
-            osx_arch: x86_64
+            osx_arch: x86_64  # NO pgo: macos-15 is arm64, can't reliably run an x86_64 binary to profile
           - name: macos-arm64
             runner: macos-15
             arch: ARM_NEON
             osx_arch: arm64
+            pgo: clang        # native arm64 host -> can run the instrumented binary to profile
           - name: windows-x86_64
             runner: ubuntu-24.04
             arch: AVX2
@@ -87,8 +89,8 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja
 
-      - name: Configure & build (native — Linux / macOS)
-        if: ${{ matrix.mingw_triple == '' }}
+      - name: Configure & build (native, no PGO — Linux / macOS)
+        if: ${{ matrix.mingw_triple == '' && matrix.pgo == '' }}
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -96,6 +98,40 @@ jobs:
             -DASKAIG_VERSION=${{ needs.meta.outputs.date }} \
             ${{ runner.os == 'Linux' && '-DCMAKE_CXX_COMPILER=g++-14' || '' }} \
             ${{ matrix.osx_arch && format('-DCMAKE_OSX_ARCHITECTURES={0}', matrix.osx_arch) || '' }}
+          cmake --build build -j
+
+      # PGO (behaviour-neutral, ~3-8% nps): instrument -> run the same training workload as
+      # tools/build_pgo.sh (bench + bench 10 + perft 6) -> rebuild optimised. Only on targets whose
+      # build host can RUN the binary to collect a profile. The node count is unchanged by PGO, so no
+      # SPRT is needed; a broken profile build just fails this job (and blocks the release — it never
+      # ships an un-profiled-but-mislabelled binary).
+      - name: Configure & build (Linux GCC PGO)
+        if: ${{ matrix.pgo == 'gcc' }}
+        run: |
+          set -e
+          common="-S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSIMD=ON -DARCH=${{ matrix.arch }} -DASKAIG_VERSION=${{ needs.meta.outputs.date }} -DCMAKE_CXX_COMPILER=g++-14"
+          cmake $common -DPGO=generate
+          cmake --build build -j
+          # GCC writes .gcda into build/; the 'use' stage below must reuse this same dir.
+          ./build/askaig bench    >/dev/null 2>&1 || true
+          ./build/askaig bench 10 >/dev/null 2>&1 || true
+          printf 'position startpos\ngo perft 6\nquit\n' | ./build/askaig >/dev/null 2>&1 || true
+          cmake $common -DPGO=use
+          cmake --build build -j
+
+      - name: Configure & build (macOS Clang PGO)
+        if: ${{ matrix.pgo == 'clang' }}
+        run: |
+          set -e
+          common="-S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSIMD=ON -DARCH=${{ matrix.arch }} -DASKAIG_VERSION=${{ needs.meta.outputs.date }} -DCMAKE_OSX_ARCHITECTURES=${{ matrix.osx_arch }}"
+          cmake $common -DPGO=generate
+          cmake --build build -j
+          rm -f build/pgo-*.profraw
+          LLVM_PROFILE_FILE="build/pgo-%p.profraw" ./build/askaig bench    >/dev/null 2>&1 || true
+          LLVM_PROFILE_FILE="build/pgo-%p.profraw" ./build/askaig bench 10 >/dev/null 2>&1 || true
+          printf 'position startpos\ngo perft 6\nquit\n' | LLVM_PROFILE_FILE="build/pgo-%p.profraw" ./build/askaig >/dev/null 2>&1 || true
+          xcrun llvm-profdata merge -output=build/pgo.profdata build/pgo-*.profraw
+          cmake $common -DPGO=use -DPGO_PROFILE="$PWD/build/pgo.profdata"
           cmake --build build -j
 
       - name: Configure & build (Windows cross — LLVM-MinGW)
