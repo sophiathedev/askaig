@@ -1,4 +1,5 @@
 #include "eval.h"
+#include <unordered_map>
 #include "kpk.h"
 #include "position.h"
 #include "types.h"
@@ -238,12 +239,57 @@ namespace eval {
     // entry. Default false → the cache behaves exactly as before in normal play (bench unchanged).
     bool g_tuning = false;
 
+    // === Analytic gradient trace (TUNING ONLY — see eval::evaluate_trace) ====================
+    // When t_trace != nullptr (set by evaluate_trace), the templated eval accumulates, per
+    // REGISTERED param, the coefficient ∂(White-POV pre-scale score)/∂param at the current weights
+    // — the exact linear-model column the finite-difference tuner used to dig out in (2·NP+1) eval
+    // passes, now produced in ONE pass. Zero-cost in normal play: evaluate<false> compiles every
+    // `if constexpr (Trace)` branch out, so the bench signature is byte-for-byte unchanged.
+    thread_local double *t_trace = nullptr;
+
+    // Address of a registered param's live int -> its index in params(). Built once, lazily (params()
+    // is defined far below; the static initialises on first trace call, long after the registry exists).
+    inline int param_index(const int *p) noexcept {
+      static const std::unordered_map<const int *, int> M = [] {
+        std::unordered_map<const int *, int> m;
+        const auto                          &P = params();
+        for (int i = 0; i < static_cast<int>(P.size()); ++i)
+          m.emplace(P[i].value, i);
+        return m;
+      }();
+      const auto it = M.find(p);
+      return it == M.end() ? -1 : it->second;
+    }
+
+    // Emit one coefficient contribution for the param stored at `p` (no-op when not tracing, or when
+    // `p` is an unregistered/structural constant). `c` is ∂s/∂param for this position (White POV).
+    template<bool Trace>
+    [[gnu::always_inline]] inline void tr(const int *p, double c) noexcept {
+      if constexpr (Trace) {
+        const int i = param_index(p);
+        if (i >= 0)
+          t_trace[i] += c;
+      }
+    }
+
+    // A tapered contribution `count * taper({*mg, *eg}, phase)`: emits the mg coefficient count·phase/24
+    // and the eg coefficient count·(24−phase)/24. (For a value used un-tapered in BOTH mg and eg, pass
+    // the same pointer for mg and eg — the two halves then sum to `count`, matching taper of {v, v}.)
+    template<bool Trace>
+    [[gnu::always_inline]] inline void trScore(const int *mg, const int *eg, double count, int phase) noexcept {
+      if constexpr (Trace) {
+        tr<Trace>(mg, count * phase / 24.0);
+        tr<Trace>(eg, count * (24 - phase) / 24.0);
+      }
+    }
+
     [[gnu::const, gnu::always_inline]] inline size_t pawn_cache_index(Bitboard wp, Bitboard bp) noexcept {
       return ((wp ^ (bp * UINT64_C(0x9E3779B97F4A7C15))) * UINT64_C(0xC2B2AE3D27D4EB4F)) >> 51; // top 13 bits
     }
 
     // Evaluates pawn structure (doubled, isolated, passed) from White's perspective. The passed-pawn
     // bonus is tapered by `phase`; the other terms are phase-independent.
+    template<bool Trace>
     [[gnu::hot]] int pawn_structure(const Position &pos, int phase) noexcept {
       const Bitboard wp = pos.bitboard_of(WHITE, PAWN);
       const Bitboard bp = pos.bitboard_of(BLACK, PAWN);
@@ -260,17 +306,18 @@ namespace eval {
           int wc = pop_count(wp & file_bb(f));
           int bc = pop_count(bp & file_bb(f));
           if (wc > 1)
-            e.base -= DOUBLED_PENALTY * (wc - 1);
+            e.base -= DOUBLED_PENALTY * (wc - 1), tr<Trace>(&DOUBLED_PENALTY, -(wc - 1));
           if (bc > 1)
-            e.base += DOUBLED_PENALTY * (bc - 1);
+            e.base += DOUBLED_PENALTY * (bc - 1), tr<Trace>(&DOUBLED_PENALTY, (bc - 1));
           if (wc > 0 && !(wp & PM.adjacent[f]))
-            e.base -= ISOLATED_PENALTY * wc;
+            e.base -= ISOLATED_PENALTY * wc, tr<Trace>(&ISOLATED_PENALTY, -wc);
           if (bc > 0 && !(bp & PM.adjacent[f]))
-            e.base += ISOLATED_PENALTY * bc;
+            e.base += ISOLATED_PENALTY * bc, tr<Trace>(&ISOLATED_PENALTY, bc);
         }
 
         e.base += CENTERED_BONUS * pop_count(wp & CENTER);
         e.base -= CENTERED_BONUS * pop_count(bp & CENTER);
+        tr<Trace>(&CENTERED_BONUS, pop_count(wp & CENTER) - pop_count(bp & CENTER));
 
         // Connected (phalanx neighbour OR pawn-defended) and backward pawns. Both phase-independent.
         const Bitboard wAtt = pawn_attacks<WHITE>(wp);
@@ -278,22 +325,24 @@ namespace eval {
         for (Bitboard t = wp & (shift<EAST>(wp) | shift<WEST>(wp) | wAtt); t;) {
           const Square sq = pop_lsb(&t);
           e.base += CONNECTED[rank_of(sq)];
+          tr<Trace>(&CONNECTED[rank_of(sq)], 1);
         }
         for (Bitboard t = bp & (shift<EAST>(bp) | shift<WEST>(bp) | bAtt); t;) {
           const Square sq = pop_lsb(&t);
           e.base -= CONNECTED[7 - rank_of(sq)];
+          tr<Trace>(&CONNECTED[7 - rank_of(sq)], -1);
         }
         for (Bitboard t = wp; t;) {
           const Square sq = pop_lsb(&t);
           const int    f  = file_of(sq);
           if ((wp & PM.adjacent[f]) && !(wp & PM.back[WHITE][sq]) && (bAtt & SQUARE_BB[sq + NORTH]))
-            e.base -= BACKWARD_PENALTY;
+            e.base -= BACKWARD_PENALTY, tr<Trace>(&BACKWARD_PENALTY, -1);
         }
         for (Bitboard t = bp; t;) {
           const Square sq = pop_lsb(&t);
           const int    f  = file_of(sq);
           if ((bp & PM.adjacent[f]) && !(bp & PM.back[BLACK][sq]) && (wAtt & SQUARE_BB[sq + SOUTH]))
-            e.base += BACKWARD_PENALTY;
+            e.base += BACKWARD_PENALTY, tr<Trace>(&BACKWARD_PENALTY, 1);
         }
 
         for (Bitboard t = wp; t;) {
@@ -328,15 +377,29 @@ namespace eval {
         const int    r    = rank_of(sq);
         const Square stop = sq + NORTH;
         Score        ps{PASSED_MG[r], PASSED_EG[r]};
-        if (occ & SQUARE_BB[stop])
+        const bool   blocked = (occ & SQUARE_BB[stop]) != 0;
+        if (blocked)
           ps.mg = ps.mg * 2 / 3, ps.eg = ps.eg * 2 / 3; // blockaded: it cannot advance
-        ps.eg += (5 * cheb(bk, stop) - 2 * cheb(wk, stop)) * PASSED_KDIST_W[r];
+        const int kd = 5 * cheb(bk, stop) - 2 * cheb(wk, stop);
+        ps.eg += kd * PASSED_KDIST_W[r];
         s += taper(ps, phase);
+        if constexpr (Trace) {
+          const double f = blocked ? 2.0 / 3.0 : 1.0;
+          tr<Trace>(&PASSED_MG[r], f * phase / 24.0);
+          tr<Trace>(&PASSED_EG[r], f * (24 - phase) / 24.0);
+          tr<Trace>(&PASSED_KDIST_W[r], kd * (24 - phase) / 24.0);
+        }
         const Bitboard behind = file_bb(file_of(sq)) & (SQUARE_BB[sq] - 1); // file squares below the pawn
-        if (wrooks & behind)
+        if (wrooks & behind) {
           s += taper(ROOK_BEHIND_PASSER, phase); // our rook supports the push
-        if (brooks & behind)
+          tr<Trace>(&ROOK_BEHIND_PASSER.mg, phase / 24.0);
+          tr<Trace>(&ROOK_BEHIND_PASSER.eg, (24 - phase) / 24.0);
+        }
+        if (brooks & behind) {
           s -= taper(ROOK_BEHIND_PASSER, phase); // enemy rook restrains it from behind
+          tr<Trace>(&ROOK_BEHIND_PASSER.mg, -phase / 24.0);
+          tr<Trace>(&ROOK_BEHIND_PASSER.eg, -(24 - phase) / 24.0);
+        }
       }
       Bitboard b = e.bpassed;
       while (b) {
@@ -344,15 +407,29 @@ namespace eval {
         const int    r    = 7 - rank_of(sq);
         const Square stop = sq + SOUTH;
         Score        ps{PASSED_MG[r], PASSED_EG[r]};
-        if (occ & SQUARE_BB[stop])
+        const bool   blocked = (occ & SQUARE_BB[stop]) != 0;
+        if (blocked)
           ps.mg = ps.mg * 2 / 3, ps.eg = ps.eg * 2 / 3;
-        ps.eg += (5 * cheb(wk, stop) - 2 * cheb(bk, stop)) * PASSED_KDIST_W[r];
+        const int kd = 5 * cheb(wk, stop) - 2 * cheb(bk, stop);
+        ps.eg += kd * PASSED_KDIST_W[r];
         s -= taper(ps, phase);
+        if constexpr (Trace) {
+          const double f = blocked ? 2.0 / 3.0 : 1.0;
+          tr<Trace>(&PASSED_MG[r], -f * phase / 24.0);
+          tr<Trace>(&PASSED_EG[r], -f * (24 - phase) / 24.0);
+          tr<Trace>(&PASSED_KDIST_W[r], -kd * (24 - phase) / 24.0);
+        }
         const Bitboard behind = file_bb(file_of(sq)) & ~((SQUARE_BB[sq] - 1) | SQUARE_BB[sq]); // above the pawn
-        if (brooks & behind)
+        if (brooks & behind) {
           s -= taper(ROOK_BEHIND_PASSER, phase);
-        if (wrooks & behind)
+          tr<Trace>(&ROOK_BEHIND_PASSER.mg, -phase / 24.0);
+          tr<Trace>(&ROOK_BEHIND_PASSER.eg, -(24 - phase) / 24.0);
+        }
+        if (wrooks & behind) {
           s += taper(ROOK_BEHIND_PASSER, phase);
+          tr<Trace>(&ROOK_BEHIND_PASSER.mg, phase / 24.0);
+          tr<Trace>(&ROOK_BEHIND_PASSER.eg, (24 - phase) / 24.0);
+        }
       }
 
       // Holes / knight outposts. A square is a hole for one side if no pawn of that side can ever
@@ -365,13 +442,13 @@ namespace eval {
         Square sq = pop_lsb(&wn);
         if (rank_of(sq) >= RANK4 && rank_of(sq) <= RANK6 && !(bspan & SQUARE_BB[sq]) &&
             (wp & pawn_attacks<BLACK>(SQUARE_BB[sq])))
-          s += OUTPOST_BONUS;
+          s += OUTPOST_BONUS, tr<Trace>(&OUTPOST_BONUS, 1);
       }
       for (Bitboard bn = pos.bitboard_of(BLACK, KNIGHT); bn;) {
         Square sq = pop_lsb(&bn);
         if (rank_of(sq) <= RANK5 && rank_of(sq) >= RANK3 && !(wspan & SQUARE_BB[sq]) &&
             (bp & pawn_attacks<WHITE>(SQUARE_BB[sq])))
-          s -= OUTPOST_BONUS;
+          s -= OUTPOST_BONUS, tr<Trace>(&OUTPOST_BONUS, -1);
       }
       return s;
     }
@@ -384,7 +461,11 @@ namespace eval {
 
     // Unscaled danger for `c`'s king: graded pawn shelter + enemy pawn storm over the three files
     // around the king (clamped to a full B..G window, as Stockfish does). Higher = more exposed.
-    [[gnu::pure]] int king_danger(Square ks, Bitboard ourPawns, Bitboard theirPawns, Color c) noexcept {
+    // `traceMul` (tuning only) = ∂(White-POV king_safety)/∂danger for this king: each SHELTER/STORM/
+    // OPEN term adds its value to `danger`, so its coefficient is traceMul (×1/STORM_BLOCKED when a
+    // storm pawn is shielded). The caller folds in the attacker-power scale and the White-POV sign.
+    template<bool Trace>
+    int king_danger(Square ks, Bitboard ourPawns, Bitboard theirPawns, Color c, double traceMul = 0.0) noexcept {
       int kf = file_of(ks);
       if (kf < 1)
         kf = 1;
@@ -412,11 +493,17 @@ namespace eval {
         const int      sd  = nearestDist(ourPawns & fbb); // nearest friendly shield pawn
         const int      td  = nearestDist(theirPawns & fbb); // nearest enemy storm pawn
         danger += sd < 0 ? OPEN_FILE_PENALTY : SHELTER_DIST[sd];
+        if (sd < 0)
+          tr<Trace>(&OPEN_FILE_PENALTY, traceMul);
+        else
+          tr<Trace>(&SHELTER_DIST[sd], traceMul);
         if (td >= 0) {
-          int st = STORM_DIST[td];
+          int    st = STORM_DIST[td];
+          double m  = traceMul;
           if (sd >= 0 && sd < td) // a friendly pawn stands between the king and the storm pawn
-            st /= STORM_BLOCKED;
+            st /= STORM_BLOCKED, m /= STORM_BLOCKED;
           danger += st;
+          tr<Trace>(&STORM_DIST[td], m);
         }
       }
       return danger;
@@ -424,7 +511,8 @@ namespace eval {
 
     // King safety from White's perspective: each king's shelter/storm danger scaled by the opponent's
     // attacking material (so it vanishes once the heavy pieces are traded off and the king turns active).
-    [[gnu::pure, gnu::hot]] int king_safety(const Position &pos) noexcept {
+    template<bool Trace>
+    [[gnu::hot]] int king_safety(const Position &pos) noexcept {
       const Square   wk    = bsf(pos.bitboard_of(WHITE, KING));
       const Square   bk    = bsf(pos.bitboard_of(BLACK, KING));
       const Bitboard wp    = pos.bitboard_of(WHITE, PAWN);
@@ -435,8 +523,10 @@ namespace eval {
       const int      bScal = wPow < KS_MAX_POWER ? wPow : KS_MAX_POWER;
 
       int s = 0;
-      s -= king_danger(wk, wp, bp, WHITE) * wScal / KS_MAX_POWER;
-      s += king_danger(bk, bp, wp, BLACK) * bScal / KS_MAX_POWER;
+      // White king's danger lowers the White-POV score (coeff −wScal/KS_MAX per danger unit); Black's
+      // raises it (+bScal/KS_MAX). The play-path arithmetic below is unchanged.
+      s -= king_danger<Trace>(wk, wp, bp, WHITE, -static_cast<double>(wScal) / KS_MAX_POWER) * wScal / KS_MAX_POWER;
+      s += king_danger<Trace>(bk, bp, wp, BLACK, static_cast<double>(bScal) / KS_MAX_POWER) * bScal / KS_MAX_POWER;
       return s;
     }
 
@@ -460,40 +550,44 @@ namespace eval {
       return pin;
     }
 
-    [[gnu::pure, gnu::hot]] int pin_penalty(const Position &pos) noexcept {
-      return PIN_PENALTY * (pop_count(pinned_of<BLACK>(pos)) - pop_count(pinned_of<WHITE>(pos)));
+    template<bool Trace>
+    [[gnu::hot]] int pin_penalty(const Position &pos) noexcept {
+      const int n = pop_count(pinned_of<BLACK>(pos)) - pop_count(pinned_of<WHITE>(pos));
+      tr<Trace>(&PIN_PENALTY, n);
+      return PIN_PENALTY * n;
     }
 
     // Bishop pair + rook placement (open/semi-open files, 7th rank), White's perspective, tapered.
-    [[gnu::pure, gnu::hot]] int piece_bonuses(const Position &pos, int phase) noexcept {
+    template<bool Trace>
+    [[gnu::hot]] int piece_bonuses(const Position &pos, int phase) noexcept {
       const Bitboard wp = pos.bitboard_of(WHITE, PAWN);
       const Bitboard bp = pos.bitboard_of(BLACK, PAWN);
       Score          s;
 
       if (pop_count(pos.bitboard_of(WHITE, BISHOP)) >= 2)
-        s.mg += BISHOP_PAIR_MG, s.eg += BISHOP_PAIR_EG;
+        s.mg += BISHOP_PAIR_MG, s.eg += BISHOP_PAIR_EG, trScore<Trace>(&BISHOP_PAIR_MG, &BISHOP_PAIR_EG, 1, phase);
       if (pop_count(pos.bitboard_of(BLACK, BISHOP)) >= 2)
-        s.mg -= BISHOP_PAIR_MG, s.eg -= BISHOP_PAIR_EG;
+        s.mg -= BISHOP_PAIR_MG, s.eg -= BISHOP_PAIR_EG, trScore<Trace>(&BISHOP_PAIR_MG, &BISHOP_PAIR_EG, -1, phase);
 
       for (Bitboard r = pos.bitboard_of(WHITE, ROOK); r;) {
         Square   sq = pop_lsb(&r);
         Bitboard fl = file_bb(file_of(sq));
         if (!((wp | bp) & fl))
-          s.mg += ROOK_OPEN, s.eg += ROOK_OPEN;
+          s.mg += ROOK_OPEN, s.eg += ROOK_OPEN, trScore<Trace>(&ROOK_OPEN, &ROOK_OPEN, 1, phase);
         else if (!(wp & fl))
-          s.mg += ROOK_SEMIOPEN, s.eg += ROOK_SEMIOPEN;
+          s.mg += ROOK_SEMIOPEN, s.eg += ROOK_SEMIOPEN, trScore<Trace>(&ROOK_SEMIOPEN, &ROOK_SEMIOPEN, 1, phase);
         if (rank_of(sq) == RANK7)
-          s.mg += ROOK_7TH_MG, s.eg += ROOK_7TH_EG;
+          s.mg += ROOK_7TH_MG, s.eg += ROOK_7TH_EG, trScore<Trace>(&ROOK_7TH_MG, &ROOK_7TH_EG, 1, phase);
       }
       for (Bitboard r = pos.bitboard_of(BLACK, ROOK); r;) {
         Square   sq = pop_lsb(&r);
         Bitboard fl = file_bb(file_of(sq));
         if (!((wp | bp) & fl))
-          s.mg -= ROOK_OPEN, s.eg -= ROOK_OPEN;
+          s.mg -= ROOK_OPEN, s.eg -= ROOK_OPEN, trScore<Trace>(&ROOK_OPEN, &ROOK_OPEN, -1, phase);
         else if (!(bp & fl))
-          s.mg -= ROOK_SEMIOPEN, s.eg -= ROOK_SEMIOPEN;
+          s.mg -= ROOK_SEMIOPEN, s.eg -= ROOK_SEMIOPEN, trScore<Trace>(&ROOK_SEMIOPEN, &ROOK_SEMIOPEN, -1, phase);
         if (rank_of(sq) == RANK2)
-          s.mg -= ROOK_7TH_MG, s.eg -= ROOK_7TH_EG;
+          s.mg -= ROOK_7TH_MG, s.eg -= ROOK_7TH_EG, trScore<Trace>(&ROOK_7TH_MG, &ROOK_7TH_EG, -1, phase);
       }
       return taper(s, phase);
     }
@@ -514,11 +608,22 @@ namespace eval {
     }
 
     // Material imbalance, White's perspective, phase-independent (see IMB_OURS/IMB_THEIRS).
-    [[gnu::pure]] int imbalance(const Position &pos) noexcept {
+    template<bool Trace>
+    int imbalance(const Position &pos) noexcept {
       int w[5], b[5];
       for (int i = 0; i < 5; ++i) { // 0=P 1=N 2=B 3=R 4=Q
         w[i] = pop_count(pos.bitboard_of(WHITE, PieceType(i)));
         b[i] = pop_count(pos.bitboard_of(BLACK, PieceType(i)));
+      }
+      if constexpr (Trace) {
+        // ∂[(side(w,b) − side(b,w))/IMB_SCALE]/∂IMB_OURS[p1][p2] = (w[p1]·w[p2] − b[p1]·b[p2])/IMB_SCALE;
+        // ∂/∂IMB_THEIRS[p1][p2] = (w[p1]·b[p2] − b[p1]·w[p2])/IMB_SCALE. Registry: OURS p2≤p1, THEIRS p2<p1.
+        for (int p1 = 0; p1 < 5; ++p1)
+          for (int p2 = 0; p2 <= p1; ++p2) {
+            tr<Trace>(&IMB_OURS[p1][p2], static_cast<double>(w[p1] * w[p2] - b[p1] * b[p2]) / IMB_SCALE);
+            if (p2 < p1)
+              tr<Trace>(&IMB_THEIRS[p1][p2], static_cast<double>(w[p1] * b[p2] - b[p1] * w[p2]) / IMB_SCALE);
+          }
       }
       return (imbalance_side(w, b) - imbalance_side(b, w)) / IMB_SCALE;
     }
@@ -542,20 +647,28 @@ namespace eval {
     // ENEMY king) for the king-attack term. `ownPawnAtt` is C's pawn attacks (the map's pawn tier).
     // Previously mobility() and attack_maps() each ran this loop independently, doubling the slider
     // lookups per eval.
-    template<Color C>
+    // Trace (tuning only): `phase` lets us emit the tapered mobility coefficient directly (signed +White
+    // / −Black, since piece_activity tapers {wmob−bmob}); `zc[pt]` collects this side's king-zone attack
+    // squares per piece type, which piece_activity needs to emit the BILINEAR king-attack coefficients.
+    template<Color C, bool Trace>
     [[gnu::hot]] void side_mob_att(const Position &pos, Bitboard occ, Bitboard targets, Bitboard ownPawnAtt,
                                    Bitboard kingZone, Score &mob, AttackMap &m, int &kzUnits,
-                                   int &kzAttackers) noexcept {
-      m.pawn = ownPawnAtt;
+                                   int &kzAttackers, int phase = 0, int *zc = nullptr) noexcept {
+      constexpr double sgn = C == WHITE ? 1.0 : -1.0;
+      m.pawn               = ownPawnAtt;
       for (Bitboard b = pos.bitboard_of(C, KNIGHT); b;) {
         Bitboard a = attacks<KNIGHT>(pop_lsb(&b), occ);
         m.minor |= a;
         m.knight |= a;
         int c = pop_count(a & targets);
         mob.mg += MOB_MG[KNIGHT] * c, mob.eg += MOB_EG[KNIGHT] * c;
+        if constexpr (Trace)
+          tr<Trace>(&MOB_MG[KNIGHT], sgn * c * phase / 24.0), tr<Trace>(&MOB_EG[KNIGHT], sgn * c * (24 - phase) / 24.0);
         if (Bitboard z = a & kingZone) {
           kzUnits += KING_ATT_WEIGHT[KNIGHT] * pop_count(z);
           ++kzAttackers;
+          if constexpr (Trace)
+            zc[KNIGHT] += pop_count(z);
         }
       }
       for (Bitboard b = pos.bitboard_of(C, BISHOP); b;) {
@@ -564,9 +677,13 @@ namespace eval {
         m.bishop |= a;
         int c = pop_count(a & targets);
         mob.mg += MOB_MG[BISHOP] * c, mob.eg += MOB_EG[BISHOP] * c;
+        if constexpr (Trace)
+          tr<Trace>(&MOB_MG[BISHOP], sgn * c * phase / 24.0), tr<Trace>(&MOB_EG[BISHOP], sgn * c * (24 - phase) / 24.0);
         if (Bitboard z = a & kingZone) {
           kzUnits += KING_ATT_WEIGHT[BISHOP] * pop_count(z);
           ++kzAttackers;
+          if constexpr (Trace)
+            zc[BISHOP] += pop_count(z);
         }
       }
       for (Bitboard b = pos.bitboard_of(C, ROOK); b;) {
@@ -574,9 +691,13 @@ namespace eval {
         m.rook |= a;
         int c = pop_count(a & targets);
         mob.mg += MOB_MG[ROOK] * c, mob.eg += MOB_EG[ROOK] * c;
+        if constexpr (Trace)
+          tr<Trace>(&MOB_MG[ROOK], sgn * c * phase / 24.0), tr<Trace>(&MOB_EG[ROOK], sgn * c * (24 - phase) / 24.0);
         if (Bitboard z = a & kingZone) {
           kzUnits += KING_ATT_WEIGHT[ROOK] * pop_count(z);
           ++kzAttackers;
+          if constexpr (Trace)
+            zc[ROOK] += pop_count(z);
         }
       }
       for (Bitboard b = pos.bitboard_of(C, QUEEN); b;) {
@@ -584,9 +705,13 @@ namespace eval {
         m.queen |= a;
         int c = pop_count(a & targets);
         mob.mg += MOB_MG[QUEEN] * c, mob.eg += MOB_EG[QUEEN] * c;
+        if constexpr (Trace)
+          tr<Trace>(&MOB_MG[QUEEN], sgn * c * phase / 24.0), tr<Trace>(&MOB_EG[QUEEN], sgn * c * (24 - phase) / 24.0);
         if (Bitboard z = a & kingZone) {
           kzUnits += KING_ATT_WEIGHT[QUEEN] * pop_count(z);
           ++kzAttackers;
+          if constexpr (Trace)
+            zc[QUEEN] += pop_count(z);
         }
       }
       m.all = m.pawn | m.minor | m.rook | m.queen | attacks<KING>(bsf(pos.bitboard_of(C, KING)), occ);
@@ -595,10 +720,11 @@ namespace eval {
     // Threat bonus for side C against ~C: pieces of ~C attacked by our pawns / minors / rooks / king /
     // safe pawn pushes, plus any enemy piece we attack that ~C does not defend (`theyDefend` = ~C's full
     // attack map). `occ` = full occupancy, `theirPawnAtt` = ~C's pawn attacks (for safe-push detection).
-    template<Color C>
-    [[gnu::pure, gnu::hot]] Score side_threats(const Position &pos, const AttackMap &us, Bitboard theyDefend,
-                                               Bitboard occ, Bitboard theirPawnAtt) noexcept {
-      const Color    Them        = ~C;
+    template<Color C, bool Trace>
+    [[gnu::hot]] Score side_threats(const Position &pos, const AttackMap &us, Bitboard theyDefend, Bitboard occ,
+                                    Bitboard theirPawnAtt, int phase = 0) noexcept {
+      constexpr double sgn         = C == WHITE ? 1.0 : -1.0; // piece_activity tapers {sw − sb}
+      const Color      Them        = ~C;
       const Bitboard theirMinors = pos.bitboard_of(Them, KNIGHT) | pos.bitboard_of(Them, BISHOP);
       const Bitboard theirR      = pos.bitboard_of(Them, ROOK);
       const Bitboard theirQ      = pos.bitboard_of(Them, QUEEN);
@@ -606,25 +732,31 @@ namespace eval {
 
       Score s;
       // Pawn threats: any enemy piece attacked by one of our pawns (flat — the pawn is cheap).
-      s.mg += THREAT_BY_PAWN.mg * pop_count(us.pawn & theirPieces);
-      s.eg += THREAT_BY_PAWN.eg * pop_count(us.pawn & theirPieces);
+      const int pawnThr = pop_count(us.pawn & theirPieces);
+      s.mg += THREAT_BY_PAWN.mg * pawnThr;
+      s.eg += THREAT_BY_PAWN.eg * pawnThr;
+      trScore<Trace>(&THREAT_BY_PAWN.mg, &THREAT_BY_PAWN.eg, sgn * pawnThr, phase);
       // Minor-piece threats, by the threatened piece's type.
       for (Bitboard t = us.minor & theirPieces; t;) {
         const int vt = type_of(pos.at(pop_lsb(&t)));
         s.mg += THREAT_BY_MINOR[vt].mg, s.eg += THREAT_BY_MINOR[vt].eg;
+        trScore<Trace>(&THREAT_BY_MINOR[vt].mg, &THREAT_BY_MINOR[vt].eg, sgn, phase);
       }
       // Rook threats (chiefly enemy rooks/queens, but minors too).
       for (Bitboard t = us.rook & theirPieces; t;) {
         const int vt = type_of(pos.at(pop_lsb(&t)));
         s.mg += THREAT_BY_ROOK[vt].mg, s.eg += THREAT_BY_ROOK[vt].eg;
+        trScore<Trace>(&THREAT_BY_ROOK[vt].mg, &THREAT_BY_ROOK[vt].eg, sgn, phase);
       }
       // Hanging: enemy pieces we attack that they do not defend.
       const int hung = pop_count(theirPieces & us.all & ~theyDefend);
       s.mg += HANGING.mg * hung, s.eg += HANGING.eg * hung;
+      trScore<Trace>(&HANGING.mg, &HANGING.eg, sgn * hung, phase);
 
       // King threats: undefended enemy pieces our king attacks (the king is a real attacker, esp. eg).
       const int kingThr = pop_count(theirPieces & attacks<KING>(bsf(pos.bitboard_of(C, KING)), occ) & ~theyDefend);
       s.mg += THREAT_BY_KING.mg * kingThr, s.eg += THREAT_BY_KING.eg * kingThr;
+      trScore<Trace>(&THREAT_BY_KING.mg, &THREAT_BY_KING.eg, sgn * kingThr, phase);
 
       // Pawn-push threats: a pawn that can safely push (to an empty square no enemy pawn attacks) and
       // would then attack an enemy piece. Single push, plus the double push from the home rank.
@@ -635,6 +767,7 @@ namespace eval {
       push &= ~theirPawnAtt; // the pushed pawn must not be en-prise to an enemy pawn
       const int pushThr = pop_count(pawn_attacks<C>(push) & theirPieces);
       s.mg += THREAT_BY_PUSH.mg * pushThr, s.eg += THREAT_BY_PUSH.eg * pushThr;
+      trScore<Trace>(&THREAT_BY_PUSH.mg, &THREAT_BY_PUSH.eg, sgn * pushThr, phase);
       return s;
     }
 
@@ -643,23 +776,33 @@ namespace eval {
     // attack (`m`), the enemy does not defend (`enemyDef` = their full attack map) and we do not
     // occupy (`ourPieces`). A capture-check of an undefended blocker counts; a king-defended square
     // does not. Slider rays use full occupancy, so a check square must be reachable past the blockers.
-    [[gnu::pure]] int safe_checks(Square ek, Bitboard occ, const AttackMap &m, Bitboard enemyDef,
-                                  Bitboard ourPieces) noexcept {
+    // `mul` (tuning only) = ∂katt/∂kw × sign — each SAFE_CHECK term enters kw flatly, so its coefficient
+    // is mul × (number of safe checks of that type). The caller passes +T for the White kw, −T for kb.
+    template<bool Trace>
+    int safe_checks(Square ek, Bitboard occ, const AttackMap &m, Bitboard enemyDef, Bitboard ourPieces,
+                    double mul = 0.0) noexcept {
       const Bitboard bishopRay = attacks<BISHOP>(ek, occ);
       const Bitboard rookRay   = attacks<ROOK>(ek, occ);
       const Bitboard knightRay = attacks<KNIGHT>(ek, occ);
       const Bitboard safe      = ~enemyDef & ~ourPieces;
       int            s         = 0;
-      s += SAFE_CHECK[KNIGHT] * pop_count(knightRay & m.knight & safe);
-      s += SAFE_CHECK[BISHOP] * pop_count(bishopRay & m.bishop & safe);
-      s += SAFE_CHECK[ROOK] * pop_count(rookRay & m.rook & safe);
-      s += SAFE_CHECK[QUEEN] * pop_count((bishopRay | rookRay) & m.queen & safe);
+      const int      nN = pop_count(knightRay & m.knight & safe), nB = pop_count(bishopRay & m.bishop & safe);
+      const int      nR = pop_count(rookRay & m.rook & safe), nQ = pop_count((bishopRay | rookRay) & m.queen & safe);
+      s += SAFE_CHECK[KNIGHT] * nN;
+      s += SAFE_CHECK[BISHOP] * nB;
+      s += SAFE_CHECK[ROOK] * nR;
+      s += SAFE_CHECK[QUEEN] * nQ;
+      if constexpr (Trace) {
+        tr<Trace>(&SAFE_CHECK[KNIGHT], mul * nN), tr<Trace>(&SAFE_CHECK[BISHOP], mul * nB);
+        tr<Trace>(&SAFE_CHECK[ROOK], mul * nR), tr<Trace>(&SAFE_CHECK[QUEEN], mul * nQ);
+      }
       return s;
     }
 
     // Mobility + threats + king-zone attacks combined, White's perspective, tapered by game phase.
     // The three terms share a single pass over the pieces (see `side_mob_att`), so the per-piece
     // attack lookups happen once.
+    template<bool Trace>
     [[gnu::hot]] int piece_activity(const Position &pos, int phase) noexcept {
       const Bitboard wpieces  = pos.all_pieces<WHITE>();
       const Bitboard bpieces  = pos.all_pieces<BLACK>();
@@ -677,27 +820,40 @@ namespace eval {
       Score     wmob, bmob;
       AttackMap wm, bm;
       int       wU = 0, wC = 0, bU = 0, bC = 0; // king-zone units / distinct attackers, per side
-      side_mob_att<WHITE>(pos, occ, ~wpieces & ~bPawnAtt, wPawnAtt, bkZone, wmob, wm, wU, wC);
-      side_mob_att<BLACK>(pos, occ, ~bpieces & ~wPawnAtt, bPawnAtt, wkZone, bmob, bm, bU, bC);
+      int       zcw[6] = {0}, zcb[6] = {0};     // (trace) king-zone attack squares per piece type, per side
+      side_mob_att<WHITE, Trace>(pos, occ, ~wpieces & ~bPawnAtt, wPawnAtt, bkZone, wmob, wm, wU, wC, phase, zcw);
+      side_mob_att<BLACK, Trace>(pos, occ, ~bpieces & ~wPawnAtt, bPawnAtt, wkZone, bmob, bm, bU, bC, phase, zcb);
 
       const int   mob = taper({wmob.mg - bmob.mg, wmob.eg - bmob.eg}, phase);
-      const Score sw  = side_threats<WHITE>(pos, wm, bm.all, occ, bm.pawn);
-      const Score sb  = side_threats<BLACK>(pos, bm, wm.all, occ, wm.pawn);
+      const Score sw  = side_threats<WHITE, Trace>(pos, wm, bm.all, occ, bm.pawn, phase);
+      const Score sb  = side_threats<BLACK, Trace>(pos, bm, wm.all, occ, wm.pawn, phase);
       const int   thr = taper({sw.mg - sb.mg, sw.eg - sb.eg}, phase);
 
       // King pressure = king-zone attacks (weighted units, scaled by attacker count — a lone attacker
       // scores nothing) PLUS safe checks (cp, NOT attacker-count gated — a single deadly check counts).
-      // Each side attacks the OTHER king. Mostly middlegame — quartered in the endgame.
-      const int kw =
-              wU * KING_ATT_SCALE[wC < 7 ? wC : 7] / 100 * KING_ATT_UNIT + safe_checks(bk, occ, wm, bm.all, wpieces);
-      const int kb =
-              bU * KING_ATT_SCALE[bC < 7 ? bC : 7] / 100 * KING_ATT_UNIT + safe_checks(wk, occ, bm, wm.all, bpieces);
-      const int katt = taper({kw - kb, (kw - kb) / 4}, phase);
+      // Each side attacks the OTHER king. Mostly middlegame — quartered in the endgame. T = ∂katt/∂kw.
+      const double T      = (phase + (24.0 - phase) / 4.0) / 24.0;
+      const int    scaleW = KING_ATT_SCALE[wC < 7 ? wC : 7];
+      const int    scaleB = KING_ATT_SCALE[bC < 7 ? bC : 7];
+      const int    kw     = wU * scaleW / 100 * KING_ATT_UNIT + safe_checks<Trace>(bk, occ, wm, bm.all, wpieces, T);
+      const int    kb     = bU * scaleB / 100 * KING_ATT_UNIT + safe_checks<Trace>(wk, occ, bm, wm.all, bpieces, -T);
+      const int    katt   = taper({kw - kb, (kw - kb) / 4}, phase);
+      if constexpr (Trace) {
+        // Bilinear partials at the current point: d(kw)/d(KING_ATT_WEIGHT[pt]) is zc[pt]·scale/100·UNIT;
+        // d(kw)/d(KING_ATT_UNIT) is wU·scale/100. (Avoid writing "NAME =" here — tools/apply_tune.py
+        // regex-matches "NAME = ...;" in this file and a comment hit would look like a second decl.)
+        for (int pt = KNIGHT; pt <= QUEEN; ++pt) {
+          tr<Trace>(&KING_ATT_WEIGHT[pt], T * zcw[pt] * (scaleW / 100.0) * KING_ATT_UNIT);
+          tr<Trace>(&KING_ATT_WEIGHT[pt], -T * zcb[pt] * (scaleB / 100.0) * KING_ATT_UNIT);
+        }
+        tr<Trace>(&KING_ATT_UNIT, T * (wU * (scaleW / 100.0) - bU * (scaleB / 100.0)));
+      }
 
       // Restricted squares: squares we attack that the enemy attacks but does not protect with a pawn.
       const int wRestr = pop_count(wm.all & bm.all & ~bm.pawn);
       const int bRestr = pop_count(bm.all & wm.all & ~wm.pawn);
       const int restr  = taper({RESTRICTED.mg * (wRestr - bRestr), RESTRICTED.eg * (wRestr - bRestr)}, phase);
+      trScore<Trace>(&RESTRICTED.mg, &RESTRICTED.eg, wRestr - bRestr, phase);
 
       // Space: safe central squares on our own half, weighted by piece count (a middlegame term).
       const Bitboard wp = pos.bitboard_of(WHITE, PAWN), bp = pos.bitboard_of(BLACK, PAWN);
@@ -713,6 +869,7 @@ namespace eval {
       const int bPc     = pop_count(bpieces & ~bp & ~pos.bitboard_of(BLACK, KING));
       const int spaceMg = SPACE_WEIGHT * (wSpace * wPc - bSpace * bPc) / 16;
       const int space   = taper({spaceMg, 0}, phase); // middlegame only
+      tr<Trace>(&SPACE_WEIGHT, (wSpace * wPc - bSpace * bPc) / 16.0 * phase / 24.0);
 
       return mob + thr + katt + restr + space;
     }
@@ -720,19 +877,20 @@ namespace eval {
     // Trapped pieces, White's perspective, tapered. (1) A bishop in the enemy corner (a7/h7 for White)
     // hemmed by an enemy pawn that it cannot escape. (2) A rook boxed in by its own king on the back
     // rank, on the side where castling is already lost (the king blocks the rook's only exit).
-    [[gnu::pure]] int trapped_pieces(const Position &pos, int phase) noexcept {
+    template<bool Trace>
+    int trapped_pieces(const Position &pos, int phase) noexcept {
       Score          s;
       const Bitboard wp = pos.bitboard_of(WHITE, PAWN), bp = pos.bitboard_of(BLACK, PAWN);
       const Bitboard wB = pos.bitboard_of(WHITE, BISHOP), bB = pos.bitboard_of(BLACK, BISHOP);
 
       if ((wB & SQUARE_BB[a7]) && (bp & SQUARE_BB[b6]))
-        s.mg -= TRAPPED_BISHOP.mg, s.eg -= TRAPPED_BISHOP.eg;
+        s.mg -= TRAPPED_BISHOP.mg, s.eg -= TRAPPED_BISHOP.eg, trScore<Trace>(&TRAPPED_BISHOP.mg, &TRAPPED_BISHOP.eg, -1, phase);
       if ((wB & SQUARE_BB[h7]) && (bp & SQUARE_BB[g6]))
-        s.mg -= TRAPPED_BISHOP.mg, s.eg -= TRAPPED_BISHOP.eg;
+        s.mg -= TRAPPED_BISHOP.mg, s.eg -= TRAPPED_BISHOP.eg, trScore<Trace>(&TRAPPED_BISHOP.mg, &TRAPPED_BISHOP.eg, -1, phase);
       if ((bB & SQUARE_BB[a2]) && (wp & SQUARE_BB[b3]))
-        s.mg += TRAPPED_BISHOP.mg, s.eg += TRAPPED_BISHOP.eg;
+        s.mg += TRAPPED_BISHOP.mg, s.eg += TRAPPED_BISHOP.eg, trScore<Trace>(&TRAPPED_BISHOP.mg, &TRAPPED_BISHOP.eg, 1, phase);
       if ((bB & SQUARE_BB[h2]) && (wp & SQUARE_BB[g3]))
-        s.mg += TRAPPED_BISHOP.mg, s.eg += TRAPPED_BISHOP.eg;
+        s.mg += TRAPPED_BISHOP.mg, s.eg += TRAPPED_BISHOP.eg, trScore<Trace>(&TRAPPED_BISHOP.mg, &TRAPPED_BISHOP.eg, 1, phase);
 
       const Bitboard wR = pos.bitboard_of(WHITE, ROOK), bR = pos.bitboard_of(BLACK, ROOK);
       const Bitboard entry = pos.castle_entry();
@@ -742,16 +900,16 @@ namespace eval {
       if (rank_of(wk) == RANK1) {
         const int kf = file_of(wk);
         if (kf >= FFILE && (entry & WHITE_OO_MASK) && (wR & MASK_RANK[RANK1] & files_above(kf)))
-          s.mg -= TRAPPED_ROOK.mg, s.eg -= TRAPPED_ROOK.eg; // kingside rook stuck behind the king
+          s.mg -= TRAPPED_ROOK.mg, s.eg -= TRAPPED_ROOK.eg, trScore<Trace>(&TRAPPED_ROOK.mg, &TRAPPED_ROOK.eg, -1, phase);
         else if (kf <= CFILE && (entry & WHITE_OOO_MASK) && (wR & MASK_RANK[RANK1] & files_below(kf)))
-          s.mg -= TRAPPED_ROOK.mg, s.eg -= TRAPPED_ROOK.eg; // queenside
+          s.mg -= TRAPPED_ROOK.mg, s.eg -= TRAPPED_ROOK.eg, trScore<Trace>(&TRAPPED_ROOK.mg, &TRAPPED_ROOK.eg, -1, phase);
       }
       if (rank_of(bk) == RANK8) {
         const int kf = file_of(bk);
         if (kf >= FFILE && (entry & BLACK_OO_MASK) && (bR & MASK_RANK[RANK8] & files_above(kf)))
-          s.mg += TRAPPED_ROOK.mg, s.eg += TRAPPED_ROOK.eg;
+          s.mg += TRAPPED_ROOK.mg, s.eg += TRAPPED_ROOK.eg, trScore<Trace>(&TRAPPED_ROOK.mg, &TRAPPED_ROOK.eg, 1, phase);
         else if (kf <= CFILE && (entry & BLACK_OOO_MASK) && (bR & MASK_RANK[RANK8] & files_below(kf)))
-          s.mg += TRAPPED_ROOK.mg, s.eg += TRAPPED_ROOK.eg;
+          s.mg += TRAPPED_ROOK.mg, s.eg += TRAPPED_ROOK.eg, trScore<Trace>(&TRAPPED_ROOK.mg, &TRAPPED_ROOK.eg, 1, phase);
       }
       return taper(s, phase);
     }
@@ -885,7 +1043,13 @@ namespace eval {
   // cheap enough that the 2 MiB/thread cache cost more (CPU-cache pressure + per-call lookup/store)
   // than its ~5% hit rate saved — removing it measured +6-8% nps with identical node counts. So the
   // eval is recomputed every call.
-  [[gnu::hot]] int evaluate(const Position &pos) noexcept {
+  // The White-POV term sum BEFORE the drawish scale factor, side-to-move flip, tempo and fifty
+  // damping. Templated so the gradient tuner can run it with Trace=true to accumulate, per registered
+  // param, the analytic coefficient ∂s/∂param (see evaluate_trace). evaluate() uses Trace=false, which
+  // compiles every `if constexpr (Trace)` branch out — byte-for-byte identical to the hand-written eval
+  // (the bench signature is unchanged).
+  template<bool Trace>
+  [[gnu::hot]] int eval_core(const Position &pos, int &phase_out) noexcept {
     // Taper the (incremental) material + piece-square score between the middlegame and endgame
     // tables by the game phase (full board -> middlegame, few pieces -> endgame).
     int phase = pop_count(pos.bitboard_of(WHITE, KNIGHT) | pos.bitboard_of(BLACK, KNIGHT)) +
@@ -894,34 +1058,54 @@ namespace eval {
                 4 * pop_count(pos.bitboard_of(WHITE, QUEEN) | pos.bitboard_of(BLACK, QUEEN));
     if (phase > psqt::PHASE_MAX)
       phase = psqt::PHASE_MAX; // promotions can exceed the starting material
+    phase_out = phase;
 
+    // Material + PST is structural (PeSTO, tuned upstream — NOT registered), so it emits no trace.
     int s = (pos.psqt_mg() * phase + pos.psqt_eg() * (psqt::PHASE_MAX - phase)) / psqt::PHASE_MAX;
-    s += pawn_structure(pos, phase);
-    s += king_safety(pos);
-    s += piece_activity(pos, phase); // mobility + threats + king-zone attacks, one shared attack pass
-    s += pin_penalty(pos);
-    s += piece_bonuses(pos, phase);
-    s += imbalance(pos); // material imbalance (quadratic piece-interaction, phase-independent)
-    s += trapped_pieces(pos, phase);
-    s += mopup(pos); // elementary-mate driving in bare-king endgames (KQK / KRK / KBNK conversion)
+    s += pawn_structure<Trace>(pos, phase);
+    s += king_safety<Trace>(pos);
+    s += piece_activity<Trace>(pos, phase);
+    s += pin_penalty<Trace>(pos);
+    s += piece_bonuses<Trace>(pos, phase);
+    s += imbalance<Trace>(pos);
+    s += trapped_pieces<Trace>(pos, phase);
+    s += mopup(pos);                      // elementary-mate driving; NOT tuned -> no trace
+    return s;
+  }
 
-    // Drawish-endgame scaling: narrow a nominal material edge toward 0 in dead / near-dead-drawn
-    // material configurations (insufficient minors, rook-vs-minor, opposite-coloured bishops) so the
-    // engine neither overvalues them nor trades into them. Applied before the side-to-move flip.
-    s = s * scale_factor(pos, s) / SCALE_NORMAL;
+  [[gnu::hot]] int evaluate(const Position &pos) noexcept {
+    int phase;
+    int s = eval_core<false>(pos, phase);
 
-    // White-perspective score flipped to the side to move, plus the tempo bonus for that side.
+    // Drawish-endgame scaling, side-to-move flip + tempo, then fifty-move damping (see eval_core).
+    s           = s * scale_factor(pos, s) / SCALE_NORMAL;
     const int v = (pos.turn() == WHITE ? s : -s) + taper(TEMPO, phase);
-
-    // Fifty-move damping: scale the whole evaluation linearly toward 0 as the halfmove clock
-    // approaches the fifty-move rule (down to 50% at 100 halfmoves, where is_draw() takes over and
-    // scores it 0 exactly). An advantage the engine cannot convert within the rule is not a real
-    // advantage: this makes shuffling lines decay, so the better side prefers PROGRESS (a pawn push
-    // or capture resets the clock and restores the full eval) over repetition-adjacent drift, and
-    // dead-drawn games converge into the match-runner's draw-adjudication window instead of
-    // shuffling for hundreds of plies. The 200 divisor is the standard (Stockfish-style) starting
-    // value, unproven here — SPRT decides.
     return v * (200 - pos.fifty()) / 200;
+  }
+
+  // Tuning only: evaluate `pos` AND fill coeff[i] = ∂(returned White-POV value)/∂param_i for every
+  // registered param, in ONE pass — the analytic gradient the finite-difference tuner used to dig out
+  // in (2·NP+1) passes. Returns the same White-POV value the FD path's white_eval does, so it slots
+  // straight into base[]/coeff[]. `coeff` must hold params().size() doubles, pre-zeroed. The caller
+  // must set eval::set_tuning(true) first (the pawn cache is bypassed so every term recomputes and
+  // emits). Tuning positions are clock-0, so the fifty-move damping is the identity.
+  int evaluate_trace(const Position &pos, double *coeff) noexcept {
+    int phase;
+    t_trace     = coeff;
+    const int s = eval_core<true>(pos, phase); // accumulate ∂s/∂param (pre-scale, White POV) into coeff
+    const int    xi    = scale_factor(pos, s);
+    const double scale = static_cast<double>(xi) / SCALE_NORMAL;
+    const auto  &P     = params();
+    for (size_t i = 0; i < P.size(); ++i)
+      coeff[i] *= scale; // the drawish factor multiplies the whole score -> every coefficient
+
+    // Tempo is added AFTER the scale and flipped by the side to move (registered as TEMPO_MG/EG).
+    const int sgn = pos.turn() == WHITE ? 1 : -1;
+    tr<true>(&TEMPO.mg, sgn * phase / 24.0);
+    tr<true>(&TEMPO.eg, sgn * (24 - phase) / 24.0);
+    t_trace = nullptr;
+
+    return s * xi / SCALE_NORMAL + sgn * taper(TEMPO, phase); // == white_eval(pos) (fifty = identity)
   }
 
   // --- Texel tuning registry (see eval.h) -----------------------------------------------------

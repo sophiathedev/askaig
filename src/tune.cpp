@@ -87,6 +87,34 @@ namespace tune {
         w.join();
     }
 
+    // Like eval_all, but ALSO fills the linear-model row coeff[p*NP + i] = ∂eval/∂param_i with the
+    // ANALYTIC gradient (eval::evaluate_trace) in a SINGLE eval pass — the trace replacement for the
+    // (2·NP+1)-pass finite differences. The caller wraps this in set_tuning(true)/(false) so the pawn
+    // cache is bypassed (every term recomputes and emits its coefficient, even on a shared pawn shape).
+    void eval_all_with_trace(const std::vector<Packed> &data, std::vector<float> &base,
+                             std::vector<float> &coeff, int NP, int threads) {
+      const size_t             n = data.size();
+      std::vector<std::thread> ws;
+      ws.reserve(static_cast<size_t>(threads));
+      for (int t = 0; t < threads; ++t)
+        ws.emplace_back([&, t]() {
+          Position            scratch;
+          std::vector<double> row(static_cast<size_t>(NP));
+          const size_t        a = n * static_cast<size_t>(t) / static_cast<size_t>(threads);
+          const size_t        b = n * (static_cast<size_t>(t) + 1) / static_cast<size_t>(threads);
+          for (size_t i = a; i < b; ++i) {
+            build(scratch, data[i]);
+            std::fill(row.begin(), row.end(), 0.0);
+            base[i]    = static_cast<float>(eval::evaluate_trace(scratch, row.data())); // White POV
+            float *dst = &coeff[i * static_cast<size_t>(NP)];
+            for (int k = 0; k < NP; ++k)
+              dst[k] = static_cast<float>(row[k]);
+          }
+        });
+      for (auto &w: ws)
+        w.join();
+    }
+
     // Logistic link, base e (Andrew Grant §2.3: dropping the base-10 / 400 constants simplifies the
     // gradient — they are absorbed into K).  σ(E) = 1 / (1 + e^(−K·E)),  dσ/dE = K·σ·(1−σ).
     [[gnu::const]] inline double sigmoid(double K, double E) noexcept { return 1.0 / (1.0 + std::exp(-K * E)); }
@@ -209,27 +237,36 @@ namespace tune {
     // === Coefficient extraction (central finite differences against the real eval) =================
     // Memory: N*NP floats. ~0.5 GB at 1M positions × 123 weights — quality beats quantity for the
     // dataset (Grant §2.2), so a few hundred-k clean positions is the intended scale.
-    std::cout << "extracting coefficients (FD step ±" << FD_STEP << ", " << (2 * NP + 1)
-              << " eval passes)...\n"
-              << std::flush;
-    std::vector<float> base(N), plus(N), minus(N);
+    std::vector<float> base(N);
     std::vector<float> coeff(N * static_cast<size_t>(NP));
+    const bool         useTrace = envd("TRACE", 1) != 0; // analytic gradient by default; TRACE=0 -> finite diff
     const auto         tExtract = std::chrono::steady_clock::now();
 
-    eval_all(data, base, threads); // base[p] = eval(w0)
-    for (int i = 0; i < NP; ++i) {
-      int       *v = params[i].value;
-      const int  o = w0[i];
-      *v           = o + FD_STEP;
-      eval_all(data, plus, threads);
-      *v = o - FD_STEP;
-      eval_all(data, minus, threads);
-      *v                = o; // restore
-      const double inv  = 1.0 / (2.0 * FD_STEP);
-      for (size_t p = 0; p < N; ++p)
-        coeff[p * NP + i] = static_cast<float>((plus[p] - minus[p]) * inv);
-      if ((i + 1) % 20 == 0 || i + 1 == NP)
-        std::cout << "  " << (i + 1) << "/" << NP << " weights\r" << std::flush;
+    if (useTrace) {
+      std::cout << "extracting coefficients (ANALYTIC trace, 1 eval pass)...\n" << std::flush;
+      eval::set_tuning(true); // bypass the pawn cache: every term must recompute and emit its coefficient
+      eval_all_with_trace(data, base, coeff, NP, threads);
+      eval::set_tuning(false);
+    } else {
+      std::cout << "extracting coefficients (FD step ±" << FD_STEP << ", " << (2 * NP + 1)
+                << " eval passes)...\n"
+                << std::flush;
+      std::vector<float> plus(N), minus(N);
+      eval_all(data, base, threads); // base[p] = eval(w0)
+      for (int i = 0; i < NP; ++i) {
+        int       *v = params[i].value;
+        const int  o = w0[i];
+        *v           = o + FD_STEP;
+        eval_all(data, plus, threads);
+        *v = o - FD_STEP;
+        eval_all(data, minus, threads);
+        *v                = o; // restore
+        const double inv  = 1.0 / (2.0 * FD_STEP);
+        for (size_t p = 0; p < N; ++p)
+          coeff[p * NP + i] = static_cast<float>((plus[p] - minus[p]) * inv);
+        if ((i + 1) % 20 == 0 || i + 1 == NP)
+          std::cout << "  " << (i + 1) << "/" << NP << " weights\r" << std::flush;
+      }
     }
     {
       const auto s = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
@@ -321,18 +358,27 @@ namespace tune {
           wl[i]            = static_cast<int>(std::lround(theta[i]));
           *params[i].value = wl[i];
         }
-        eval_all(data, base, threads);
-        for (int idx: kingIdx) {
-          int       *v = params[idx].value;
-          const int  o = wl[idx];
-          *v           = o + FD_STEP;
-          eval_all(data, plus, threads);
-          *v = o - FD_STEP;
-          eval_all(data, minus, threads);
-          *v               = o;
-          const double inv = 1.0 / (2.0 * FD_STEP);
-          for (size_t p = 0; p < N; ++p)
-            coeff[p * NP + idx] = static_cast<float>((plus[p] - minus[p]) * inv);
+        if (useTrace) {
+          // One trace pass refreshes base[] AND every coefficient (incl. the bilinear king terms) at
+          // the new linearization point — strictly better than the FD king-only refresh, and as cheap.
+          eval::set_tuning(true);
+          eval_all_with_trace(data, base, coeff, NP, threads);
+          eval::set_tuning(false);
+        } else {
+          std::vector<float> plus(N), minus(N);
+          eval_all(data, base, threads);
+          for (int idx: kingIdx) {
+            int       *v = params[idx].value;
+            const int  o = wl[idx];
+            *v           = o + FD_STEP;
+            eval_all(data, plus, threads);
+            *v = o - FD_STEP;
+            eval_all(data, minus, threads);
+            *v               = o;
+            const double inv = 1.0 / (2.0 * FD_STEP);
+            for (size_t p = 0; p < N; ++p)
+              coeff[p * NP + idx] = static_cast<float>((plus[p] - minus[p]) * inv);
+          }
         }
         wlin = wl;
       }

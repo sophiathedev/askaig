@@ -35,6 +35,13 @@ namespace eval {
   // side-to-move's perspective (negamax convention: positive means the side to move is better).
   [[nodiscard]] int evaluate(const Position &pos) noexcept;
 
+  // Tuning only: like evaluate() but ALSO writes, for each registered param i (params()[i]), the
+  // analytic coefficient ∂eval/∂param_i at the current weights into coeff[i] — the linear-model column
+  // the gradient tuner builds, produced in ONE eval pass. Returns the White-POV value (== the FD
+  // tuner's white_eval). `coeff` must hold params().size() doubles, pre-zeroed; call set_tuning(true)
+  // first (the pawn cache must be bypassed so every term recomputes and emits its coefficient).
+  int evaluate_trace(const Position &pos, double *coeff) noexcept;
+
   // True if `c`'s pawn on `sq` is passed (no enemy pawn can block or capture it on its way to
   // promotion). Used by the search's passed-pawn extension.
   [[nodiscard, gnu::pure]] bool is_passed_pawn(const Position &pos, Color c, Square sq) noexcept;
