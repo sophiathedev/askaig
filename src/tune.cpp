@@ -336,6 +336,32 @@ namespace tune {
     for (int i = 0; i < NP; ++i)
       theta[i] = w0[i];
 
+    // FREEZE=<comma-separated name prefixes>: hold the matching params at their SOURCE (w0) value for the
+    // whole tune, so the well-determined weights tune AROUND a fixed collinear block instead of co-adapting
+    // to it. This makes apply_tune.py's skip-list self-consistent — applying a SUBSET of a jointly-tuned
+    // collinear solution mismatches (e.g. new BISHOP_PAIR vs an old IMB that already absorbed it) and loses
+    // Elo. Freeze the blocks you intend to keep at source: FREEZE=IMB_,SHELTER_,STORM_,ROOK_7TH ./askaig tune ...
+    std::vector<bool> frozen(NP, false);
+    if (const char *fz = std::getenv("FREEZE"); fz && *fz) {
+      const std::string spec(fz);
+      int               nf = 0;
+      for (int i = 0; i < NP; ++i)
+        for (size_t s = 0; s < spec.size();) {
+          size_t            c   = spec.find(',', s);
+          if (c == std::string::npos)
+            c = spec.size();
+          const std::string pfx = spec.substr(s, c - s);
+          if (!pfx.empty() && params[i].name.rfind(pfx, 0) == 0) {
+            frozen[i] = true;
+            ++nf;
+            break;
+          }
+          s = c + 1;
+        }
+      std::printf("FREEZE: %d/%d params held at source (prefixes: %s)\n", nf, NP, fz);
+      std::cout << std::flush;
+    }
+
     auto model_eval = [&](size_t p) noexcept {
       double e = base[p];
       const float *row = &coeff[p * NP];
@@ -414,6 +440,8 @@ namespace tune {
       // (passers, threats, mobility) move freely. lambda = per-epoch decay fraction (0 = off).
       const double bc1 = 1.0 - std::pow(b1, epoch), bc2 = 1.0 - std::pow(b2, epoch);
       for (int i = 0; i < NP; ++i) {
+        if (frozen[i]) // held at source: no Adam step, no decay (theta[i] stays == w0[i])
+          continue;
         double gi = 0.0;
         for (int t = 0; t < threads; ++t)
           gi += tgrad[static_cast<size_t>(t)][static_cast<size_t>(i)];
