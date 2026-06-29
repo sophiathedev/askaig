@@ -160,4 +160,15 @@ namespace tt {
 
   size_t size_mb() { return g_count * sizeof(Entry) / (1024 * 1024); }
 
+  int hashfull() noexcept {
+    if (g_table == nullptr)
+      return 0;
+    const size_t slots = g_count < 4000 ? g_count : 4000; // sample up to 4000 entries (1000 buckets)
+    int          used  = 0;
+    for (size_t i = 0; i < slots; ++i)
+      if (g_table[i].bound() != NONE && (g_table[i].genbound >> 2) == g_gen)
+        ++used;
+    return static_cast<int>(used * 1000 / slots);
+  }
+
 } // namespace tt

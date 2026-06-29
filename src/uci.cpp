@@ -549,7 +549,7 @@ namespace {
                 std::cout << "info depth " << d << " seldepth " << res.seldepth << " score " << format_score(res.score);
                 if (g_show_wdl)
                   std::cout << " " << wdl::format(res.score);
-                std::cout << " nodes " << nodes << " nps " << nps << " time " << ms;
+                std::cout << " nodes " << nodes << " nps " << nps << " hashfull " << tt::hashfull() << " time " << ms;
                 if (!pv.empty()) {
                   std::cout << " pv";
                   for (Move m: pv)

@@ -73,4 +73,8 @@ namespace tt {
   // Current allocated size in megabytes.
   size_t size_mb();
 
+  // Approximate fill of the CURRENT search, in per-mille (0..1000), for UCI "info ... hashfull": samples
+  // up to 1000 buckets and counts occupied entries from the current generation. Cheap (printed per depth).
+  [[nodiscard]] int hashfull() noexcept;
+
 } // namespace tt
