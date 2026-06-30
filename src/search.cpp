@@ -32,7 +32,7 @@ namespace search {
     // SPSA tuning (see tunables()); a normal run uses the defaults shown.
     int RFP_MAX_DEPTH           = 5; // reverse futility (static null move) up to this depth
     int RFP_MARGIN              = 25; // per-depth eval surplus over beta needed to prune
-    int FUTILITY_MAX_DEPTH      = 4; // move-loop futility up to this depth
+    int FUTILITY_MAX_DEPTH      = 2; // move-loop futility up to this depth
     int FUTILITY_MARGIN         = 116; // per-depth eval deficit below alpha that prunes quiets
     int LMP_MAX_DEPTH           = 5; // late-move (move-count) pruning up to this depth
     int RAZOR_MAX_DEPTH         = 4; // razoring up to this depth
