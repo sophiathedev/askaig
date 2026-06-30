@@ -848,7 +848,7 @@ namespace search {
         // comfortably above beta — the more the position looks won without moving, the safer it is to
         // reduce the verification harder (capped at +3). static_eval is valid here (this branch is
         // !in_check, where it was computed above).
-        int R = 2 + depth / 4;
+        int R = 2 + depth / 6;
         if (static_eval >= beta)
           R += std::min((static_eval - beta) / NMP_EVAL_DIV, 3);
         // Clamp the reduced null-search depth to >= 0: the eval bonus can push R past depth-1 (e.g. at
