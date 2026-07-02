@@ -328,6 +328,14 @@ namespace {
 
     // --- whole-node pruning (never at PV nodes, in check, or under exclusion) ---
     if (!PV && !in_check && !excluded) {
+      // Razoring: the eval is hopelessly below alpha at shallow depth — verify with a
+      // quiescence search and trust its fail-low.
+      if (depth <= 4 && ss->static_eval + 300 * depth < alpha) {
+        const int v = qsearch<false>(pos, ss, alpha - 1, alpha, ply);
+        if (v < alpha && std::abs(v) < MATE_IN_MAX)
+          return v;
+      }
+
       // Reverse futility pruning: eval is so far above beta a shallow search won't drop below.
       if (depth <= 8 && std::abs(beta) < MATE_IN_MAX &&
           ss->static_eval - 80 * (depth - improving) >= beta)
@@ -352,6 +360,35 @@ namespace {
           return 0;
         if (v >= beta)
           return v >= MATE_IN_MAX ? beta : v; // don't return unproven mates
+      }
+
+      // ProbCut: a good capture that beats beta by a margin at reduced depth almost certainly
+      // produces a full-depth beta cutoff too. Skipped when the TT already says otherwise.
+      const int pc_beta = beta + 180 - 60 * improving;
+      if (depth >= 5 && std::abs(beta) < MATE_IN_MAX &&
+          !(tthit && ttdepth >= depth - 3 && ttsc != tt::VALUE_NONE_TT && ttsc < pc_beta)) {
+        MovePicker pcpick(pos, *td.hist, ttm.is_capture() ? ttm : Move(), nullptr, nullptr, nullptr,
+                          /*quiescence=*/true);
+        for (Move m; (m = pcpick.next()).to_from() != 0;) {
+          if (!m.is_capture() || !see_ge(pos, m, pc_beta - ss->static_eval))
+            continue;
+          ss->move = m;
+          ss->ch   = &td.hist->cont[pos.at(m.from())][m.to()];
+          ++td.nodes;
+          td.ev.push(pos, m);
+          do_move(pos, m);
+          int v = -qsearch<false>(pos, ss + 1, -pc_beta, -pc_beta + 1, ply + 1);
+          if (v >= pc_beta) // qsearch agrees: confirm with a reduced full search
+            v = -negamax<false>(pos, ss + 1, -pc_beta, -pc_beta + 1, depth - 4, ply + 1, !cutnode);
+          undo_move(pos, m);
+          td.ev.pop();
+          if (g_stop.load(std::memory_order_relaxed))
+            return 0;
+          if (v >= pc_beta) {
+            tt::store(tte, key, m, to_tt(v, ply), raw_eval, depth - 3, tt::LOWER, false);
+            return v;
+          }
+        }
       }
     }
 
