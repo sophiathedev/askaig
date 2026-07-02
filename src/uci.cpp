@@ -428,19 +428,10 @@ namespace {
   }
 
   // --- d / display ---------------------------------------------------------------------------
-  // Pretty board preview: colored piece grid, the position facts, and the current static NNUE
-  // eval from the observer's (White's) point of view: + = better for White, - = better for
-  // Black, plus the raw centipawn value.
+  // Board preview (plain text, no ANSI codes): piece grid, the position facts, and the current
+  // static NNUE eval from the observer's (White's) point of view: + = better for White,
+  // - = better for Black, plus the raw centipawn value.
   void display_cmd(const Position &pos) {
-    // Plain color codes only — no bold/dim attributes: terminals render bold with a separate
-    // (or synthetic) font face and dim at theme-dependent strength, which makes the board look
-    // inconsistent; pure colors draw with the normal glyphs everywhere.
-    constexpr const char *LBL = "\033[38;5;208m"; // orange labels
-    constexpr const char *WPC = "\033[97m"; // white pieces: bright white
-    constexpr const char *BPC = "\033[94m"; // black pieces: bright blue
-    constexpr const char *DIM = "\033[90m"; // frame / empty squares: gray
-    constexpr const char *RST = "\033[0m";
-
     // A castling right is lost once its king/rook "entry" squares have been touched.
     const Bitboard entry = pos.castle_entry();
     std::string    castles;
@@ -464,44 +455,38 @@ namespace {
     // The static NNUE eval, observer's (White's) POV: + = better for White, - for Black.
     std::string eval_str = "no net loaded";
     if (nnue::loaded()) {
-      const int   stm_cp = nnue::evaluate_refresh(pos);
-      const int   cp     = pos.turn() == WHITE ? stm_cp : -stm_cp;
-      const char *col    = cp > 0 ? "\033[92m" : (cp < 0 ? "\033[91m" : RST);
-      char        pawns[16];
+      const int stm_cp = nnue::evaluate_refresh(pos);
+      const int cp     = pos.turn() == WHITE ? stm_cp : -stm_cp;
+      char      pawns[16];
       std::snprintf(pawns, sizeof pawns, "%+.2f", cp / 100.0);
-      eval_str = std::string(col) + pawns + RST + " (cp " + std::to_string(cp) + ")";
+      eval_str = std::string(pawns) + " (cp " + std::to_string(cp) + ")";
     }
 
-    const std::string L = LBL, R = RST;
     const std::string info[] = {
-            L + "FEN: " + R + pos.fen() + " " + std::to_string(pos.fifty()) + " " +
-                    std::to_string(pos.ply() / 2 + 1),
-            L + "Zobrist Key: " + R + zob.str(),
-            L + "Castle Rights: " + R + castles,
-            L + "Side To Move: " + R + (pos.turn() == WHITE ? "White" : "Black"),
-            L + "En Passant: " + R + (ep == NO_SQUARE ? "NULL" : SQSTR[ep]),
-            L + "Half Moves: " + R + std::to_string(pos.fifty()),
-            L + "In Check: " + R + (check ? "true" : "false"),
-            L + "Eval: " + R + eval_str,
+            "FEN: " + pos.fen() + " " + std::to_string(pos.fifty()) + " " + std::to_string(pos.ply() / 2 + 1),
+            "Zobrist Key: " + zob.str(),
+            "Castle Rights: " + castles,
+            std::string("Side To Move: ") + (pos.turn() == WHITE ? "White" : "Black"),
+            std::string("En Passant: ") + (ep == NO_SQUARE ? "NULL" : SQSTR[ep]),
+            "Half Moves: " + std::to_string(pos.fifty()),
+            std::string("In Check: ") + (check ? "true" : "false"),
+            "Eval: " + eval_str,
     };
 
-    std::cout << "   " << DIM << "-----------------" << RST << "\n";
+    std::cout << "   -----------------\n";
     for (int r = 7; r >= 0; --r) {
-      std::cout << " " << LBL << r + 1 << RST << " " << DIM << "|" << RST;
+      std::cout << " " << r + 1 << " |";
       for (int f = 0; f < 8; ++f) {
         const Piece pc = pos.at(create_square(File(f), Rank(r)));
-        if (pc == NO_PIECE)
-          std::cout << " " << DIM << "." << RST;
-        else
-          std::cout << " " << (color_of(pc) == WHITE ? WPC : BPC) << PIECE_STR[pc] << RST;
+        std::cout << " " << (pc == NO_PIECE ? '.' : PIECE_STR[pc]);
       }
-      std::cout << " " << DIM << "|" << RST;
+      std::cout << " |";
       if (const size_t i = size_t(7 - r); i < std::size(info))
         std::cout << " " << info[i];
       std::cout << "\n";
     }
-    std::cout << "   " << DIM << "-----------------" << RST << "\n";
-    std::cout << "     " << LBL << "A B C D E F G H" << RST << "\n";
+    std::cout << "   -----------------\n";
+    std::cout << "     A B C D E F G H\n";
   }
 
   // Handles "position [startpos | fen <fen>] [moves <m1> ...]".
