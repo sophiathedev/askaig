@@ -42,6 +42,17 @@ namespace {
   Clock::time_point  g_t0;
   int                g_split_depth = 10; // the "Split" UCI option
 
+  // Node-based time management: how many of the just-completed iteration's nodes went into
+  // the root's first-searched move (the TT/PV move from move ordering — the one we already
+  // believe is best). Reset at the start of every root call so a widened aspiration re-try
+  // only keeps the LAST attempt's count; read back in think() once the iteration returns.
+  // Deliberately tracks only this one move rather than every root move: it is always searched
+  // fully sequentially (splitting only ever farms out the SIBLINGS after it), so no split-path
+  // instrumentation is needed, and it usually IS the eventual best move — think() checks that
+  // and simply skips the adjustment on the rarer iterations where it wasn't.
+  uint64_t g_root_m1_nodes = 0;
+  Move     g_root_m1_move{};
+
   // LMR reduction table, ln(depth)*ln(moves) scaled (the "most principled" log formula).
   int  g_lmr[64][64];
   bool g_lmr_init = false;
@@ -312,6 +323,8 @@ namespace {
     t.seldepth = std::max(t.seldepth, ply);
 
     const bool root = ply == 0;
+    if (root) // fresh attempt (first call, or an aspiration re-try after a widened window)
+      g_root_m1_nodes = 0, g_root_m1_move = Move();
     if (!root) {
       if (pos.is_draw())
         return 0;
@@ -510,6 +523,7 @@ namespace {
       ss->move          = m;
       ss->ch            = &g_hist.cont[moved][m.to()];
 
+      const uint64_t nodes_before = t.nodes; // for the root's node-based time management below
       ++t.nodes;
       t.ev.push(pos, m);
       do_move(pos, m);
@@ -530,8 +544,16 @@ namespace {
         r = std::clamp(r, 0, new_depth - 1);
 
         v = -negamax<false>(t, pos, ss + 1, -alpha - 1, -alpha, new_depth - r, ply + 1, true);
-        if (v > alpha && r > 0) // reduced search beat alpha: verify at full depth
-          v = -negamax<false>(t, pos, ss + 1, -alpha - 1, -alpha, new_depth, ply + 1, !cutnode);
+        if (v > alpha && r > 0) {
+          // The reduced search beat alpha: pick a confirmation depth from how convincingly it
+          // did so against the best move found so far, then re-search at that depth. Well past
+          // best -> the move looks genuinely strong, so look one ply deeper than normal to
+          // confirm it properly; only just past alpha -> treat the reduced score as noise from
+          // the cheap search and confirm one ply shallower instead of the full new_depth.
+          const int confirm_depth =
+                  std::clamp(new_depth + int(v > best + 40) - int(v < best + 15), 1, new_depth + 1);
+          v = -negamax<false>(t, pos, ss + 1, -alpha - 1, -alpha, confirm_depth, ply + 1, !cutnode);
+        }
       } else if (!PV || move_count > 1)
         v = -negamax<false>(t, pos, ss + 1, -alpha - 1, -alpha, new_depth, ply + 1, PV ? true : !cutnode);
 
@@ -540,6 +562,10 @@ namespace {
 
       undo_move(pos, m);
       t.ev.pop();
+      if (root && move_count == 1) { // node-based time management reads this back in think()
+        g_root_m1_nodes = t.nodes - nodes_before;
+        g_root_m1_move  = m;
+      }
       if (time_up(t)) [[unlikely]] // see the qsearch move loop
         return 0;
 
@@ -753,7 +779,24 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
       info(d, res, res.nodes, ms);
     if (g_stop.load(std::memory_order_relaxed))
       break;
-    if (soft_ms > 0 && ms >= soft_ms)
+
+    // Node-based time management: scale the soft deadline by how much of this iteration's
+    // effort went into the move we already believe is best. Only meaningful once move
+    // ordering / node counts have had a few plies to settle, and only when g_root_m1_move
+    // actually IS the reported best move (the rarer case where a later move overtook it is
+    // left alone — standard soft-deadline behaviour, no scaling applied).
+    int64_t effective_soft = soft_ms;
+    if (soft_ms > 0 && d >= 5 && res.nodes >= 1000 && !res.pv.empty() &&
+        g_root_m1_move.to_from() == res.pv[0].to_from()) {
+      const double frac = double(g_root_m1_nodes) / double(res.nodes);
+      // Heavily focused on one move (frac -> 1) => confident, cut the budget down to half;
+      // effort spread thin across candidates (frac -> 0) => unclear, allow up to 1.5x.
+      const double scale = std::clamp(1.5 - frac, 0.5, 1.5);
+      effective_soft      = int64_t(double(soft_ms) * scale);
+      if (hard_ms > 0)
+        effective_soft = std::min(effective_soft, hard_ms);
+    }
+    if (soft_ms > 0 && ms >= effective_soft)
       break;
   }
 
