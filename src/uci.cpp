@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -12,7 +13,9 @@
 #include <vector>
 #include "nnue.h"
 #include "position.h"
+#include "search.h"
 #include "tables.h"
+#include "tt.h"
 #include "types.h"
 
 namespace {
@@ -23,8 +26,21 @@ namespace {
   constexpr auto ENGINE_NAME   = "Askaig " ASKAIG_VERSION;
   constexpr auto ENGINE_AUTHOR = "the Askaig developers (see AUTHORS file)";
 
-  // Number of perft worker threads (the "Threads" UCI option).
+  // Number of perft worker threads (the "Threads" UCI option; the search is single-threaded).
   int g_threads = 1;
+
+  // The search runs on this background thread so the UCI loop stays responsive (stop/isready
+  // work mid-search). g_out serialises stdout so info/bestmove lines never interleave.
+  std::thread g_search;
+  std::mutex  g_out;
+
+  // Stops any running search and joins its thread. Called before any command that mutates
+  // engine state, so a search never runs concurrently with a position/option change.
+  void stop_search() {
+    search::request_stop();
+    if (g_search.joinable())
+      g_search.join();
+  }
 
   // Largest sensible thread count to advertise/accept.
   unsigned max_threads() {
@@ -427,6 +443,62 @@ namespace {
     std::cout << "checksum " << sink << "\n"; // also a cross-build (NEON/AVX2/scalar) invariant
   }
 
+  // Formats a search score as a UCI "score ..." field: mate scores as "mate <n>" in moves.
+  std::string format_score(int score) {
+    if (score >= search::MATE_IN_MAX)
+      return "mate " + std::to_string((search::MATE - score + 1) / 2);
+    if (score <= -search::MATE_IN_MAX)
+      return "mate " + std::to_string(-((search::MATE + score + 1) / 2));
+    return "cp " + std::to_string(score);
+  }
+
+  // --- bench (search signature) ------------------------------------------------------------------
+  // Fixed positions searched at a fixed depth with a fixed-size, cleared TT: the summed node
+  // count is a deterministic signature of the search — any functional change moves it, a pure
+  // speedup does not (the `./askaig bench` OpenBench-style convention).
+  constexpr const char *BENCH_FENS[] = {
+          "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", // startpos
+          "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", // kiwipete
+          "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", // perft pos3 (rook endgame)
+          "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1", // perft pos4 (promotions)
+          "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8", // perft pos5
+          "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", // perft pos6
+          "r1bq1rk1/pp2ppbp/2np1np1/8/2BNP3/2N1BP2/PPPQ2PP/R3K2R w KQ - 0 1", // dragon yugoslav
+          "r2q1rk1/p1pnbppp/1p2pn2/8/2pP4/2N1PN2/PPQ1BPPP/R1B2RK1 w - - 0 1", // QGD
+          "2r2rk1/1bqnbpp1/1p1ppn1p/pP6/N1P1P3/P2B1N1P/1B2QPP1/R2R2K1 w - - 0 1", // hedgehog
+          "2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - 0 1", // WAC.001 (mating attack)
+          "8/8/4kpp1/3p1b2/p6P/2B5/6P1/6K1 b - - 0 1", // bishop endgame
+          "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1", // K+P vs K
+  };
+  constexpr int BENCH_DEPTH = 12;
+
+  void bench_cmd(int depth) {
+    const size_t prev_mb = tt::size_mb(); // restore the user's Hash afterwards
+    tt::resize(16); // fixed size: the signature must not depend on the Hash setting
+    uint64_t   total_nodes = 0;
+    const auto t0          = std::chrono::steady_clock::now();
+    int        i           = 0;
+    for (const char *fen: BENCH_FENS) {
+      tt::clear();
+      search::new_game(); // fresh heuristics per position -> bit-reproducible
+      Position bp;
+      Position::set(fen, bp);
+      search::Result r = search::think(bp, depth, nullptr, 0, 0);
+      total_nodes += r.nodes;
+      std::cout << "position " << ++i << "/" << std::size(BENCH_FENS) << " bestmove " << move_to_uci(r.best)
+                << " nodes " << r.nodes << "\n";
+    }
+    const auto ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    std::cout << "\nTotal time (ms) : " << ms << "\nNodes searched  : " << total_nodes
+              << "\nNodes/second    : " << (ms > 0 ? total_nodes * 1000 / static_cast<uint64_t>(ms) : total_nodes)
+              << "\n"
+              << std::flush;
+    tt::resize(prev_mb);
+    tt::clear();
+    search::new_game(); // don't leak bench heuristics into a real game
+  }
+
   // --- d / display ---------------------------------------------------------------------------
   // Board preview (plain text, no ANSI codes): piece grid, the position facts, and the current
   // static NNUE eval from the observer's (White's) point of view: + = better for White,
@@ -521,24 +593,101 @@ namespace {
     }
   }
 
-  // Handles "go ...". Only "go perft <depth> [noncache]" is implemented (a move-generation node
-  // count); the search forms (depth/movetime/wtime/...) are gone — search and evaluation are being
-  // rebuilt from scratch.
+  constexpr int     DEFAULT_DEPTH    = 12;
+  constexpr int64_t MOVE_OVERHEAD_MS = 30; // safety buffer for GUI/transport lag
+
+  // Handles "go ...". "go perft <depth> [noncache]" counts move-generation nodes; otherwise
+  // it runs the iterative-deepening search. Recognised limits: depth <n>, infinite,
+  // movetime <ms>, wtime/btime/winc/binc/movestogo. (searchmoves/ponder/nodes/mate ignored.)
   void go_cmd(Position &pos, std::istringstream &is) {
+    stop_search(); // never run two searches at once, nor search while pos can change
+
+    int         depth    = 0;
+    int64_t     movetime = 0, wtime = 0, btime = 0, winc = 0, binc = 0;
+    int         movestogo = 0;
+    bool        infinite  = false;
     std::string token;
     while (is >> token) {
       if (token == "perft") {
         int d = 1;
         is >> d;
         // Optional trailing "noncache": skip the perft-hash memoisation so every subtree is
-        // recomputed (the whole tree is walked, still bulk-counted at the leaves). Default uses the cache.
+        // recomputed (still bulk-counted at the leaves). Default uses the cache.
         std::string opt;
         const bool  use_cache = !(is >> opt && opt == "noncache");
-        run_perft(pos, d, use_cache);
+        run_perft(pos, d, use_cache); // synchronous: perft is a debug node count, not a game move
         return;
       }
+      if (token == "depth")
+        is >> depth;
+      else if (token == "movetime")
+        is >> movetime;
+      else if (token == "wtime")
+        is >> wtime;
+      else if (token == "btime")
+        is >> btime;
+      else if (token == "winc")
+        is >> winc;
+      else if (token == "binc")
+        is >> binc;
+      else if (token == "movestogo")
+        is >> movestogo;
+      else if (token == "infinite")
+        infinite = true;
     }
-    std::cout << "info string search not implemented yet (only 'go perft <depth> [noncache]')\n";
+
+    // Resolve the limits into (max_depth, soft_ms, hard_ms). Time limits drive the search to
+    // the ply ceiling and let the clock stop it; a bare depth caps the depth instead.
+    int     max_depth = DEFAULT_DEPTH;
+    int64_t soft_ms = 0, hard_ms = 0;
+    if (movetime > 0) {
+      max_depth = search::MAX_PLY;
+      hard_ms   = std::max<int64_t>(movetime - MOVE_OVERHEAD_MS, 1);
+      soft_ms   = 0; // fixed move time: run the whole budget
+    } else if (wtime > 0 || btime > 0) {
+      max_depth         = search::MAX_PLY;
+      const int64_t t   = pos.turn() == WHITE ? wtime : btime;
+      const int64_t inc = pos.turn() == WHITE ? winc : binc;
+      const int     mtg = movestogo > 0 ? movestogo : 40;
+      const int64_t avail = std::max<int64_t>(t - MOVE_OVERHEAD_MS, 1);
+      // A share of the clock plus most of the increment, hard-capped at 3x that (and never
+      // more than half the remaining time, with a small reserve so lag can't flag us).
+      const int64_t opt     = std::min<int64_t>(avail / mtg + 3 * inc / 4, std::max<int64_t>(avail / 2, 1));
+      const int64_t reserve = std::clamp<int64_t>(t / 10, MOVE_OVERHEAD_MS, 500);
+      soft_ms               = std::max<int64_t>(opt, 1);
+      hard_ms = std::max<int64_t>(1, std::min<int64_t>({3 * opt, std::max<int64_t>(avail / 2, 1), t - reserve}));
+      soft_ms = std::min(soft_ms, hard_ms);
+    } else if (infinite) {
+      max_depth = search::MAX_PLY; // effectively until "stop"
+    } else if (depth > 0)
+      max_depth = depth;
+    if (depth > 0) // an explicit depth is always an upper bound, even alongside a time limit
+      max_depth = std::min(max_depth, depth);
+
+    // Search on a background thread; the loop keeps reading stdin so "stop"/"isready" work.
+    // `pos` is safe to capture by pointer: every pos-mutating command calls stop_search() first.
+    Position *pp = &pos;
+    g_search     = std::thread([pp, max_depth, soft_ms, hard_ms]() {
+      search::Result r = search::think(
+              *pp, max_depth,
+              [](int d, const search::Result &res, uint64_t nodes, long long ms) {
+                const uint64_t              nps = ms > 0 ? nodes * 1000 / uint64_t(ms) : nodes * 1000;
+                std::lock_guard<std::mutex> lk(g_out);
+                std::cout << "info depth " << d << " seldepth " << res.seldepth << " score "
+                          << format_score(res.score) << " nodes " << nodes << " nps " << nps << " hashfull "
+                          << tt::hashfull() << " time " << ms;
+                if (!res.pv.empty()) {
+                  std::cout << " pv";
+                  for (Move m: res.pv)
+                    std::cout << " " << move_to_uci(m);
+                }
+                std::cout << "\n" << std::flush;
+              },
+              soft_ms, hard_ms);
+
+      std::lock_guard<std::mutex> lk(g_out);
+      std::cout << "bestmove " << (r.best.to_from() != 0 ? move_to_uci(r.best) : "0000") << "\n" << std::flush;
+    });
   }
 
 } // namespace
@@ -557,18 +706,27 @@ void uci::loop() {
     if (cmd == "uci") {
       std::cout << "id name " << ENGINE_NAME << "\n";
       std::cout << "id author " << ENGINE_AUTHOR << "\n";
+      std::cout << "option name Hash type spin default " << tt::DEFAULT_HASH_MB << " min 1 max 65536\n";
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
       std::cout << "option name EvalFile type string default <embedded>\n";
       std::cout << "uciok\n";
     } else if (cmd == "isready") {
-      std::cout << "readyok\n";
+      // Must answer even mid-search, so this never touches engine state.
+      std::lock_guard<std::mutex> lk(g_out);
+      std::cout << "readyok\n" << std::flush;
     } else if (cmd == "ucinewgame") {
+      stop_search();
       pos.emplace();
       Position::set(DEFAULT_FEN, *pos);
+      tt::clear();
+      search::new_game(); // history tables persist across "go"s, but not across games
     } else if (cmd == "position") {
+      stop_search();
       position_cmd(pos, is);
     } else if (cmd == "go") {
       go_cmd(*pos, is);
+    } else if (cmd == "stop") {
+      search::request_stop(); // the search thread finishes promptly and prints its bestmove
     } else if (cmd == "d" || cmd == "display") {
       display_cmd(*pos);
     } else if (cmd == "eval") {
@@ -582,11 +740,18 @@ void uci::loop() {
                   << " cp (white)\n";
       }
     } else if (cmd == "setoption") {
+      stop_search(); // resizing the TT under a running search is unsafe
       // setoption name <id> [value <x>]
       std::string token;
       std::string name;
       is >> token >> name >> token; // "name", <id>, "value"
-      if (name == "Threads") {
+      if (name == "Hash") {
+        int mb = 0;
+        if (is >> mb) {
+          mb = std::clamp(mb, 1, 65536);
+          tt::resize(size_t(mb));
+        }
+      } else if (name == "Threads") {
         int t = 0;
         if (is >> t)
           g_threads = t < 1 ? 1 : (t > 1024 ? 1024 : t);
@@ -606,11 +771,16 @@ void uci::loop() {
       }
       // (unknown options: silently ignored, per the UCI spec)
     } else if (cmd == "bench") {
-      // Hidden benchmark commands: "bench evalnps".
+      // "bench [depth]" = the search signature; "bench evalnps" = the NNUE micro-benchmark.
+      stop_search(); // bench owns the TT/heuristics while it runs
       std::string what;
       is >> what;
       if (what == "evalnps")
         bench_evalnps();
+      else {
+        const int d = what.empty() ? 0 : std::atoi(what.c_str());
+        bench_cmd(d > 0 ? d : BENCH_DEPTH);
+      }
     } else if (cmd == "selftest") {
       // Hidden test commands (not advertised): "selftest nnue [games] [maxply]".
       std::string what;
@@ -623,10 +793,13 @@ void uci::loop() {
     } else if (cmd == "register" || cmd.empty()) {
       // accepted but no-op
     } else if (cmd == "quit" || cmd == "exit") {
+      stop_search();
       break;
     }
     // unknown commands are silently ignored, as the UCI spec requires
 
     std::cout.flush();
   }
+
+  stop_search(); // joins the search thread on EOF/quit so it isn't destroyed while joinable
 }

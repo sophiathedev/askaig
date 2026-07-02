@@ -23,6 +23,9 @@ add_executable(askaig
     src/tables.cpp
     src/position.cpp
     src/nnue.cpp
+    src/tt.cpp
+    src/see.cpp
+    src/search.cpp
     src/uci.cpp
     src/main.cpp
     ${NNUE_EMBED})
