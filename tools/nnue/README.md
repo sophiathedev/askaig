@@ -1,7 +1,14 @@
 # askaig NNUE training pipeline
 
-Everything needed to produce `networks/default.nnue` — the (768→256)x2→1 SCReLU net the
-engine embeds at build time (see `src/nnue.h` for the architecture and quantization spec).
+Everything needed to produce `networks/default.nnue` — the engine's embedded net (see
+`src/nnue.h` for the exact spec):
+
+    (768 x 8 king buckets -> 512)x2 -> 1 of 8 material output buckets, SCReLU  (net v2)
+
+Features are (own-king bucket, piece, square) with kings included and horizontal mirroring
+when the perspective's king sits on files e-h; the output head is picked by material count.
+Labels: Stockfish evals (the Lichess evaluation DB provides the deepest available analysis
+per position, typically depth 18-40+), distilled via sigmoid(cp/400).
 
 ## Files
 

@@ -208,7 +208,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
     ap.add_argument("out", help="output .bf (or N for --check)")
-    ap.add_argument("--format", choices=["lichess", "result", "epd"], default="lichess")
+    ap.add_argument("--format", choices=["lichess", "jsonl", "result", "epd"], default="lichess")
     ap.add_argument("--check", action="store_true", help="decode-verify N random records of src")
     args = ap.parse_args()
     check(args) if args.check else convert(args)

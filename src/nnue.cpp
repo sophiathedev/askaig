@@ -20,27 +20,46 @@ namespace {
 
   using namespace nnue;
 
-  // The quantized network, in the exact layout the kernels read. One global copy (nets are
-  // immutable after load; every Evaluator/thread reads the same weights).
+  // The quantized network, in the exact layout the kernels read. One global copy (~6.3 MB,
+  // zero-initialised BSS; nets are immutable after load, every thread reads the same weights).
   struct Network {
     alignas(64) int16_t ft_w[FEATURES * HL]; // feature-major: row f = ft_w[f*HL .. f*HL+HL)
     alignas(64) int16_t ft_b[HL];
-    alignas(64) int16_t out_w[2 * HL]; // [0,HL) = stm half, [HL,2HL) = the other half
-    int32_t out_b;
+    alignas(64) int16_t out_w[OUT_BUCKETS][2 * HL]; // [bucket][stm half | other half]
+    int32_t out_b[OUT_BUCKETS];
   };
 
   Network g_net;
   bool    g_loaded = false;
 
-  // Feature index of (pc, s) from `persp`'s point of view (see nnue.h for the layout).
-  inline int feature_index(Color persp, Piece pc, Square s) {
-    const int c = color_of(pc);
-    const int t = type_of(pc);
-    return persp == WHITE ? 384 * c + 64 * t + s : 384 * (c ^ 1) + 64 * t + (s ^ 56);
+  // King context of a perspective given its PERSPECTIVE-ORIENTED king square (black: sq^56).
+  KingCtx king_ctx(Square oriented_ksq) {
+    const bool mir = file_of(oriented_ksq) >= EFILE;
+    const int  sq  = mir ? (oriented_ksq ^ 7) : oriented_ksq;
+    return {int8_t(KING_BUCKET[sq]), mir};
   }
 
-  inline const int16_t *ft_row(Color persp, Piece pc, Square s) {
-    return &g_net.ft_w[feature_index(persp, pc, s) * HL];
+  KingCtx king_ctx_of(const Position &pos, Color persp) {
+    const Square k = bsf(pos.bitboard_of(persp, KING));
+    return king_ctx(persp == WHITE ? k : Square(k ^ 56));
+  }
+
+  // Feature index of (pc, s) from `persp`'s point of view under king context `c`.
+  inline int feature_index(Color persp, Piece pc, Square s, KingCtx c) {
+    const int rel = color_of(pc) == persp ? 0 : 1;
+    int       sq  = persp == WHITE ? s : (s ^ 56);
+    if (c.mirror)
+      sq ^= 7;
+    return 768 * c.bucket + 64 * (6 * rel + type_of(pc)) + sq;
+  }
+
+  inline const int16_t *ft_row(Color persp, Piece pc, Square s, KingCtx c) {
+    return &g_net.ft_w[feature_index(persp, pc, s, c) * HL];
+  }
+
+  // The material output bucket: 2..32 pieces -> 0..7.
+  inline int out_bucket(const Position &pos) {
+    return (pop_count(pos.all_pieces<WHITE>() | pos.all_pieces<BLACK>()) - 2) / 4;
   }
 
   // --- Kernels ---------------------------------------------------------------------------------
@@ -48,12 +67,9 @@ namespace {
   // math (int16 adds wrap identically, int32 sums are order-independent mod 2^32), so the paths
   // are bit-identical — `selftest nnue` pins the vector paths to the scalar reference.
   //
-  // Alignment: Network/Accumulator arrays are alignas(64) and one feature row is HL*2 = 512
-  // bytes, so every row and every half is 64-byte aligned — aligned vector loads throughout,
-  // and HL divides all vector widths (no tail loops).
+  // Alignment: Network/Accumulator arrays are alignas(64) and one feature row is HL*2 bytes,
+  // so every row and half is 64-byte aligned — aligned vector loads throughout, no tail loops.
 
-  // Fused parent->child updates: one read-modify-write pass per shape, both perspectives handled
-  // by the caller. Shapes: quiet/promo = add1_sub1, capture/ep = add1_sub2, castling = add2_sub2.
 #if defined(SIMD) && defined(ARCH_AVX2)
 
   void add1_sub1(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0) {
@@ -85,9 +101,8 @@ namespace {
     }
   }
 
-  // Refresh: tiled so the accumulator tile stays in registers across all piece rows (one pass
-  // over memory per tile instead of one per piece).
-  void refresh_half(int16_t *dst, const int16_t *const *rows, int n) {
+  // Refresh: tiled so the accumulator tile stays in registers across all piece rows.
+  void refresh_kernel(int16_t *dst, const int16_t *const *rows, int n) {
     for (int i = 0; i < HL; i += 64) { // 4 x 16-lane vectors per tile
       __m256i v0 = _mm256_load_si256(reinterpret_cast<const __m256i *>(g_net.ft_b + i));
       __m256i v1 = _mm256_load_si256(reinterpret_cast<const __m256i *>(g_net.ft_b + i + 16));
@@ -108,8 +123,6 @@ namespace {
   }
 
   // One half of the SCReLU dot: sum clamp(a,0,QA) * (clamp(a,0,QA) * w) in int32 lanes.
-  // v*w fits int16 (trainer clips |w_q| <= 127); two lane-sum registers break the dependency
-  // chain; the horizontal reduction happens once, in the caller.
   __m256i dot_half(const int16_t *a, const int16_t *w) {
     const __m256i zero = _mm256_setzero_si256();
     const __m256i qa   = _mm256_set1_epi16(QA);
@@ -127,8 +140,8 @@ namespace {
     return _mm256_add_epi32(s0, s1);
   }
 
-  int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a) {
-    const __m256i s  = _mm256_add_epi32(dot_half(stm_a, g_net.out_w), dot_half(opp_a, g_net.out_w + HL));
+  int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a, const int16_t *w) {
+    const __m256i s  = _mm256_add_epi32(dot_half(stm_a, w), dot_half(opp_a, w + HL));
     __m128i       s4 = _mm_add_epi32(_mm256_castsi256_si128(s), _mm256_extracti128_si256(s, 1));
     s4               = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0x4E));
     s4               = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0xB1));
@@ -166,7 +179,7 @@ namespace {
     }
   }
 
-  void refresh_half(int16_t *dst, const int16_t *const *rows, int n) {
+  void refresh_kernel(int16_t *dst, const int16_t *const *rows, int n) {
     for (int i = 0; i < HL; i += 32) { // 4 x 8-lane vectors per tile
       int16x8_t v0 = vld1q_s16(g_net.ft_b + i);
       int16x8_t v1 = vld1q_s16(g_net.ft_b + i + 8);
@@ -193,8 +206,7 @@ namespace {
     for (int i = 0; i < HL; i += 16) {
       int16x8_t v0 = vminq_s16(vmaxq_s16(vld1q_s16(a + i), zero), qa);
       int16x8_t v1 = vminq_s16(vmaxq_s16(vld1q_s16(a + i + 8), zero), qa);
-      // v*w fits int16 exactly (|w_q| <= 127), so the low-half multiply is exact — the NEON
-      // equivalent of AVX2's mullo+madd.
+      // v*w fits int16 exactly (|w_q| <= 127) — the NEON equivalent of AVX2's mullo+madd.
       const int16x8_t p0 = vmulq_s16(v0, vld1q_s16(w + i));
       const int16x8_t p1 = vmulq_s16(v1, vld1q_s16(w + i + 8));
       s0                 = vmlal_s16(s0, vget_low_s16(v0), vget_low_s16(p0));
@@ -205,8 +217,8 @@ namespace {
     return vaddq_s32(s0, s1);
   }
 
-  int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a) {
-    return vaddvq_s32(vaddq_s32(dot_half(stm_a, g_net.out_w), dot_half(opp_a, g_net.out_w + HL)));
+  int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a, const int16_t *w) {
+    return vaddvq_s32(vaddq_s32(dot_half(stm_a, w), dot_half(opp_a, w + HL)));
   }
 
 #else // scalar reference (SIMD off / unknown arch)
@@ -225,7 +237,7 @@ namespace {
       dst[i] = static_cast<int16_t>(src[i] + a0[i] + a1[i] - s0[i] - s1[i]);
   }
 
-  void refresh_half(int16_t *dst, const int16_t *const *rows, int n) {
+  void refresh_kernel(int16_t *dst, const int16_t *const *rows, int n) {
     std::memcpy(dst, g_net.ft_b, sizeof(g_net.ft_b));
     for (int k = 0; k < n; ++k) {
       const int16_t *r = rows[k];
@@ -234,15 +246,15 @@ namespace {
     }
   }
 
-  int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a) {
+  int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a, const int16_t *w) {
     int32_t        sum     = 0;
     const int16_t *half[2] = {stm_a, opp_a};
     for (int h = 0; h < 2; ++h) {
-      const int16_t *a = half[h];
-      const int16_t *w = &g_net.out_w[h * HL];
+      const int16_t *a  = half[h];
+      const int16_t *wh = w + h * HL;
       for (int i = 0; i < HL; ++i) {
         const int32_t v = std::clamp<int32_t>(a[i], 0, QA);
-        sum += v * v * static_cast<int32_t>(w[i]); // exact: |v*v*w| <= 255*255*127 < 2^31
+        sum += v * v * static_cast<int32_t>(wh[i]); // exact: |v*v*w| <= 255*255*127 < 2^31
       }
     }
     return sum;
@@ -250,53 +262,67 @@ namespace {
 
 #endif
 
-  // Rebuilds both perspective halves of `acc` from scratch (bias + every piece on the board).
-  void acc_refresh(Accumulator &acc, const Position &pos) {
-    const int16_t *rows[2][64]; // 32 pieces max in a legal game; headroom for weird FEN input
+  // Rebuilds one perspective half of `acc` from scratch (bias + every piece, kings included).
+  void refresh_half(Accumulator &acc, Color persp, const Position &pos) {
+    const KingCtx  c = king_ctx_of(pos, persp);
+    const int16_t *rows[40]; // 32 pieces max in a legal game; headroom for weird FEN input
     int            n = 0;
     for (int pc = WHITE_PAWN; pc <= BLACK_KING; ++pc) {
       if (pc > WHITE_KING && pc < BLACK_PAWN)
         continue; // the gap in the Piece enum (6, 7)
       Bitboard bb = pos.bitboard_of(Piece(pc));
-      while (bb) {
-        const Square s  = pop_lsb(&bb);
-        rows[WHITE][n]  = ft_row(WHITE, Piece(pc), s);
-        rows[BLACK][n]  = ft_row(BLACK, Piece(pc), s);
-        ++n;
-      }
+      while (bb && n < 40)
+        rows[n++] = ft_row(persp, Piece(pc), pop_lsb(&bb), c);
     }
-    refresh_half(acc.v[WHITE], rows[WHITE], n);
-    refresh_half(acc.v[BLACK], rows[BLACK], n);
-    acc.computed = true;
+    refresh_kernel(acc.v[persp], rows, n);
+    acc.ctx[persp]      = c;
+    acc.computed[persp] = true;
   }
 
-  // Builds `child` from `parent` by applying child.dp, both perspectives in one fused pass.
-  void acc_apply(Accumulator &child, const Accumulator &parent) {
-    const DirtyPiece &dp = child.dp;
-    for (int p = 0; p < 2; ++p) {
-      const Color    persp = Color(p);
-      const int16_t *src   = parent.v[p];
-      int16_t       *dst   = child.v[p];
+  // Builds one perspective half of `child` from `parent` by applying child.dp under a king
+  // context that is KNOWN not to change (the caller checked). Kings are ordinary features.
+  void apply_half(Accumulator &child, const Accumulator &parent, Color persp) {
+    const DirtyPiece &dp  = child.dp;
+    const KingCtx     c   = parent.ctx[persp];
+    const int16_t    *src = parent.v[persp];
+    int16_t          *dst = child.v[persp];
 
-      if (dp.n_add == 2) // castling: 2 adds, 2 subs
-        add2_sub2(dst, src, ft_row(persp, dp.add_pc[0], dp.add_sq[0]), ft_row(persp, dp.add_pc[1], dp.add_sq[1]),
-                  ft_row(persp, dp.sub_pc[0], dp.sub_sq[0]), ft_row(persp, dp.sub_pc[1], dp.sub_sq[1]));
-      else if (dp.n_sub == 2) // capture / en passant: 1 add, 2 subs
-        add1_sub2(dst, src, ft_row(persp, dp.add_pc[0], dp.add_sq[0]), ft_row(persp, dp.sub_pc[0], dp.sub_sq[0]),
-                  ft_row(persp, dp.sub_pc[1], dp.sub_sq[1]));
-      else if (dp.n_add == 1) // quiet / promotion: 1 add, 1 sub
-        add1_sub1(dst, src, ft_row(persp, dp.add_pc[0], dp.add_sq[0]), ft_row(persp, dp.sub_pc[0], dp.sub_sq[0]));
-      else // null move: no feature changes
-        std::memcpy(dst, src, sizeof(int16_t) * HL);
-    }
-    child.computed = true;
+    if (dp.n_add == 2) // castling: 2 adds, 2 subs
+      add2_sub2(dst, src, ft_row(persp, dp.add_pc[0], dp.add_sq[0], c), ft_row(persp, dp.add_pc[1], dp.add_sq[1], c),
+                ft_row(persp, dp.sub_pc[0], dp.sub_sq[0], c), ft_row(persp, dp.sub_pc[1], dp.sub_sq[1], c));
+    else if (dp.n_sub == 2) // capture / en passant: 1 add, 2 subs
+      add1_sub2(dst, src, ft_row(persp, dp.add_pc[0], dp.add_sq[0], c), ft_row(persp, dp.sub_pc[0], dp.sub_sq[0], c),
+                ft_row(persp, dp.sub_pc[1], dp.sub_sq[1], c));
+    else if (dp.n_add == 1) // quiet / promotion: 1 add, 1 sub
+      add1_sub1(dst, src, ft_row(persp, dp.add_pc[0], dp.add_sq[0], c), ft_row(persp, dp.sub_pc[0], dp.sub_sq[0], c));
+    else // null move: no feature changes
+      std::memcpy(dst, src, sizeof(int16_t) * HL);
+
+    child.ctx[persp]      = c;
+    child.computed[persp] = true;
   }
 
-  // SCReLU output layer: sum over both halves of clamp(a,0,QA)^2 * w, stm half first.
-  int output_dot(const Accumulator &acc, Color stm) {
-    const int32_t sum = dot_reduce(acc.v[stm], acc.v[~stm]);
+  // True when `dp` moves `persp`'s own king (adds always contain the mover).
+  bool moves_own_king(const DirtyPiece &dp, Color persp) {
+    for (int i = 0; i < dp.n_add; ++i)
+      if (dp.add_pc[i] == make_piece(persp, KING))
+        return true;
+    return false;
+  }
+
+  // New king context after `dp` (call only when moves_own_king): from the king's add square.
+  KingCtx ctx_after(const DirtyPiece &dp, Color persp) {
+    for (int i = 0; i < dp.n_add; ++i)
+      if (dp.add_pc[i] == make_piece(persp, KING))
+        return king_ctx(persp == WHITE ? dp.add_sq[i] : Square(dp.add_sq[i] ^ 56));
+    return {0, false}; // unreachable
+  }
+
+  // SCReLU output layer through the position's material bucket, stm half first.
+  int output_dot(const Accumulator &acc, Color stm, int bucket) {
+    const int32_t sum = dot_reduce(acc.v[stm], acc.v[~stm], g_net.out_w[bucket]);
     // sum is at scale QA^2*QB; one /QA plus the bias (at QA*QB) then rescale to centipawns.
-    return ((sum / QA) + g_net.out_b) * SCALE / (QA * QB);
+    return ((sum / QA) + g_net.out_b[bucket]) * SCALE / (QA * QB);
   }
 
 } // namespace
@@ -317,9 +343,9 @@ bool nnue::load_buffer(const unsigned char *data, size_t size, std::string *err)
 
   if (std::memcmp(h.magic, "AKNN", 4) != 0)
     return fail("bad magic (not an askaig .nnue file)");
-  if (h.version != 1)
-    return fail("unsupported version");
-  if (h.features != FEATURES || h.hl != HL || h.buckets != 1)
+  if (h.version != 2)
+    return fail("unsupported version (this engine reads v2: king-bucketed 768, output buckets)");
+  if (h.features != FEATURES || h.hl != HL || h.buckets != OUT_BUCKETS)
     return fail("architecture mismatch (features/hl/buckets)");
   if (h.qa != QA || h.qb != QB || h.scale != SCALE || h.activation != 1)
     return fail("quantization/activation mismatch");
@@ -327,7 +353,8 @@ bool nnue::load_buffer(const unsigned char *data, size_t size, std::string *err)
   constexpr size_t FT_W  = sizeof(g_net.ft_w);
   constexpr size_t FT_B  = sizeof(g_net.ft_b);
   constexpr size_t OUT_W = sizeof(g_net.out_w);
-  if (size != sizeof(NetHeader) + FT_W + FT_B + OUT_W + sizeof(int32_t))
+  constexpr size_t OUT_B = sizeof(g_net.out_b);
+  if (size != sizeof(NetHeader) + FT_W + FT_B + OUT_W + OUT_B)
     return fail("file size does not match the architecture");
 
   const unsigned char *p = data + sizeof(NetHeader);
@@ -337,7 +364,7 @@ bool nnue::load_buffer(const unsigned char *data, size_t size, std::string *err)
   p += FT_B;
   std::memcpy(g_net.out_w, p, OUT_W);
   p += OUT_W;
-  std::memcpy(&g_net.out_b, p, sizeof(int32_t));
+  std::memcpy(g_net.out_b, p, OUT_B);
 
   g_loaded = true;
   return true;
@@ -365,11 +392,14 @@ bool nnue::loaded() { return g_loaded; }
 
 // --- Evaluator -----------------------------------------------------------------------------
 
-nnue::Evaluator::Evaluator() : stack(new Accumulator[MAX_PLY + 8]), top(0) { stack[0].computed = false; }
+nnue::Evaluator::Evaluator() : stack(new Accumulator[MAX_PLY + 8]), top(0) {
+  stack[0].computed[WHITE] = stack[0].computed[BLACK] = false;
+}
 
 void nnue::Evaluator::reset(const Position &pos) {
   top = 0;
-  acc_refresh(stack[0], pos);
+  refresh_half(stack[0], WHITE, pos);
+  refresh_half(stack[0], BLACK, pos);
 }
 
 // Records the feature changes of `m` (to be played on `before`) into a new stack entry.
@@ -377,9 +407,10 @@ void nnue::Evaluator::reset(const Position &pos) {
 // (the Move stores king-to-rook, e1h1), and the captured piece is read from `before`.
 void nnue::Evaluator::push(const Position &before, Move m) {
   assert(top + 1 < MAX_PLY + 8);
-  Accumulator &a = stack[++top];
-  a.computed     = false;
-  DirtyPiece &dp = a.dp;
+  Accumulator &a     = stack[++top];
+  a.computed[WHITE]  = false;
+  a.computed[BLACK]  = false;
+  DirtyPiece &dp     = a.dp;
   dp.n_add = dp.n_sub = 0;
 
   const auto add = [&dp](Piece pc, Square s) {
@@ -452,8 +483,9 @@ void nnue::Evaluator::push(const Position &before, Move m) {
 
 void nnue::Evaluator::push_null() {
   assert(top + 1 < MAX_PLY + 8);
-  Accumulator &a = stack[++top];
-  a.computed     = false;
+  Accumulator &a    = stack[++top];
+  a.computed[WHITE] = false;
+  a.computed[BLACK] = false;
   a.dp.n_add = a.dp.n_sub = 0; // no feature changes; applied as a copy
 }
 
@@ -462,29 +494,50 @@ void nnue::Evaluator::pop() {
   --top;
 }
 
-int nnue::Evaluator::evaluate(const Position &pos) {
-  assert(g_loaded);
-  if (!stack[top].computed) {
-    // Walk back to the nearest computed ancestor and apply the recorded updates forward.
-    // If none is close enough (or reset() was never called), a full refresh of the top from
-    // `pos` is cheaper than a long chain of applies (~32 row-adds vs 2-4 per ply).
-    constexpr int MAX_BACKTRACK = 24;
-    int           j             = top;
-    while (j > 0 && !stack[j].computed && top - j < MAX_BACKTRACK)
-      --j;
-    if (stack[j].computed) {
-      for (int k = j + 1; k <= top; ++k)
-        acc_apply(stack[k], stack[k - 1]);
-    } else {
-      acc_refresh(stack[top], pos);
+// Makes stack[top]'s `persp` half valid: walk back to the nearest computed ancestor and apply
+// the recorded updates forward — unless an own-king move CHANGES the (bucket, mirror) context
+// anywhere in the chain (or the chain is too long / has no computed ancestor), in which case a
+// full refresh of the half from `pos` is the only (and cheaper) option.
+void nnue::Evaluator::ensure_half(Color persp, const Position &pos) {
+  if (stack[top].computed[persp])
+    return;
+
+  constexpr int MAX_BACKTRACK = 24;
+  int           j             = top;
+  while (j > 0 && !stack[j].computed[persp] && top - j < MAX_BACKTRACK)
+    --j;
+  if (!stack[j].computed[persp]) {
+    refresh_half(stack[top], persp, pos);
+    return;
+  }
+
+  // Scan forward: any context-crossing king move forces a refresh instead.
+  KingCtx c = stack[j].ctx[persp];
+  for (int k = j + 1; k <= top; ++k) {
+    if (moves_own_king(stack[k].dp, persp)) {
+      const KingCtx nc = ctx_after(stack[k].dp, persp);
+      if (!(nc == c)) {
+        refresh_half(stack[top], persp, pos);
+        return;
+      }
+      c = nc;
     }
   }
-  return output_dot(stack[top], pos.turn());
+  for (int k = j + 1; k <= top; ++k)
+    apply_half(stack[k], stack[k - 1], persp);
+}
+
+int nnue::Evaluator::evaluate(const Position &pos) {
+  assert(g_loaded);
+  ensure_half(WHITE, pos);
+  ensure_half(BLACK, pos);
+  return output_dot(stack[top], pos.turn(), out_bucket(pos));
 }
 
 int nnue::evaluate_refresh(const Position &pos) {
   assert(g_loaded);
   Accumulator acc;
-  acc_refresh(acc, pos);
-  return output_dot(acc, pos.turn());
+  refresh_half(acc, WHITE, pos);
+  refresh_half(acc, BLACK, pos);
+  return output_dot(acc, pos.turn(), out_bucket(pos));
 }

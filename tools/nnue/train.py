@@ -57,8 +57,8 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train()
         t0, running, nb = time.time(), 0.0, 0
-        for stm, opp, score, result in train:
-            pred = model(stm, opp).squeeze(1)
+        for stm, opp, score, result, obkt in train:
+            pred = model(stm, opp, obkt).squeeze(1)
             loss = torch.mean((torch.sigmoid(pred) - target_of(score, result)) ** 2)
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -71,8 +71,8 @@ def main():
         model.eval()
         with torch.no_grad():
             vloss, vn = 0.0, 0
-            for stm, opp, score, result in val:
-                pred = model(stm, opp).squeeze(1)
+            for stm, opp, score, result, obkt in val:
+                pred = model(stm, opp, obkt).squeeze(1)
                 vloss += torch.mean((torch.sigmoid(pred) - target_of(score, result)) ** 2).item()
                 vn += 1
         vloss /= max(vn, 1)

@@ -1,14 +1,29 @@
 """Memory-mapped bulletformat reader with fully vectorized numpy decoding.
 
+Produces king-bucketed, horizontally-mirrored feature indices (kings included) matching
+src/nnue.cpp's feature_index exactly, plus the material output bucket per position.
+
 Independent of convert_fen.py's per-record Python codec on purpose: two implementations of
-the same format cross-check each other (convert_fen.py --check validates records this loader
-then consumes).
+the same format cross-check each other.
 """
 
 import numpy as np
 import torch
 
-FEATURES = 768
+KING_BUCKETS = 8
+FEATURES = KING_BUCKETS * 768  # 6144
+
+# Must match nnue::KING_BUCKET in src/nnue.h (indexed by the mirrored, persp-oriented square).
+KING_BUCKET = np.array([
+    0, 1, 2, 3, 3, 2, 1, 0,
+    4, 4, 5, 5, 5, 5, 4, 4,
+    6, 6, 6, 6, 6, 6, 6, 6,
+    6, 6, 6, 6, 6, 6, 6, 6,
+    7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7,
+], dtype=np.int64)
 
 BF_DTYPE = np.dtype([
     ("occ", "<u8"),
@@ -26,9 +41,16 @@ def open_bf(path):
     return np.memmap(path, dtype=BF_DTYPE, mode="r")
 
 
+def king_ctx(oriented_ksq):
+    """(bucket, mirror-xor-mask) per record from a perspective-oriented king square array."""
+    mir = ((oriented_ksq & 7) >= 4).astype(np.int64) * 7  # 0 or 7, xor-mask form
+    bucket = KING_BUCKET[oriented_ksq ^ mir]
+    return bucket, mir
+
+
 def decode_batch(recs):
-    """Structured slice (B,) -> (stm_idx, opp_idx (B,32) int64 padded with 768,
-    score (B,) f32 stm-relative cp, result (B,) f32 in {0, 0.5, 1} stm-relative)."""
+    """Structured slice (B,) -> (stm_idx, opp_idx (B,32) int64 padded with FEATURES,
+    score (B,) f32 stm-relative cp, result (B,) f32 in {0,0.5,1}, obkt (B,) int64)."""
     B = len(recs)
 
     # Occupied squares, ascending per record: unpack the u64 to (B, 64) bits.
@@ -52,8 +74,15 @@ def decode_batch(recs):
     typ[typ >= 6] = 3  # unmoved-rook marker used by some public writers -> plain rook
     sq = sqs.astype(np.int64)
 
-    stm_feat = 384 * col + 64 * typ + sq  # records are stm-normalized: "white" = side to move
-    opp_feat = 384 * (1 - col) + 64 * typ + (sq ^ 56)
+    # King contexts. Records are stm-normalized: "white" = side to move; ksq is the stm king
+    # (stm-persp-oriented) and opp_ksq is the opponent king already ^56'd (opp-persp-oriented).
+    b_s, m_s = king_ctx(recs["ksq"].astype(np.int64))
+    b_o, m_o = king_ctx(recs["opp_ksq"].astype(np.int64))
+    b_s, m_s = b_s[rows], m_s[rows]  # broadcast per piece
+    b_o, m_o = b_o[rows], m_o[rows]
+
+    stm_feat = 768 * b_s + 64 * (6 * col + typ) + (sq ^ m_s)
+    opp_feat = 768 * b_o + 64 * (6 * (1 - col) + typ) + ((sq ^ 56) ^ m_o)
 
     stm_idx = np.full((B, 32), FEATURES, np.int64)
     opp_idx = np.full((B, 32), FEATURES, np.int64)
@@ -62,7 +91,8 @@ def decode_batch(recs):
 
     score = recs["score"].astype(np.float32)
     result = recs["result"].astype(np.float32) / 2.0
-    return stm_idx, opp_idx, score, result
+    obkt = (counts - 2) // 4
+    return stm_idx, opp_idx, score, result, obkt
 
 
 class Batches:
@@ -81,8 +111,9 @@ class Batches:
 
     def __iter__(self):
         for lo in range(self.start, self.stop - self.batch_size + 1, self.batch_size):
-            stm, opp, score, result = decode_batch(self.arr[lo:lo + self.batch_size])
+            stm, opp, score, result, obkt = decode_batch(self.arr[lo:lo + self.batch_size])
             yield (torch.from_numpy(stm).to(self.device),
                    torch.from_numpy(opp).to(self.device),
                    torch.from_numpy(score).to(self.device),
-                   torch.from_numpy(result).to(self.device))
+                   torch.from_numpy(result).to(self.device),
+                   torch.from_numpy(obkt).to(self.device))
