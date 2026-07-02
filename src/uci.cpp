@@ -427,6 +427,78 @@ namespace {
     std::cout << "checksum " << sink << "\n"; // also a cross-build (NEON/AVX2/scalar) invariant
   }
 
+  // --- d / display ---------------------------------------------------------------------------
+  // Pretty board preview: colored piece grid, the position facts, and the current static NNUE
+  // eval from the observer's (White's) point of view: + = better for White, - = better for
+  // Black, plus the raw centipawn value.
+  void display_cmd(const Position &pos) {
+    constexpr const char *LBL = "\033[38;5;208m"; // orange labels
+    constexpr const char *WPC = "\033[1;97m"; // white pieces: bold bright white
+    constexpr const char *BPC = "\033[1;94m"; // black pieces: bright blue
+    constexpr const char *DIM = "\033[2m"; // frame / empty squares
+    constexpr const char *RST = "\033[0m";
+
+    // A castling right is lost once its king/rook "entry" squares have been touched.
+    const Bitboard entry = pos.castle_entry();
+    std::string    castles;
+    if (!(entry & WHITE_OO_MASK))
+      castles += 'K';
+    if (!(entry & WHITE_OOO_MASK))
+      castles += 'Q';
+    if (!(entry & BLACK_OO_MASK))
+      castles += 'k';
+    if (!(entry & BLACK_OOO_MASK))
+      castles += 'q';
+    if (castles.empty())
+      castles = "-";
+
+    const Square ep    = pos.history[pos.ply()].epsq;
+    const bool   check = pos.turn() == WHITE ? pos.in_check<WHITE>() : pos.in_check<BLACK>();
+
+    std::ostringstream zob;
+    zob << "0x" << std::hex << std::uppercase << pos.get_hash();
+
+    const std::string L = LBL, R = RST;
+    const std::string info[] = {
+            L + "FEN: " + R + pos.fen() + " " + std::to_string(pos.fifty()) + " " +
+                    std::to_string(pos.ply() / 2 + 1),
+            L + "Zobrist Key: " + R + zob.str(),
+            L + "Castle Rights: " + R + castles,
+            L + "Side To Move: " + R + (pos.turn() == WHITE ? "White" : "Black"),
+            L + "En Passant: " + R + (ep == NO_SQUARE ? "NULL" : SQSTR[ep]),
+            L + "Half Moves: " + R + std::to_string(pos.fifty()),
+            L + "In Check: " + R + (check ? "true" : "false"),
+    };
+
+    std::cout << "   " << DIM << "-----------------" << RST << "\n";
+    for (int r = 7; r >= 0; --r) {
+      std::cout << " " << LBL << r + 1 << RST << " " << DIM << "|" << RST;
+      for (int f = 0; f < 8; ++f) {
+        const Piece pc = pos.at(create_square(File(f), Rank(r)));
+        if (pc == NO_PIECE)
+          std::cout << " " << DIM << "." << RST;
+        else
+          std::cout << " " << (color_of(pc) == WHITE ? WPC : BPC) << PIECE_STR[pc] << RST;
+      }
+      std::cout << " " << DIM << "|" << RST;
+      if (const size_t i = size_t(7 - r); i < std::size(info))
+        std::cout << " " << info[i];
+      std::cout << "\n";
+    }
+    std::cout << "   " << DIM << "-----------------" << RST << "\n";
+    std::cout << "     " << LBL << "A B C D E F G H" << RST << "\n\n";
+
+    if (nnue::loaded()) {
+      const int   stm_cp = nnue::evaluate_refresh(pos);
+      const int   cp     = pos.turn() == WHITE ? stm_cp : -stm_cp; // observer = White's POV
+      const char *col    = cp > 0 ? "\033[92m" : (cp < 0 ? "\033[91m" : RST);
+      char        pawns[16];
+      std::snprintf(pawns, sizeof pawns, "%+.2f", cp / 100.0);
+      std::cout << " " << LBL << "Eval: " << RST << col << pawns << RST << " (cp " << cp << ")\n";
+    } else
+      std::cout << " " << LBL << "Eval: " << RST << "no net loaded\n";
+  }
+
   // Handles "position [startpos | fen <fen>] [moves <m1> ...]".
   void position_cmd(std::optional<Position> &pos, std::istringstream &is) {
     std::string token;
@@ -508,7 +580,7 @@ void uci::loop() {
     } else if (cmd == "go") {
       go_cmd(*pos, is);
     } else if (cmd == "d" || cmd == "display") {
-      std::cout << *pos;
+      display_cmd(*pos);
     } else if (cmd == "eval") {
       // Debug helper (like Stockfish's "eval"): the raw static NNUE evaluation of the current
       // position via a full accumulator refresh. No search — for net testing (see parity.py).
