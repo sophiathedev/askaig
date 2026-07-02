@@ -473,7 +473,7 @@ namespace {
             "Eval: " + eval_str,
     };
 
-    std::cout << "   -----------------\n";
+    std::cout << "   -------------------\n"; // 19 dashes: spans pipe-to-pipe of the 22-char rows
     for (int r = 7; r >= 0; --r) {
       std::cout << " " << r + 1 << " |";
       for (int f = 0; f < 8; ++f) {
@@ -485,7 +485,7 @@ namespace {
         std::cout << " " << info[i];
       std::cout << "\n";
     }
-    std::cout << "   -----------------\n";
+    std::cout << "   -------------------\n"; // 19 dashes: spans pipe-to-pipe of the 22-char rows
     std::cout << "     A B C D E F G H\n";
   }
 
