@@ -113,7 +113,10 @@ namespace nnue {
     void push(const Position &before, Move m);
     void push_null(); // pairs with Position::play_null (no feature changes)
     void pop();
-    int  evaluate(const Position &pos); // centipawns, side-to-move perspective
+    // Centipawns, side-to-move perspective. NOT pure: the lazy walk-back writes into this
+    // Evaluator's own accumulator stack as a memoization side effect (see nnue.cpp). Ignoring
+    // the result would always be a bug — hence `nodiscard`.
+    [[nodiscard]] int evaluate(const Position &pos);
 
   private:
     void ensure_half(Color persp, const Position &pos);
@@ -122,7 +125,8 @@ namespace nnue {
     int                            top;
   };
 
-  // One-shot evaluation via a full accumulator refresh (the UCI `eval` command, tests).
-  int evaluate_refresh(const Position &pos);
+  // One-shot evaluation via a full LOCAL accumulator refresh (the UCI `eval`/`d` commands,
+  // parity tests). Unlike Evaluator::evaluate, mutates no state outside the call -> `pure`.
+  [[gnu::pure, nodiscard]] int evaluate_refresh(const Position &pos);
 
 } // namespace nnue

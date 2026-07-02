@@ -7,7 +7,7 @@ namespace {
 
   // All pieces of both colors attacking `s` under occupancy `occ` (kings included — the swap
   // loop needs them; Position::attackers_from omits kings and is single-color).
-  Bitboard attackers_to(const Position &pos, Square s, Bitboard occ) {
+  [[gnu::pure, gnu::always_inline]] inline Bitboard attackers_to(const Position &pos, Square s, Bitboard occ) {
     return (pawn_attacks<WHITE>(s) & pos.bitboard_of(BLACK_PAWN)) |
            (pawn_attacks<BLACK>(s) & pos.bitboard_of(WHITE_PAWN)) |
            (attacks<KNIGHT>(s, occ) & (pos.bitboard_of(WHITE_KNIGHT) | pos.bitboard_of(BLACK_KNIGHT))) |
@@ -18,13 +18,17 @@ namespace {
   }
 
   template<Color C>
-  Bitboard color_bb(const Position &pos) {
+  [[gnu::pure, gnu::always_inline]] inline Bitboard color_bb(const Position &pos) {
     return pos.all_pieces<C>();
   }
 
 } // namespace
 
-bool search::see_ge(const Position &pos, Move m, int threshold) {
+// Called from move ordering (every capture, every node) and from three separate pruning sites
+// in the main search — one of the hottest non-inlined functions in the engine. Pure: reads
+// `pos` and the (immutable after init) attack tables, writes nothing. Ignoring the result would
+// always be a pruning/ordering bug, hence `nodiscard`.
+[[gnu::pure, gnu::hot, nodiscard]] bool search::see_ge(const Position &pos, Move m, int threshold) {
   const MoveFlags f = m.flags();
   if (f == OO || f == OOO) // castling never wins or loses material
     return 0 >= threshold;

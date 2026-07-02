@@ -32,8 +32,9 @@ namespace tt {
   void new_search(); // bumps the generation (called once per "go")
 
   // Returns the matching entry (and sets found), or the replacement candidate slot to store into.
-  Entry *probe(uint64_t key, bool &found);
-  void   store(Entry *e, uint64_t key, Move m, int score, int eval, int depth, Bound b, bool pv);
+  [[gnu::hot, nodiscard]] Entry *probe(uint64_t key, bool &found);
+  [[gnu::hot]] void              store(Entry *e, uint64_t key, Move m, int score, int eval, int depth, Bound b,
+                                       bool pv);
 
   size_t size_mb();
   int    hashfull(); // per-mille of recently-written entries, sampled

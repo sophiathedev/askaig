@@ -16,7 +16,11 @@ namespace {
   size_t   g_mb       = 0;
   uint8_t  g_gen      = 0; // stepped by 8 per search; low 3 bits of genbound hold pv|bound
 
-  inline uint8_t age_of(uint8_t genbound) { return uint8_t((g_gen - (genbound & 0xF8)) & 0xF8); }
+  // Reads the mutable-but-effectively-frozen-per-search global `g_gen` (bumped once per "go" by
+  // new_search()), no side effects — safe as `pure`; tiny and called up to 3x per probe.
+  [[gnu::pure, gnu::always_inline]] inline uint8_t age_of(uint8_t genbound) {
+    return uint8_t((g_gen - (genbound & 0xF8)) & 0xF8);
+  }
 
 } // namespace
 
@@ -42,7 +46,10 @@ void tt::clear() {
 
 void tt::new_search() { g_gen += 8; }
 
-tt::Entry *tt::probe(uint64_t key, bool &found) {
+// Called at every negamax/qsearch node. NOT pure — a hit refreshes the entry's age in place,
+// a real side effect the replacement scheme depends on. The returned pointer is always meant
+// to be read or stored through by the caller; discarding it would be a bug.
+[[gnu::hot, nodiscard]] tt::Entry *tt::probe(uint64_t key, bool &found) {
   Cluster       &c   = g_table[key & (g_clusters - 1)];
   const uint16_t k16 = uint16_t(key >> 48);
 
@@ -62,7 +69,9 @@ tt::Entry *tt::probe(uint64_t key, bool &found) {
   return victim;
 }
 
-void tt::store(Entry *e, uint64_t key, Move m, int score, int eval, int depth, Bound b, bool pv) {
+// Called at (almost) every negamax/qsearch node on the way back up — hot, and inherently
+// side-effecting (writes the slot), so no purity attributes apply.
+[[gnu::hot]] void tt::store(Entry *e, uint64_t key, Move m, int score, int eval, int depth, Bound b, bool pv) {
   const uint16_t k16 = uint16_t(key >> 48);
   // Keep the old move when the new search found none; don't overwrite a same-key entry that is
   // deeper unless the new bound is EXACT (standard preserve-depth policy).

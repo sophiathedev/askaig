@@ -125,23 +125,27 @@ namespace search {
   int        quiet_history(const Stack *ss, const Position &pos, Move m);
 
   // --- tiny shared helpers ----------------------------------------------------------------------
-  inline void do_move(Position &p, Move m) {
+  // Called at every make/unmake in the whole tree: force-inlined dispatch wrappers. Both mutate
+  // `p`, so neither is `pure`/`const`.
+  [[gnu::always_inline, gnu::hot]] inline void do_move(Position &p, Move m) {
     if (p.turn() == WHITE)
       p.play<WHITE>(m);
     else
       p.play<BLACK>(m);
   }
-  inline void undo_move(Position &p, Move m) {
+  [[gnu::always_inline, gnu::hot]] inline void undo_move(Position &p, Move m) {
     if (p.turn() == WHITE)
       p.undo<BLACK>(m);
     else
       p.undo<WHITE>(m);
   }
-  inline bool is_quiet(Move m) {
+  // Move is a value type (a plain uint16_t underneath) — zero memory access, so `const`
+  // (the strongest attribute) applies, not just `pure`.
+  [[gnu::const, gnu::always_inline]] inline bool is_quiet(Move m) {
     const MoveFlags f = m.flags();
     return f == QUIET || f == DOUBLE_PUSH || f == OO || f == OOO;
   }
-  inline bool stm_in_check(const Position &p) {
+  [[gnu::pure, gnu::always_inline]] inline bool stm_in_check(const Position &p) {
     return p.turn() == WHITE ? p.in_check<WHITE>() : p.in_check<BLACK>();
   }
 

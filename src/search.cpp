@@ -51,27 +51,36 @@ namespace {
         g_lmr[d][m] = int(0.8 + std::log(d) * std::log(m) / 2.3);
     g_lmr_init = true;
   }
-  int lmr_base(int depth, int movecount) { return g_lmr[std::min(depth, 63)][std::min(movecount, 63)]; }
+  // Reads a global filled once (init_lmr, before any search starts) and never written again —
+  // safe as `pure` (no side effects; the memory it reads is effectively frozen for the caller).
+  [[gnu::pure, gnu::always_inline]] inline int lmr_base(int depth, int movecount) {
+    return g_lmr[std::min(depth, 63)][std::min(movecount, 63)];
+  }
 
   // --- small helpers ----------------------------------------------------------------------------
+  // Tiny, extremely hot leaf functions (called at every node/move): `always_inline` matches the
+  // existing idiom in simd.h/tables.h for functions this small and this frequently called.
+  // `const`/`pure` follow GNU semantics precisely: `const` only for functions with zero memory
+  // reads (pure arithmetic on by-value arguments); `pure` for functions that read memory
+  // (Position, history tables) but have no side effects of their own.
 
   // The engine Zobrist hash omits castling rights and the en-passant square (they change the
   // legal moves, so two positions differing only there must not share a TT slot) — mix them in.
-  uint64_t tt_key(const Position &p) {
+  [[gnu::pure, gnu::always_inline]] inline uint64_t tt_key(const Position &p) {
     return p.get_hash() ^ ((p.castle_entry() & ALL_CASTLING_MASK) * 0x9E3779B97F4A7C15ull) ^
            (uint64_t(uint16_t(p.history[p.ply()].epsq)) * 0xC2B2AE3D27D4EB4Full);
   }
 
   // Correction-history keys. Each is a cheap position-derived hash into a CORR_SIZE table —
   // collisions just blend unrelated positions' corrections, no correctness impact.
-  size_t pawn_corr_index(const Position &p) {
+  [[gnu::pure, gnu::always_inline]] inline size_t pawn_corr_index(const Position &p) {
     const uint64_t w = p.bitboard_of(WHITE_PAWN) * 0x9E3779B97F4A7C15ull;
     const uint64_t b = p.bitboard_of(BLACK_PAWN) * 0xC2B2AE3D27D4EB4Full;
     return (w ^ (b + 0x165667B19E3779F9ull + (w << 6) + (w >> 2))) & (Histories::CORR_SIZE - 1);
   }
   // Non-pawn material imbalance: piece-TYPE COUNTS (not placement), so it fires on trades and
   // promotions rather than on where the pieces happen to stand.
-  size_t material_corr_index(const Position &p) {
+  [[gnu::pure, gnu::always_inline]] inline size_t material_corr_index(const Position &p) {
     uint64_t key = 0;
     for (int pt = KNIGHT; pt <= QUEEN; ++pt) {
       key = key * 9 + uint64_t(pop_count(p.bitboard_of(make_piece(WHITE, PieceType(pt)))));
@@ -79,27 +88,32 @@ namespace {
     }
     return (key * 0x9E3779B97F4A7C15ull) & (Histories::CORR_SIZE - 1);
   }
-  size_t minor_corr_index(const Position &p) {
+  [[gnu::pure, gnu::always_inline]] inline size_t minor_corr_index(const Position &p) {
     const Bitboard minors = p.bitboard_of(WHITE_KNIGHT) | p.bitboard_of(WHITE_BISHOP) |
                             p.bitboard_of(BLACK_KNIGHT) | p.bitboard_of(BLACK_BISHOP);
     return (minors * 0x9E3779B97F4A7C15ull) & (Histories::CORR_SIZE - 1);
   }
-  size_t major_corr_index(const Position &p) {
+  [[gnu::pure, gnu::always_inline]] inline size_t major_corr_index(const Position &p) {
     const Bitboard majors = p.bitboard_of(WHITE_ROOK) | p.bitboard_of(WHITE_QUEEN) |
                             p.bitboard_of(BLACK_ROOK) | p.bitboard_of(BLACK_QUEEN);
     return (majors * 0xC2B2AE3D27D4EB4Full) & (Histories::CORR_SIZE - 1);
   }
 
-  // Mate scores are stored ply-relative in the TT ("mate in N from HERE").
-  int to_tt(int v, int ply) { return v >= MATE_IN_MAX ? v + ply : v <= -MATE_IN_MAX ? v - ply : v; }
-  int from_tt(int v, int ply) { return v >= MATE_IN_MAX ? v - ply : v <= -MATE_IN_MAX ? v + ply : v; }
+  // Mate scores are stored ply-relative in the TT ("mate in N from HERE"). Pure arithmetic on
+  // scalar arguments only, no memory touched at all — `const` (stronger than `pure`) applies.
+  [[gnu::const, gnu::always_inline]] inline int to_tt(int v, int ply) {
+    return v >= MATE_IN_MAX ? v + ply : v <= -MATE_IN_MAX ? v - ply : v;
+  }
+  [[gnu::const, gnu::always_inline]] inline int from_tt(int v, int ply) {
+    return v >= MATE_IN_MAX ? v - ply : v <= -MATE_IN_MAX ? v + ply : v;
+  }
 
   // Sum of all correction-history tables for this node: pawn skeleton, non-pawn material,
   // minor- and major-piece placement, and the continuation table keyed by the previous move
   // (piece, to) — skipped at the root and right after a null move, where there is none.
   // Divided by a larger constant than a single table would need (256 vs. the old 64) so five
   // tables agreeing doesn't blow the correction past what one confident table used to give.
-  int correction(const Position &pos, const Stack *ss) {
+  [[gnu::pure, gnu::hot]] int correction(const Position &pos, const Stack *ss) {
     const Color c    = pos.turn();
     int         corr = g_hist.corr_pawn[c][pawn_corr_index(pos)] + g_hist.corr_material[c][material_corr_index(pos)] +
                 g_hist.corr_minor[c][minor_corr_index(pos)] + g_hist.corr_major[c][major_corr_index(pos)];
@@ -108,14 +122,19 @@ namespace {
     return corr / 256;
   }
 
-  // Static eval + the learned corrections, clamped out of the mate range.
-  int evaluate(ThreadData &t, const Position &pos, const Stack *ss) {
+  // Static eval + the learned corrections, clamped out of the mate range. NOT pure: t.ev's
+  // lazy accumulator walk-back writes into t's (real, cross-call-persistent) accumulator cache
+  // as a side effect — not just a local computation — so `pure` would be incorrect here even
+  // though the observable result is deterministic. Called at nearly every node; discarding the
+  // result would always be a bug.
+  [[gnu::hot, nodiscard]] int evaluate(ThreadData &t, const Position &pos, const Stack *ss) {
     const int raw = t.ev.evaluate(pos);
     return std::clamp(raw + correction(pos, ss), -MATE_IN_MAX + 1, MATE_IN_MAX - 1);
   }
 
-  // A stop/abort poll for the tree: aborted() plus the hard clock.
-  bool time_up(ThreadData &t) {
+  // A stop/abort poll for the tree: aborted() plus the hard clock. NOT pure — it can flip
+  // g_stop on timeout, a real side effect every other node in this file relies on.
+  [[gnu::hot]] bool time_up(ThreadData &t) {
     if (aborted(t))
       return true;
     if (g_hard_ms > 0 && (t.nodes & 2047) == 0) {
@@ -128,9 +147,9 @@ namespace {
     return false;
   }
 
-  int hist_bonus(int depth) { return std::min(160 * depth - 80, 2000); }
+  [[gnu::const, gnu::always_inline]] inline int hist_bonus(int depth) { return std::min(160 * depth - 80, 2000); }
 
-  int quiet_hist(const Stack *ss, const Position &pos, Move m) {
+  [[gnu::pure, gnu::always_inline]] inline int quiet_hist(const Stack *ss, const Position &pos, Move m) {
     const Piece pc = pos.at(m.from());
     int         h  = g_hist.butterfly[pos.turn()][m.from()][m.to()];
     if ((ss - 1)->ch)
@@ -140,7 +159,8 @@ namespace {
     return h;
   }
 
-  void update_quiet_hists(Stack *ss, const Position &pos, Move best, const Move *tried, int n_tried, int depth) {
+  [[gnu::hot]] void update_quiet_hists(Stack *ss, const Position &pos, Move best, const Move *tried, int n_tried,
+                                       int depth) {
     const int  bonus = hist_bonus(depth);
     const auto touch = [&](Move m, int b) {
       const Piece pc = pos.at(m.from());
@@ -159,7 +179,7 @@ namespace {
     }
   }
 
-  void update_capture_hists(const Position &pos, Move best, const Move *tried, int n_tried, int depth) {
+  [[gnu::hot]] void update_capture_hists(const Position &pos, Move best, const Move *tried, int n_tried, int depth) {
     const int  bonus = hist_bonus(depth);
     const auto touch = [&](Move m, int b) {
       const PieceType captured = m.flags() == EN_PASSANT ? PAWN : type_of(pos.at(m.to()));
@@ -171,10 +191,12 @@ namespace {
       touch(tried[i], -bonus);
   }
 
+  // The two hottest functions in the engine: every node passes through one of these.
   template<bool PV>
-  int qsearch(ThreadData &t, Position &pos, Stack *ss, int alpha, int beta, int ply);
+  [[gnu::hot]] int qsearch(ThreadData &t, Position &pos, Stack *ss, int alpha, int beta, int ply);
   template<bool PV>
-  int negamax(ThreadData &t, Position &pos, Stack *ss, int alpha, int beta, int depth, int ply, bool cutnode);
+  [[gnu::hot]] int negamax(ThreadData &t, Position &pos, Stack *ss, int alpha, int beta, int depth, int ply,
+                           bool cutnode);
 
   // --- YBWC split machinery ---------------------------------------------------------------------
 
@@ -184,7 +206,7 @@ namespace {
   // --- quiescence -------------------------------------------------------------------------------
 
   template<bool PV>
-  int qsearch(ThreadData &t, Position &pos, Stack *ss, int alpha, int beta, int ply) {
+  [[gnu::hot]] int qsearch(ThreadData &t, Position &pos, Stack *ss, int alpha, int beta, int ply) {
     if constexpr (PV)
       ss->pv_len = 0;
     t.seldepth = std::max(t.seldepth, ply);
@@ -192,7 +214,7 @@ namespace {
       return 0;
     if (pos.is_draw())
       return 0;
-    if (ply >= MAX_PLY)
+    if (ply >= MAX_PLY) [[unlikely]] // needs a 120-ply-deep line; essentially never happens
       return evaluate(t, pos, ss);
 
     const bool     in_check = stm_in_check(pos);
@@ -246,7 +268,9 @@ namespace {
       const int v = -qsearch<PV>(t, pos, ss + 1, -beta, -alpha, ply + 1);
       undo_move(pos, m);
       t.ev.pop();
-      if (g_stop.load(std::memory_order_relaxed))
+      // Checked on every move at every node; true exactly once, ever, for the whole search
+      // (when time runs out) — about as skewed a branch as exists in this file.
+      if (g_stop.load(std::memory_order_relaxed)) [[unlikely]]
         return 0;
 
       if (v > best) {
@@ -276,7 +300,8 @@ namespace {
   // --- main search ------------------------------------------------------------------------------
 
   template<bool PV>
-  int negamax(ThreadData &t, Position &pos, Stack *ss, int alpha, int beta, int depth, int ply, bool cutnode) {
+  [[gnu::hot]] int negamax(ThreadData &t, Position &pos, Stack *ss, int alpha, int beta, int depth, int ply,
+                           bool cutnode) {
     if (depth <= 0)
       return qsearch<PV>(t, pos, ss, alpha, beta, ply);
 
@@ -290,12 +315,13 @@ namespace {
     if (!root) {
       if (pos.is_draw())
         return 0;
-      if (ply >= MAX_PLY)
+      if (ply >= MAX_PLY) [[unlikely]] // needs a 120-ply-deep line; essentially never happens
         return evaluate(t, pos, ss);
-      // Mate distance pruning.
+      // Mate distance pruning: only bites once a shorter mate is already known on another
+      // line, so alpha/beta collapsing here is rare outside forced-mate endgames.
       alpha = std::max(alpha, -MATE + ply);
       beta  = std::min(beta, MATE - ply - 1);
-      if (alpha >= beta)
+      if (alpha >= beta) [[unlikely]]
         return alpha;
     }
 
@@ -378,7 +404,7 @@ namespace {
         const int v = -negamax<false>(t, pos, ss + 1, -beta, -beta + 1, depth - R, ply + 1, !cutnode);
         pos.undo_null();
         t.ev.pop();
-        if (g_stop.load(std::memory_order_relaxed))
+        if (g_stop.load(std::memory_order_relaxed)) [[unlikely]] // see the qsearch move loop
           return 0;
         if (v >= beta)
           return v >= MATE_IN_MAX ? beta : v; // don't return unproven mates
@@ -404,7 +430,7 @@ namespace {
             v = -negamax<false>(t, pos, ss + 1, -pc_beta, -pc_beta + 1, depth - 4, ply + 1, !cutnode);
           undo_move(pos, m);
           t.ev.pop();
-          if (g_stop.load(std::memory_order_relaxed))
+          if (g_stop.load(std::memory_order_relaxed)) [[unlikely]] // see the qsearch move loop
             return 0;
           if (v >= pc_beta) {
             tt::store(tte, key, m, to_tt(v, ply), raw_eval, depth - 3, tt::LOWER, false);
@@ -514,7 +540,7 @@ namespace {
 
       undo_move(pos, m);
       t.ev.pop();
-      if (time_up(t))
+      if (time_up(t)) [[unlikely]] // see the qsearch move loop
         return 0;
 
       if (quiet) {
@@ -582,7 +608,7 @@ namespace {
 
         run_split(t, sp, pos, ss); // register + master claim loop + abort + wait (ybwc.cpp)
 
-        if (g_stop.load(std::memory_order_relaxed))
+        if (g_stop.load(std::memory_order_relaxed)) [[unlikely]] // see the qsearch move loop
           return 0;
 
         // Merge the split result.

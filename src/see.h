@@ -12,6 +12,6 @@ namespace search {
   // Static exchange evaluation: true iff the capture sequence started by `m` on its target
   // square wins at least `threshold` centipawns (standard swap algorithm, both colors'
   // attackers including kings, with x-ray reveals).
-  bool see_ge(const Position &pos, Move m, int threshold);
+  [[gnu::pure, gnu::hot, nodiscard]] bool see_ge(const Position &pos, Move m, int threshold);
 
 } // namespace search

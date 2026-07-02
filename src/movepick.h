@@ -18,8 +18,10 @@ namespace search {
   class MovePicker {
   public:
     // ch1/ch2: continuation-history slices of the previous and the move before it (nullable).
-    MovePicker(Position &pos, const Histories &hist, Move ttm, const Move *killers, const ContTable *ch1,
-               const ContTable *ch2, bool quiescence)
+    // Constructed at every node (main search) or pruning probe (QS/ProbCut) — hot, but not
+    // `pure`: it writes the picker's own move/score arrays, a real (if purely local) effect.
+    [[gnu::hot]] MovePicker(Position &pos, const Histories &hist, Move ttm, const Move *killers,
+                            const ContTable *ch1, const ContTable *ch2, bool quiescence)
         : n(0), cur(0) {
       Move buf[218];
       const size_t cnt =
@@ -59,8 +61,9 @@ namespace search {
       }
     }
 
-    // Yields the next-best move, or a null move (to_from() == 0) when exhausted.
-    Move next() {
+    // Yields the next-best move, or a null move (to_from() == 0) when exhausted. Called in a
+    // tight loop at every node; discarding the result would silently skip a move.
+    [[gnu::hot, nodiscard]] Move next() {
       if (cur >= n)
         return Move();
       size_t best = cur;

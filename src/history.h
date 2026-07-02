@@ -12,7 +12,9 @@ namespace search {
 
   constexpr int HIST_MAX = 16384;
 
-  inline void hist_update(int16_t &h, int bonus) {
+  // Writes through `h` (a real side effect), so it can't be `pure`/`const` — but it's tiny and
+  // called several times per history update at every cutoff node, so force-inline it.
+  [[gnu::always_inline, gnu::hot]] inline void hist_update(int16_t &h, int bonus) {
     h = static_cast<int16_t>(h + bonus - int(h) * std::abs(bonus) / HIST_MAX);
   }
 

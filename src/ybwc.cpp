@@ -13,14 +13,17 @@ namespace {
 
   using namespace search;
 
-  Position clone_position(const Position &src) { // Position is plain data; memcpy is a faithful copy
+  // Position is plain data; memcpy is a faithful copy. Reads through `src`, writes nothing
+  // observable outside the returned value — `pure`, not `const` (it dereferences a reference).
+  [[gnu::pure]] Position clone_position(const Position &src) {
     Position dst;
     std::memcpy(static_cast<void *>(&dst), static_cast<const void *>(&src), sizeof(Position));
     return dst;
   }
 
   // One parallel sibling. Returns INT32_MIN when the move was pruned, else the search value.
-  int split_move(ThreadData &t, SplitPoint &sp, Position &pos, Stack *ss, Move m, int move_count) {
+  // Mirrors the sequential move loop's tail in search.cpp in hotness, not just in logic.
+  [[gnu::hot]] int split_move(ThreadData &t, SplitPoint &sp, Position &pos, Stack *ss, Move m, int move_count) {
     const int  depth     = sp.depth;
     const int  ply       = sp.ply;
     const bool quiet     = is_quiet(m);
@@ -83,7 +86,7 @@ namespace {
 
   // Claims and searches sibling moves from `sp` until exhausted/cut. Used by the master (on
   // its own position) and by pool helpers (on a clone). Results land in sp.{best,alpha,...}.
-  void split_claim_loop(ThreadData &t, SplitPoint &sp, Position &pos, Stack *ss) {
+  [[gnu::hot]] void split_claim_loop(ThreadData &t, SplitPoint &sp, Position &pos, Stack *ss) {
     while (!aborted(t)) {
       const size_t idx = sp.next.fetch_add(1, std::memory_order_relaxed);
       if (idx >= sp.moves.size())

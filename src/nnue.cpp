@@ -33,19 +33,24 @@ namespace {
   bool    g_loaded = false;
 
   // King context of a perspective given its PERSPECTIVE-ORIENTED king square (black: sq^56).
-  KingCtx king_ctx(Square oriented_ksq) {
+  // Reads the immutable global KING_BUCKET table -> `pure`, not `const` (const forbids any
+  // memory dereference, even of an unwritable global). Called per accumulator refresh/update.
+  [[gnu::pure, gnu::always_inline]] inline KingCtx king_ctx(Square oriented_ksq) {
     const bool mir = file_of(oriented_ksq) >= EFILE;
     const int  sq  = mir ? (oriented_ksq ^ 7) : oriented_ksq;
     return {int8_t(KING_BUCKET[sq]), mir};
   }
 
-  KingCtx king_ctx_of(const Position &pos, Color persp) {
+  [[gnu::pure, gnu::always_inline]] inline KingCtx king_ctx_of(const Position &pos, Color persp) {
     const Square k = bsf(pos.bitboard_of(persp, KING));
     return king_ctx(persp == WHITE ? k : Square(k ^ 56));
   }
 
-  // Feature index of (pc, s) from `persp`'s point of view under king context `c`.
-  inline int feature_index(Color persp, Piece pc, Square s, KingCtx c) {
+  // Feature index of (pc, s) from `persp`'s point of view under king context `c`. Every
+  // argument is passed by value and only bit-twiddled — zero memory access, so `const`
+  // (stronger than `pure`) applies. Called per active feature, per accumulator update/refresh:
+  // one of the hottest functions in the whole engine.
+  [[gnu::const, gnu::always_inline]] inline int feature_index(Color persp, Piece pc, Square s, KingCtx c) {
     const int rel = color_of(pc) == persp ? 0 : 1;
     int       sq  = persp == WHITE ? s : (s ^ 56);
     if (c.mirror)
@@ -53,12 +58,13 @@ namespace {
     return 768 * c.bucket + 64 * (6 * rel + type_of(pc)) + sq;
   }
 
-  inline const int16_t *ft_row(Color persp, Piece pc, Square s, KingCtx c) {
+  // Reads the network weights (immutable once loaded) -> `pure`.
+  [[gnu::pure, gnu::always_inline]] inline const int16_t *ft_row(Color persp, Piece pc, Square s, KingCtx c) {
     return &g_net.ft_w[feature_index(persp, pc, s, c) * HL];
   }
 
-  // The material output bucket: 2..32 pieces -> 0..7.
-  inline int out_bucket(const Position &pos) {
+  // The material output bucket: 2..32 pieces -> 0..7. Called once per evaluate().
+  [[gnu::pure, gnu::always_inline]] inline int out_bucket(const Position &pos) {
     return (pop_count(pos.all_pieces<WHITE>() | pos.all_pieces<BLACK>()) - 2) / 4;
   }
 
@@ -72,7 +78,7 @@ namespace {
 
 #if defined(SIMD) && defined(ARCH_AVX2)
 
-  void add1_sub1(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0) {
+  [[gnu::hot]] void add1_sub1(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0) {
     for (int i = 0; i < HL; i += 16) {
       __m256i v = _mm256_load_si256(reinterpret_cast<const __m256i *>(src + i));
       v         = _mm256_add_epi16(v, _mm256_load_si256(reinterpret_cast<const __m256i *>(a0 + i)));
@@ -80,7 +86,7 @@ namespace {
       _mm256_store_si256(reinterpret_cast<__m256i *>(dst + i), v);
     }
   }
-  void add1_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0, const int16_t *s1) {
+  [[gnu::hot]] void add1_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0, const int16_t *s1) {
     for (int i = 0; i < HL; i += 16) {
       __m256i v = _mm256_load_si256(reinterpret_cast<const __m256i *>(src + i));
       v         = _mm256_add_epi16(v, _mm256_load_si256(reinterpret_cast<const __m256i *>(a0 + i)));
@@ -89,7 +95,7 @@ namespace {
       _mm256_store_si256(reinterpret_cast<__m256i *>(dst + i), v);
     }
   }
-  void add2_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *a1, const int16_t *s0,
+  [[gnu::hot]] void add2_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *a1, const int16_t *s0,
                  const int16_t *s1) {
     for (int i = 0; i < HL; i += 16) {
       __m256i v = _mm256_load_si256(reinterpret_cast<const __m256i *>(src + i));
@@ -102,7 +108,7 @@ namespace {
   }
 
   // Refresh: tiled so the accumulator tile stays in registers across all piece rows.
-  void refresh_kernel(int16_t *dst, const int16_t *const *rows, int n) {
+  [[gnu::hot]] void refresh_kernel(int16_t *dst, const int16_t *const *rows, int n) {
     for (int i = 0; i < HL; i += 64) { // 4 x 16-lane vectors per tile
       __m256i v0 = _mm256_load_si256(reinterpret_cast<const __m256i *>(g_net.ft_b + i));
       __m256i v1 = _mm256_load_si256(reinterpret_cast<const __m256i *>(g_net.ft_b + i + 16));
@@ -123,7 +129,7 @@ namespace {
   }
 
   // One half of the SCReLU dot: sum clamp(a,0,QA) * (clamp(a,0,QA) * w) in int32 lanes.
-  __m256i dot_half(const int16_t *a, const int16_t *w) {
+  [[gnu::pure, gnu::hot]] __m256i dot_half(const int16_t *a, const int16_t *w) {
     const __m256i zero = _mm256_setzero_si256();
     const __m256i qa   = _mm256_set1_epi16(QA);
     __m256i       s0 = zero, s1 = zero;
@@ -140,7 +146,7 @@ namespace {
     return _mm256_add_epi32(s0, s1);
   }
 
-  int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a, const int16_t *w) {
+  [[gnu::pure, gnu::hot]] int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a, const int16_t *w) {
     const __m256i s  = _mm256_add_epi32(dot_half(stm_a, w), dot_half(opp_a, w + HL));
     __m128i       s4 = _mm_add_epi32(_mm256_castsi256_si128(s), _mm256_extracti128_si256(s, 1));
     s4               = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0x4E));
@@ -150,7 +156,7 @@ namespace {
 
 #elif defined(SIMD) && defined(ARCH_ARM_NEON)
 
-  void add1_sub1(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0) {
+  [[gnu::hot]] void add1_sub1(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0) {
     for (int i = 0; i < HL; i += 8) {
       int16x8_t v = vld1q_s16(src + i);
       v           = vaddq_s16(v, vld1q_s16(a0 + i));
@@ -158,7 +164,7 @@ namespace {
       vst1q_s16(dst + i, v);
     }
   }
-  void add1_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0, const int16_t *s1) {
+  [[gnu::hot]] void add1_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0, const int16_t *s1) {
     for (int i = 0; i < HL; i += 8) {
       int16x8_t v = vld1q_s16(src + i);
       v           = vaddq_s16(v, vld1q_s16(a0 + i));
@@ -167,7 +173,7 @@ namespace {
       vst1q_s16(dst + i, v);
     }
   }
-  void add2_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *a1, const int16_t *s0,
+  [[gnu::hot]] void add2_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *a1, const int16_t *s0,
                  const int16_t *s1) {
     for (int i = 0; i < HL; i += 8) {
       int16x8_t v = vld1q_s16(src + i);
@@ -179,7 +185,7 @@ namespace {
     }
   }
 
-  void refresh_kernel(int16_t *dst, const int16_t *const *rows, int n) {
+  [[gnu::hot]] void refresh_kernel(int16_t *dst, const int16_t *const *rows, int n) {
     for (int i = 0; i < HL; i += 32) { // 4 x 8-lane vectors per tile
       int16x8_t v0 = vld1q_s16(g_net.ft_b + i);
       int16x8_t v1 = vld1q_s16(g_net.ft_b + i + 8);
@@ -199,7 +205,7 @@ namespace {
     }
   }
 
-  int32x4_t dot_half(const int16_t *a, const int16_t *w) {
+  [[gnu::pure, gnu::hot]] int32x4_t dot_half(const int16_t *a, const int16_t *w) {
     const int16x8_t zero = vdupq_n_s16(0);
     const int16x8_t qa   = vdupq_n_s16(QA);
     int32x4_t       s0 = vdupq_n_s32(0), s1 = vdupq_n_s32(0);
@@ -217,27 +223,27 @@ namespace {
     return vaddq_s32(s0, s1);
   }
 
-  int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a, const int16_t *w) {
+  [[gnu::pure, gnu::hot]] int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a, const int16_t *w) {
     return vaddvq_s32(vaddq_s32(dot_half(stm_a, w), dot_half(opp_a, w + HL)));
   }
 
 #else // scalar reference (SIMD off / unknown arch)
 
-  void add1_sub1(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0) {
+  [[gnu::hot]] void add1_sub1(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0) {
     for (int i = 0; i < HL; ++i)
       dst[i] = static_cast<int16_t>(src[i] + a0[i] - s0[i]);
   }
-  void add1_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0, const int16_t *s1) {
+  [[gnu::hot]] void add1_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0, const int16_t *s1) {
     for (int i = 0; i < HL; ++i)
       dst[i] = static_cast<int16_t>(src[i] + a0[i] - s0[i] - s1[i]);
   }
-  void add2_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *a1, const int16_t *s0,
+  [[gnu::hot]] void add2_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *a1, const int16_t *s0,
                  const int16_t *s1) {
     for (int i = 0; i < HL; ++i)
       dst[i] = static_cast<int16_t>(src[i] + a0[i] + a1[i] - s0[i] - s1[i]);
   }
 
-  void refresh_kernel(int16_t *dst, const int16_t *const *rows, int n) {
+  [[gnu::hot]] void refresh_kernel(int16_t *dst, const int16_t *const *rows, int n) {
     std::memcpy(dst, g_net.ft_b, sizeof(g_net.ft_b));
     for (int k = 0; k < n; ++k) {
       const int16_t *r = rows[k];
@@ -246,7 +252,7 @@ namespace {
     }
   }
 
-  int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a, const int16_t *w) {
+  [[gnu::pure, gnu::hot]] int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a, const int16_t *w) {
     int32_t        sum     = 0;
     const int16_t *half[2] = {stm_a, opp_a};
     for (int h = 0; h < 2; ++h) {
@@ -263,7 +269,7 @@ namespace {
 #endif
 
   // Rebuilds one perspective half of `acc` from scratch (bias + every piece, kings included).
-  void refresh_half(Accumulator &acc, Color persp, const Position &pos) {
+  [[gnu::hot]] void refresh_half(Accumulator &acc, Color persp, const Position &pos) {
     const KingCtx  c = king_ctx_of(pos, persp);
     const int16_t *rows[40]; // 32 pieces max in a legal game; headroom for weird FEN input
     int            n = 0;
@@ -281,7 +287,7 @@ namespace {
 
   // Builds one perspective half of `child` from `parent` by applying child.dp under a king
   // context that is KNOWN not to change (the caller checked). Kings are ordinary features.
-  void apply_half(Accumulator &child, const Accumulator &parent, Color persp) {
+  [[gnu::hot]] void apply_half(Accumulator &child, const Accumulator &parent, Color persp) {
     const DirtyPiece &dp  = child.dp;
     const KingCtx     c   = parent.ctx[persp];
     const int16_t    *src = parent.v[persp];
@@ -302,8 +308,10 @@ namespace {
     child.computed[persp] = true;
   }
 
-  // True when `dp` moves `persp`'s own king (adds always contain the mover).
-  bool moves_own_king(const DirtyPiece &dp, Color persp) {
+  // True when `dp` moves `persp`'s own king (adds always contain the mover). Reads `dp` through
+  // a reference (a dereference), so `pure`, not `const`; no side effects, tiny, called once per
+  // scanned stack entry in the lazy walk-back.
+  [[gnu::pure, gnu::always_inline]] inline bool moves_own_king(const DirtyPiece &dp, Color persp) {
     for (int i = 0; i < dp.n_add; ++i)
       if (dp.add_pc[i] == make_piece(persp, KING))
         return true;
@@ -311,15 +319,17 @@ namespace {
   }
 
   // New king context after `dp` (call only when moves_own_king): from the king's add square.
-  KingCtx ctx_after(const DirtyPiece &dp, Color persp) {
+  [[gnu::pure, gnu::always_inline]] inline KingCtx ctx_after(const DirtyPiece &dp, Color persp) {
     for (int i = 0; i < dp.n_add; ++i)
       if (dp.add_pc[i] == make_piece(persp, KING))
         return king_ctx(persp == WHITE ? dp.add_sq[i] : Square(dp.add_sq[i] ^ 56));
     return {0, false}; // unreachable
   }
 
-  // SCReLU output layer through the position's material bucket, stm half first.
-  int output_dot(const Accumulator &acc, Color stm, int bucket) {
+  // SCReLU output layer through the position's material bucket, stm half first. Reads the
+  // accumulator and the (immutable once loaded) network, writes nothing — `pure`; called once
+  // per evaluate(), the tail of the hottest call chain in the engine.
+  [[gnu::pure, gnu::hot]] int output_dot(const Accumulator &acc, Color stm, int bucket) {
     const int32_t sum = dot_reduce(acc.v[stm], acc.v[~stm], g_net.out_w[bucket]);
     // sum is at scale QA^2*QB; one /QA plus the bias (at QA*QB) then rescale to centipawns.
     return ((sum / QA) + g_net.out_b[bucket]) * SCALE / (QA * QB);
@@ -405,7 +415,9 @@ void nnue::Evaluator::reset(const Position &pos) {
 // Records the feature changes of `m` (to be played on `before`) into a new stack entry.
 // Mirrors the play<C>() switch exactly — note castling squares are hardcoded per color
 // (the Move stores king-to-rook, e1h1), and the captured piece is read from `before`.
-void nnue::Evaluator::push(const Position &before, Move m) {
+// Called at every make in the whole tree — hot, and inherently side-effecting (pushes a new
+// stack entry), so no purity attributes apply.
+[[gnu::hot]] void nnue::Evaluator::push(const Position &before, Move m) {
   assert(top + 1 < MAX_PLY + 8);
   Accumulator &a     = stack[++top];
   a.computed[WHITE]  = false;
@@ -489,7 +501,7 @@ void nnue::Evaluator::push_null() {
   a.dp.n_add = a.dp.n_sub = 0; // no feature changes; applied as a copy
 }
 
-void nnue::Evaluator::pop() {
+[[gnu::hot]] void nnue::Evaluator::pop() {
   assert(top > 0);
   --top;
 }
@@ -497,8 +509,9 @@ void nnue::Evaluator::pop() {
 // Makes stack[top]'s `persp` half valid: walk back to the nearest computed ancestor and apply
 // the recorded updates forward — unless an own-king move CHANGES the (bucket, mirror) context
 // anywhere in the chain (or the chain is too long / has no computed ancestor), in which case a
-// full refresh of the half from `pos` is the only (and cheaper) option.
-void nnue::Evaluator::ensure_half(Color persp, const Position &pos) {
+// full refresh of the half from `pos` is the only (and cheaper) option. Writes into `stack[]`
+// (the lazy-evaluation memoization) as a side effect, so it is NOT `pure`.
+[[gnu::hot]] void nnue::Evaluator::ensure_half(Color persp, const Position &pos) {
   if (stack[top].computed[persp])
     return;
 
@@ -527,14 +540,24 @@ void nnue::Evaluator::ensure_half(Color persp, const Position &pos) {
     apply_half(stack[k], stack[k - 1], persp);
 }
 
-int nnue::Evaluator::evaluate(const Position &pos) {
+// The main search's static-eval entry point. NOT pure: ensure_half's lazy walk-back writes into
+// this Evaluator's own accumulator stack as a memoization side effect (the result is still
+// deterministic given the push/pop history, but that's not what GNU `pure` certifies — it
+// forbids memory writes through the object regardless of observable effect). `nodiscard`
+// because every call site needs the value; calling this for its cache-filling side effect
+// alone would be pointless.
+[[gnu::hot, nodiscard]] int nnue::Evaluator::evaluate(const Position &pos) {
   assert(g_loaded);
   ensure_half(WHITE, pos);
   ensure_half(BLACK, pos);
   return output_dot(stack[top], pos.turn(), out_bucket(pos));
 }
 
-int nnue::evaluate_refresh(const Position &pos) {
+// One-shot eval via a full LOCAL refresh (used by the `eval`/`d` UCI commands and parity
+// tests). Unlike the member evaluate() above, the Accumulator it mutates is a stack-local
+// variable invisible outside this call — no externally observable side effects — so `pure`
+// correctly applies here.
+[[gnu::pure, nodiscard]] int nnue::evaluate_refresh(const Position &pos) {
   assert(g_loaded);
   Accumulator acc;
   refresh_half(acc, WHITE, pos);
