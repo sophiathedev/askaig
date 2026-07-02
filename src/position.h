@@ -132,8 +132,14 @@ public:
   void move_piece(Square from, Square to);
   void move_piece_quiet(Square from, Square to);
 
-  friend std::ostream      &operator<<(std::ostream &os, const Position &p);
-  static void               set(const std::string &fen, Position &p);
+  friend std::ostream &operator<<(std::ostream &os, const Position &p);
+  // Parses `fen` into the freshly-constructed `p`. Returns false on a malformed board field
+  // (an unrecognised piece letter, or a rank that over/underflows the 64 squares) and leaves
+  // `p` in a WHATEVER-partial state was reached — the caller (the UCI `position` command,
+  // where `fen` is untrusted external input) must check this and fall back to a known-good
+  // position rather than continuing with a partially/incorrectly built one. Every other caller
+  // in this codebase passes a hardcoded, already-known-valid FEN and is not required to check.
+  static bool               set(const std::string &fen, Position &p);
   [[nodiscard]] std::string fen() const;
 
   Position   &operator=(const Position &) = delete;

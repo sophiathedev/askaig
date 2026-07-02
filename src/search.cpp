@@ -734,16 +734,21 @@ int search::quiet_history(const Stack *ss, const Position &pos, Move m) { return
 
 void search::request_stop() { g_stop.store(true, std::memory_order_relaxed); }
 
+void search::clear_stop() { g_stop.store(false, std::memory_order_relaxed); }
+
 void search::new_game() { g_hist.clear(); }
 
 void search::set_threads(int n) { pool().set_size(std::max(0, n - 1)); }
 
 void search::set_split_depth(int d) { g_split_depth = std::max(1, d); }
 
+// The caller must have already called search::clear_stop() SYNCHRONOUSLY on whatever thread
+// might race a subsequent request_stop() (see search.h) before invoking this — think() itself
+// does not reset g_stop, precisely so a stop requested before this function starts running (on
+// a freshly-spawned search thread, for instance) is never silently discarded.
 search::Result search::think(Position &pos, int max_depth, const InfoFn &info, int64_t soft_ms, int64_t hard_ms) {
   if (!g_lmr_init)
     init_lmr();
-  g_stop.store(false, std::memory_order_relaxed);
   g_main.nodes = 0;
   g_hard_ms    = hard_ms;
   g_t0         = Clock::now();

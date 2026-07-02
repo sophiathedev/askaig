@@ -81,21 +81,45 @@ std::string Position::fen() const {
   return fen.str();
 }
 
-// Updates a position according to an FEN string
-void Position::set(const std::string &fen, Position &p) {
+// Updates a position according to an FEN string. Returns false (see position.h) the moment the
+// board field is found to be malformed, WITHOUT placing the offending character's piece —
+// PIECE_STR.find() on an unrecognised letter returns std::string::npos, and casting that
+// straight to Piece and indexing piece_bb/zobrist_table with it (the un-validated code used to
+// do exactly this) is a huge out-of-bounds write, not a graceful failure. Reproduced and fixed
+// via `position fen this is not a fen at all` (SIGSEGV) while writing the UCI robustness test.
+bool Position::set(const std::string &fen, Position &p) {
+  const size_t sp = fen.find(' ');
+  // A well-formed FEN always has a board field followed by at least "w"/"b" — without a space
+  // at all, fen.substr(sp) below (starting AT sp, not just up to it) would be substr(npos),
+  // which throws std::out_of_range rather than failing gracefully. Also reproduced (SIGABRT via
+  // an uncaught exception) via `position fen abcdefgh` while writing the UCI robustness test.
+  if (sp == std::string::npos)
+    return false;
+
   int square = a8;
-  for (char ch: fen.substr(0, fen.find(' '))) {
-    if (isdigit(ch))
+  for (char ch: fen.substr(0, sp)) {
+    if (isdigit(ch)) {
+      if (ch == '0' || ch - '0' > 8)
+        return false; // FEN run-lengths are 1..8
       square += (ch - '0') * EAST;
-    else if (ch == '/')
+    } else if (ch == '/') {
       square += 2 * SOUTH;
-    else
-      p.put_piece(Piece(PIECE_STR.find(ch)), Square(square++));
+    } else {
+      const size_t idx = PIECE_STR.find(ch);
+      // PIECE_STR is "PNBRQK~>pnbrqk.": indices 6/7 ('~'/'>') are unused filler and 14 ('.') is
+      // the NO_PIECE display sentinel — none of those, nor an unrecognised letter, are valid
+      // FEN input; only 0..5 and 8..13 (the 12 real pieces) are.
+      if (idx == std::string::npos || idx == 6 || idx == 7 || idx == 14)
+        return false;
+      if (square < a1 || square > h8)
+        return false; // the board field ran past 64 squares
+      p.put_piece(Piece(idx), Square(square++));
+    }
   }
 
   // Parse the side-to-move, castling-rights and en-passant fields as whitespace-separated
   // tokens. The two halfmove/fullmove counters (if present) are read past and ignored.
-  std::istringstream ss(fen.substr(fen.find(' ')));
+  std::istringstream ss(fen.substr(sp));
   std::string        side;
   std::string        castling;
   std::string        ep;
@@ -143,6 +167,7 @@ void Position::set(const std::string &fen, Position &p) {
 
   // Seed the root position's hash (now fully built) for repetition detection.
   p.history[p.game_ply].hash = p.hash;
+  return true;
 }
 
 

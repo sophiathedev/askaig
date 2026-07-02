@@ -33,6 +33,12 @@ namespace search {
   Result think(Position &pos, int max_depth, const InfoFn &info, int64_t soft_ms, int64_t hard_ms);
 
   void request_stop(); // asynchronous (from the UCI thread)
+  // Arms think() for a fresh search. MUST be called synchronously on whatever thread might
+  // race a subsequent request_stop() — for a backgrounded search that's the UCI thread, right
+  // before spawning the search thread, NOT inside think() itself (which used to reset this on
+  // the NEW thread; a "go" immediately followed by "stop" could then have its stop request
+  // wiped by that reset if it lost the race, silently running the full search anyway).
+  void clear_stop();
   void new_game(); // clears history tables (TT cleared separately via tt::clear)
 
   // YBWC parallelism: `n` total threads (n-1 pool helpers; 1 = single-threaded, bit-identical

@@ -575,6 +575,7 @@ namespace {
       std::cout << "selftest search FAIL: no net loaded\n";
       return false;
     }
+    search::clear_stop(); // see bench_cmd's comment — think() no longer resets this itself
     struct Case {
       const char *fen;
       int         depth;
@@ -647,6 +648,57 @@ namespace {
     return ok;
   }
 
+  // --- selftest stop ---------------------------------------------------------------------------
+  // Regression test for a real bug found while stress-testing "go" immediately followed by
+  // "stop": think() used to unconditionally reset g_stop at its own start. A stop requested on
+  // the UCI thread BEFORE the newly-spawned search thread's think() call actually started
+  // running could have that request silently wiped out by think()'s own reset, so the search
+  // ran to full (clamped) depth instead of stopping — observed as a multi-second delay where an
+  // instant response was expected. The fix moved the reset to search::clear_stop(), called
+  // synchronously by the spawner before the thread starts (go_cmd) or once up front by
+  // synchronous callers (bench_cmd, selftest_search here) — think() itself must never touch it.
+  //
+  // A real timing race is inherently flaky to test for directly, so this reproduces the bug
+  // deterministically instead: pre-set g_stop BEFORE calling think() (simulating "the stop
+  // request already landed"), with no depth/time limit at all. If think() were still resetting
+  // g_stop internally, it would search for real (many nodes, real time); since it must not, the
+  // very first time_up()/aborted() check has to bail immediately.
+  bool selftest_stop() {
+    if (!nnue::loaded()) {
+      std::cout << "selftest stop FAIL: no net loaded\n";
+      return false;
+    }
+    Position pos;
+    Position::set(DEFAULT_FEN, pos);
+    tt::clear();
+    search::new_game();
+
+    search::clear_stop();
+    search::request_stop(); // simulate: the stop request already landed before think() runs
+    const auto           t0 = std::chrono::steady_clock::now();
+    const search::Result r  = search::think(pos, search::MAX_PLY - 1, nullptr, 0, 0);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    search::clear_stop(); // leave global state clean for whatever runs next
+
+    bool ok = true;
+    if (r.nodes > 100) {
+      std::cout << "selftest stop FAIL: " << r.nodes << " nodes searched despite g_stop being set before think() ran\n";
+      ok = false;
+    }
+    if (ms > 500) {
+      std::cout << "selftest stop FAIL: think() took " << ms << "ms despite g_stop being set before it ran\n";
+      ok = false;
+    }
+    if (r.best.to_from() == 0) {
+      std::cout << "selftest stop FAIL: no fallback bestmove returned\n";
+      ok = false;
+    }
+    if (ok)
+      std::cout << "selftest stop PASS: a pre-set stop is honoured immediately (" << r.nodes << " nodes, " << ms
+                << "ms)\n";
+    return ok;
+  }
+
   // --- selftest all ----------------------------------------------------------------------------
   // Runs every selftest and reports a combined verdict. Uses &= (not &&) deliberately: every
   // suite runs regardless of an earlier failure, so a single pass reports everything that's
@@ -658,6 +710,7 @@ namespace {
     ok &= selftest_draw();
     ok &= selftest_nnue(500, 80);
     ok &= selftest_search();
+    ok &= selftest_stop();
     std::cout << (ok ? "selftest all: ALL PASS\n" : "selftest all: SOME FAILED (see above)\n");
   }
 
@@ -751,6 +804,10 @@ namespace {
   constexpr int BENCH_DEPTH = 12;
 
   void bench_cmd(int depth) {
+    // Runs synchronously on this thread (no concurrent stop-sender to race), but g_stop may
+    // still be true from an earlier "go" + "stop" — think() no longer resets it itself (see
+    // search::clear_stop()'s comment), so every non-backgrounded caller must.
+    search::clear_stop();
     const size_t prev_mb = tt::size_mb(); // restore the user's Hash afterwards
     tt::resize(16); // fixed size: the signature must not depend on the Hash setting
     uint64_t   total_nodes = 0;
@@ -859,7 +916,16 @@ namespace {
     }
 
     pos.emplace(); // set() assumes a freshly-constructed Position
-    Position::set(fen, *pos);
+    if (!Position::set(fen, *pos)) {
+      // A malformed FEN: `*pos` is now a partially-built garbage position (set() stops the
+      // instant it finds the problem, without undoing what came before) — reset to a
+      // known-good position rather than handing `go`/`eval`/`d` something that could itself
+      // misbehave on it (e.g. a missing king breaking bsf() on an empty bitboard).
+      std::cout << "info string ignoring malformed FEN (reset to startpos): " << fen << "\n";
+      pos.emplace();
+      Position::set(DEFAULT_FEN, *pos);
+      return;
+    }
 
     if (token == "moves") {
       std::string mv;
@@ -948,6 +1014,13 @@ namespace {
       max_depth = depth;
     if (depth > 0) // an explicit depth is always an upper bound, even alongside a time limit
       max_depth = std::min(max_depth, depth);
+
+    // clear_stop() MUST happen here, synchronously on this (the UCI) thread, before the search
+    // thread is spawned — not inside think() on the new thread, which could start AFTER this
+    // thread has already read and processed a "stop" for it, silently discarding that request
+    // (found by testing "go depth 99999" immediately followed by "stop": the search ran to
+    // completion instead of stopping, because think()'s old internal reset raced the stop).
+    search::clear_stop();
 
     // Search on a background thread; the loop keeps reading stdin so "stop"/"isready" work.
     // `pos` is safe to capture by pointer: every pos-mutating command calls stop_search() first.
@@ -1094,6 +1167,8 @@ void uci::loop() {
         selftest_draw();
       else if (what == "search")
         selftest_search();
+      else if (what == "stop")
+        selftest_stop();
       else if (what == "all")
         selftest_all();
     } else if (cmd == "register" || cmd.empty()) {
