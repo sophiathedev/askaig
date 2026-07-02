@@ -17,12 +17,15 @@ Input formats (--format):
   lichess : "<board> <turn> <castle> <ep> <p>"  p = white-POV win prob (sigmoid K=0.005 of SF cp)
             -> score = logit(p)/K clamped to +-1000 (matching tools/lichess_label.py's mate clamp),
                result derived from p thresholds (only used when training with lambda > 0)
+  jsonl   : the raw Lichess eval DB (lichess_db_eval.jsonl.zst, decompressed on stdin or a file):
+            one JSON object per line -> deepest eval's principal cp, exact (mates clamped +-1000)
   result  : "<6-field FEN> <r>"  r = white-POV game result 1.0 / 0.5 / 0.0 -> score = 0 (!)
   epd     : '<board> <turn> <castle> <ep> c9 "1-0";'  (Zurichess quiet-labeled style) -> score = 0 (!)
 (!) result-only inputs carry no teacher score; train those with lambda = 1.
 
 Usage:
   python3 convert_fen.py --format lichess tools/work/lichess.book tools/work/lichess.bf
+  zstd -dc lichess_db_eval.jsonl.zst | python3 convert_fen.py --format jsonl - big.bf
   python3 convert_fen.py --check tools/work/lichess.bf 100   # decode/roundtrip-verify N records
 """
 
@@ -114,31 +117,62 @@ def pieces_to_board_field(pieces):
     return "/".join(rows)
 
 
+def parse_jsonl(line):
+    """One Lichess eval-DB JSON line -> (board_field, white_to_move, cp_white, result2) or None."""
+    import json
+
+    o = json.loads(line)
+    fen, evals = o.get("fen"), o.get("evals")
+    if not fen or not evals:
+        return None
+    pv = max(evals, key=lambda e: e.get("depth", 0)).get("pvs", [{}])[0]
+    if "cp" in pv:
+        cp = pv["cp"]
+    elif "mate" in pv:
+        cp = CP_CLAMP if pv["mate"] > 0 else -CP_CLAMP
+    else:
+        return None
+    cp = max(-CP_CLAMP, min(CP_CLAMP, cp))  # white-POV on lichess
+    t = fen.split()
+    res2 = 2 if cp > 160 else (0 if cp < -160 else 1)  # ~sigmoid(0.005*160) = 0.69
+    return t[0], t[1] == "w", cp, res2
+
+
 def convert(args):
     n_in = n_out = 0
-    with open(args.src) as fin, open(args.out, "wb") as fout:
+    fin = sys.stdin if args.src == "-" else open(args.src)
+    with open(args.out, "wb") as fout:
         for line in fin:
             n_in += 1
             t = line.split()
             if not t:
                 continue
             try:
-                if args.format == "lichess":
-                    board, turn, label = t[0], t[1], float(t[4])
+                if args.format == "jsonl":
+                    parsed = parse_jsonl(line)
+                    if parsed is None:
+                        continue
+                    board, wtm, cp, res2 = parsed
+                elif args.format == "lichess":
+                    board, wtm, label = t[0], t[1] == "w", float(t[4])
                     p = min(max(label, 1e-6), 1 - 1e-6)
                     cp = max(-CP_CLAMP, min(CP_CLAMP, math.log(p / (1 - p)) / K))
                     res2 = 2 if label > 2 / 3 else (0 if label < 1 / 3 else 1)
                 elif args.format == "result":
-                    board, turn, cp = t[0], t[1], 0.0
+                    board, wtm, cp = t[0], t[1] == "w", 0.0
                     res2 = round(2 * float(t[6]))
                 else:  # epd: ... c9 "1-0";
-                    board, turn, cp = t[0], t[1], 0.0
+                    board, wtm, cp = t[0], t[1] == "w", 0.0
                     r = line.split('"')[1]
                     res2 = 2 if r == "1-0" else (0 if r == "0-1" else 1)
-                fout.write(encode(parse_board(board), turn == "w", cp, res2))
+                fout.write(encode(parse_board(board), wtm, cp, res2))
                 n_out += 1
+                if n_out % 5_000_000 == 0:
+                    print(f"... {n_out} records", file=sys.stderr)
             except (IndexError, ValueError, KeyError) as e:
                 print(f"skip line {n_in}: {e}", file=sys.stderr)
+    if fin is not sys.stdin:
+        fin.close()
     print(f"{args.src}: {n_in} lines -> {n_out} records ({n_out * 32} bytes) -> {args.out}")
 
 

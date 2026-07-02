@@ -71,9 +71,14 @@ def from_checkpoint(path):
     sd = torch.load(path, map_location="cpu")
     if "model" in sd:
         sd = sd["model"]
-    # model.py: ft = nn.Linear(768, HL), out = nn.Linear(2*HL, 1)
-    ft_w = sd["ft.weight"].numpy().T.copy()  # torch Linear weight is (HL, 768) -> (768, HL)
-    ft_b = sd["ft.bias"].numpy()
+    # model.py: ft = nn.Embedding(769, HL) (row f = feature f, row 768 = zero padding),
+    #           ft_bias = (HL,), out = nn.Linear(2*HL, 1)
+    ft_w = sd["ft.weight"].numpy()[:FEATURES]  # (768, HL), already feature-major
+    # The padding row (768) is dropped here, so it MUST be zero — MPS's embedding backward
+    # ignores padding_idx and lets it drift unless model.clip() re-pins it every step.
+    assert np.abs(sd["ft.weight"].numpy()[FEATURES]).max() == 0, \
+        "padding row nonzero (MPS padding_idx bug) - retrain with the current model.clip()"
+    ft_b = sd["ft_bias"].numpy()
     out_w = sd["out.weight"].numpy().reshape(-1)
     out_b = float(sd["out.bias"].numpy().reshape(-1)[0])
     assert np.abs(ft_w).max() <= CLIP + 1e-6 and np.abs(out_w).max() <= CLIP + 1e-6, "checkpoint not clipped"
