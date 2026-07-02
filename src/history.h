@@ -27,10 +27,19 @@ namespace search {
     int16_t capture[NPIECES][NSQUARES][NPIECE_TYPES];
     // Continuation history: [prev piece][prev to] -> ContTable over the current move. (~3.7 MB)
     ContTable cont[NPIECES][NSQUARES];
-    // Static-eval correction history, keyed by (stm, pawn-structure key): learns a per-structure
-    // offset between the static eval and the search result. Applied and updated in search.cpp.
+
+    // Static-eval correction history: several independent (stm, structural-key) tables, each
+    // learning a per-structure offset between the static eval and what the search actually
+    // found there. NNUE's raw output is still just one number per node — a small/young net has
+    // systematic biases correlated with pawn structure, material balance, and piece placement
+    // that a cheap, node-free learned correction removes without touching the network itself.
+    // Applied (summed, then rescaled) and updated together in search.cpp.
     static constexpr size_t CORR_SIZE = 16384;
-    int16_t                 corr[NCOLORS][CORR_SIZE];
+    int16_t                 corr_pawn[NCOLORS][CORR_SIZE]; // pawn skeleton (placement)
+    int16_t                 corr_material[NCOLORS][CORR_SIZE]; // non-pawn piece counts (imbalance)
+    int16_t                 corr_minor[NCOLORS][CORR_SIZE]; // knight+bishop placement, both sides
+    int16_t                 corr_major[NCOLORS][CORR_SIZE]; // rook+queen placement, both sides
+    int16_t                 corr_cont[NPIECES][NSQUARES]; // keyed by the previous move (piece, to)
 
     void clear() { std::memset(this, 0, sizeof(*this)); }
   };

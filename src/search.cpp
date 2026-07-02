@@ -62,22 +62,56 @@ namespace {
            (uint64_t(uint16_t(p.history[p.ply()].epsq)) * 0xC2B2AE3D27D4EB4Full);
   }
 
-  // Pawn-structure key for the static-eval correction history.
-  size_t corr_index(const Position &p) {
+  // Correction-history keys. Each is a cheap position-derived hash into a CORR_SIZE table —
+  // collisions just blend unrelated positions' corrections, no correctness impact.
+  size_t pawn_corr_index(const Position &p) {
     const uint64_t w = p.bitboard_of(WHITE_PAWN) * 0x9E3779B97F4A7C15ull;
     const uint64_t b = p.bitboard_of(BLACK_PAWN) * 0xC2B2AE3D27D4EB4Full;
     return (w ^ (b + 0x165667B19E3779F9ull + (w << 6) + (w >> 2))) & (Histories::CORR_SIZE - 1);
+  }
+  // Non-pawn material imbalance: piece-TYPE COUNTS (not placement), so it fires on trades and
+  // promotions rather than on where the pieces happen to stand.
+  size_t material_corr_index(const Position &p) {
+    uint64_t key = 0;
+    for (int pt = KNIGHT; pt <= QUEEN; ++pt) {
+      key = key * 9 + uint64_t(pop_count(p.bitboard_of(make_piece(WHITE, PieceType(pt)))));
+      key = key * 9 + uint64_t(pop_count(p.bitboard_of(make_piece(BLACK, PieceType(pt)))));
+    }
+    return (key * 0x9E3779B97F4A7C15ull) & (Histories::CORR_SIZE - 1);
+  }
+  size_t minor_corr_index(const Position &p) {
+    const Bitboard minors = p.bitboard_of(WHITE_KNIGHT) | p.bitboard_of(WHITE_BISHOP) |
+                            p.bitboard_of(BLACK_KNIGHT) | p.bitboard_of(BLACK_BISHOP);
+    return (minors * 0x9E3779B97F4A7C15ull) & (Histories::CORR_SIZE - 1);
+  }
+  size_t major_corr_index(const Position &p) {
+    const Bitboard majors = p.bitboard_of(WHITE_ROOK) | p.bitboard_of(WHITE_QUEEN) |
+                            p.bitboard_of(BLACK_ROOK) | p.bitboard_of(BLACK_QUEEN);
+    return (majors * 0xC2B2AE3D27D4EB4Full) & (Histories::CORR_SIZE - 1);
   }
 
   // Mate scores are stored ply-relative in the TT ("mate in N from HERE").
   int to_tt(int v, int ply) { return v >= MATE_IN_MAX ? v + ply : v <= -MATE_IN_MAX ? v - ply : v; }
   int from_tt(int v, int ply) { return v >= MATE_IN_MAX ? v - ply : v <= -MATE_IN_MAX ? v + ply : v; }
 
-  // Static eval + the learned per-pawn-structure correction, clamped out of the mate range.
-  int evaluate(ThreadData &t, const Position &pos) {
-    const int raw  = t.ev.evaluate(pos);
-    const int corr = g_hist.corr[pos.turn()][corr_index(pos)] / 64;
-    return std::clamp(raw + corr, -MATE_IN_MAX + 1, MATE_IN_MAX - 1);
+  // Sum of all correction-history tables for this node: pawn skeleton, non-pawn material,
+  // minor- and major-piece placement, and the continuation table keyed by the previous move
+  // (piece, to) — skipped at the root and right after a null move, where there is none.
+  // Divided by a larger constant than a single table would need (256 vs. the old 64) so five
+  // tables agreeing doesn't blow the correction past what one confident table used to give.
+  int correction(const Position &pos, const Stack *ss) {
+    const Color c    = pos.turn();
+    int         corr = g_hist.corr_pawn[c][pawn_corr_index(pos)] + g_hist.corr_material[c][material_corr_index(pos)] +
+                g_hist.corr_minor[c][minor_corr_index(pos)] + g_hist.corr_major[c][major_corr_index(pos)];
+    if ((ss - 1)->move.to_from() != 0)
+      corr += g_hist.corr_cont[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()];
+    return corr / 256;
+  }
+
+  // Static eval + the learned corrections, clamped out of the mate range.
+  int evaluate(ThreadData &t, const Position &pos, const Stack *ss) {
+    const int raw = t.ev.evaluate(pos);
+    return std::clamp(raw + correction(pos, ss), -MATE_IN_MAX + 1, MATE_IN_MAX - 1);
   }
 
   // A stop/abort poll for the tree: aborted() plus the hard clock.
@@ -159,7 +193,7 @@ namespace {
     if (pos.is_draw())
       return 0;
     if (ply >= MAX_PLY)
-      return evaluate(t, pos);
+      return evaluate(t, pos, ss);
 
     const bool     in_check = stm_in_check(pos);
     const uint64_t key      = tt_key(pos);
@@ -175,7 +209,7 @@ namespace {
 
     int best = -INF, raw_eval = tt::VALUE_NONE_TT;
     if (!in_check) {
-      raw_eval = tthit && tte->eval != tt::VALUE_NONE_TT ? tte->eval : evaluate(t, pos);
+      raw_eval = tthit && tte->eval != tt::VALUE_NONE_TT ? tte->eval : evaluate(t, pos, ss);
       best     = raw_eval;
       // The TT score is a tighter bound on this position than the static eval — use it.
       if (tthit && ttsc != tt::VALUE_NONE_TT) {
@@ -257,7 +291,7 @@ namespace {
       if (pos.is_draw())
         return 0;
       if (ply >= MAX_PLY)
-        return evaluate(t, pos);
+        return evaluate(t, pos, ss);
       // Mate distance pruning.
       alpha = std::max(alpha, -MATE + ply);
       beta  = std::min(beta, MATE - ply - 1);
@@ -299,7 +333,7 @@ namespace {
     if (in_check)
       ss->static_eval = tt::VALUE_NONE_TT;
     else {
-      raw_eval        = tteval != tt::VALUE_NONE_TT ? tteval : evaluate(t, pos);
+      raw_eval        = tteval != tt::VALUE_NONE_TT ? tteval : evaluate(t, pos, ss);
       ss->static_eval = raw_eval;
       // Sharpen with the TT score when it bounds in the right direction.
       if (tthit && ttsc != tt::VALUE_NONE_TT &&
@@ -585,12 +619,20 @@ namespace {
       tt::store(tte, key, best_move, to_tt(best, ply), raw_eval, depth, bound, PV);
 
       // Static-eval correction history: when the search result disagrees with the static eval
-      // in a bound-consistent way, learn the offset for this pawn structure.
+      // in a bound-consistent way, learn the offset — in EVERY table at once (pawn skeleton,
+      // material, minor/major placement, and the previous-move continuation), each moving
+      // toward the same target independently at its own key.
       if (!in_check && (best_move.to_from() == 0 || is_quiet(best_move)) &&
           !(bound == tt::LOWER && best <= ss->static_eval) &&
           !(bound == tt::UPPER && best >= ss->static_eval) && std::abs(best) < MATE_IN_MAX) {
-        const int b = std::clamp((best - ss->static_eval) * depth / 8, -256, 256);
-        hist_update(g_hist.corr[pos.turn()][corr_index(pos)], b);
+        const int   b = std::clamp((best - ss->static_eval) * depth / 8, -256, 256);
+        const Color c = pos.turn();
+        hist_update(g_hist.corr_pawn[c][pawn_corr_index(pos)], b);
+        hist_update(g_hist.corr_material[c][material_corr_index(pos)], b);
+        hist_update(g_hist.corr_minor[c][minor_corr_index(pos)], b);
+        hist_update(g_hist.corr_major[c][major_corr_index(pos)], b);
+        if ((ss - 1)->move.to_from() != 0)
+          hist_update(g_hist.corr_cont[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()], b);
       }
     }
     return best;
