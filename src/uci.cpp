@@ -708,6 +708,7 @@ void uci::loop() {
       std::cout << "id author " << ENGINE_AUTHOR << "\n";
       std::cout << "option name Hash type spin default " << tt::DEFAULT_HASH_MB << " min 1 max 65536\n";
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
+      std::cout << "option name Split type spin default 10 min 4 max 64\n"; // YBWC split depth
       std::cout << "option name EvalFile type string default <embedded>\n";
       std::cout << "uciok\n";
     } else if (cmd == "isready") {
@@ -752,9 +753,17 @@ void uci::loop() {
           tt::resize(size_t(mb));
         }
       } else if (name == "Threads") {
+        // Drives both the perft workers and the YBWC helper pool (Threads-1 helpers).
         int t = 0;
-        if (is >> t)
+        if (is >> t) {
           g_threads = t < 1 ? 1 : (t > 1024 ? 1024 : t);
+          search::set_threads(g_threads);
+        }
+      } else if (name == "Split") {
+        // Minimum depth at which YBWC splits a node's remaining siblings across the pool.
+        int d = 0;
+        if (is >> d)
+          search::set_split_depth(std::clamp(d, 4, 64));
       } else if (name == "EvalFile") {
         // The value is the rest of the line (paths can contain spaces). A bad file keeps the
         // currently loaded net (the embedded default) and reports why.

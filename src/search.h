@@ -35,4 +35,9 @@ namespace search {
   void request_stop(); // asynchronous (from the UCI thread)
   void new_game(); // clears history tables (TT cleared separately via tt::clear)
 
+  // YBWC parallelism: `n` total threads (n-1 pool helpers; 1 = single-threaded, bit-identical
+  // to no pool), splitting only at nodes with depth >= the split depth (the "Split" option).
+  void set_threads(int n);
+  void set_split_depth(int d);
+
 } // namespace search

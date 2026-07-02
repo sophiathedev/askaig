@@ -73,6 +73,7 @@ namespace search {
     }
 
     [[nodiscard]] size_t total() const { return n; }
+    [[nodiscard]] size_t remaining() const { return n - cur; }
 
   private:
     Move   moves[218];
