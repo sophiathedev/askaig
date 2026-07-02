@@ -7,6 +7,10 @@ cmake-build-*/
 /.sprt/
 /config.json
 /_archive_rewrite/
-/tools/
+/tools/*
+!/tools/nnue/
+tools/nnue/__pycache__/
+tools/nnue/*.pt
 build-tune/
 build-pgo/
+build-nosimd/

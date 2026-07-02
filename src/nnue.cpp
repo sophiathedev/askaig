@@ -165,6 +165,13 @@ bool nnue::load_file(const std::string &path, std::string *err) {
   return load_buffer(buf.data(), buf.size(), err);
 }
 
+// The build-time default net (a byte copy of networks/default.nnue), generated into the
+// build tree by cmake/embed_file.cmake.
+extern const unsigned char g_default_net[];
+extern const size_t        g_default_net_size;
+
+bool nnue::load_embedded(std::string *err) { return load_buffer(g_default_net, g_default_net_size, err); }
+
 bool nnue::loaded() { return g_loaded; }
 
 // --- Evaluator -----------------------------------------------------------------------------

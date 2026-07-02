@@ -49,8 +49,10 @@ namespace nnue {
 
   // Loads a net, replacing the current one. On failure the current net is kept and `err`
   // (when non-null) explains why. load_buffer validates the header and total size.
+  // load_embedded loads the net baked into the binary (networks/default.nnue at build time).
   bool load_file(const std::string &path, std::string *err = nullptr);
   bool load_buffer(const unsigned char *data, size_t size, std::string *err = nullptr);
+  bool load_embedded(std::string *err = nullptr);
   bool loaded();
 
   // --- Incremental evaluation ------------------------------------------------------------------
