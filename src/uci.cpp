@@ -432,10 +432,13 @@ namespace {
   // eval from the observer's (White's) point of view: + = better for White, - = better for
   // Black, plus the raw centipawn value.
   void display_cmd(const Position &pos) {
+    // Plain color codes only — no bold/dim attributes: terminals render bold with a separate
+    // (or synthetic) font face and dim at theme-dependent strength, which makes the board look
+    // inconsistent; pure colors draw with the normal glyphs everywhere.
     constexpr const char *LBL = "\033[38;5;208m"; // orange labels
-    constexpr const char *WPC = "\033[1;97m"; // white pieces: bold bright white
-    constexpr const char *BPC = "\033[1;94m"; // black pieces: bright blue
-    constexpr const char *DIM = "\033[2m"; // frame / empty squares
+    constexpr const char *WPC = "\033[97m"; // white pieces: bright white
+    constexpr const char *BPC = "\033[94m"; // black pieces: bright blue
+    constexpr const char *DIM = "\033[90m"; // frame / empty squares: gray
     constexpr const char *RST = "\033[0m";
 
     // A castling right is lost once its king/rook "entry" squares have been touched.
