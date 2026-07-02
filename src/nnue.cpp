@@ -6,6 +6,12 @@
 #include <fstream>
 #include <vector>
 
+#if defined(SIMD) && defined(ARCH_AVX2)
+  #include <immintrin.h>
+#elif defined(SIMD) && defined(ARCH_ARM_NEON)
+  #include <arm_neon.h>
+#endif
+
 // The loader memcpys little-endian int16/int32 weight blocks straight into memory; a
 // big-endian port would need byte swaps here, so fail loudly at compile time instead.
 static_assert(std::endian::native == std::endian::little, "NNUE net loading assumes a little-endian host");
@@ -38,66 +44,199 @@ namespace {
   }
 
   // --- Kernels ---------------------------------------------------------------------------------
-  // Scalar reference implementations. The SIMD (AVX2/NEON) versions must produce bit-identical
-  // results — everything here is exact integer math, asserted by `selftest nnue`.
+  // Three implementations selected at compile time: AVX2, NEON, scalar. All are exact integer
+  // math (int16 adds wrap identically, int32 sums are order-independent mod 2^32), so the paths
+  // are bit-identical — `selftest nnue` pins the vector paths to the scalar reference.
+  //
+  // Alignment: Network/Accumulator arrays are alignas(64) and one feature row is HL*2 = 512
+  // bytes, so every row and every half is 64-byte aligned — aligned vector loads throughout,
+  // and HL divides all vector widths (no tail loops).
 
-  // Rebuilds both perspective halves of `acc` from scratch (bias + every piece on the board).
-  void acc_refresh(Accumulator &acc, const Position &pos) {
-    std::memcpy(acc.v[WHITE], g_net.ft_b, sizeof(g_net.ft_b));
-    std::memcpy(acc.v[BLACK], g_net.ft_b, sizeof(g_net.ft_b));
-    for (int pc = WHITE_PAWN; pc <= BLACK_KING; ++pc) {
-      if (pc > WHITE_KING && pc < BLACK_PAWN)
-        continue; // the gap in the Piece enum (6, 7)
-      Bitboard bb = pos.bitboard_of(Piece(pc));
-      while (bb) {
-        const Square   s = pop_lsb(&bb);
-        const int16_t *w = ft_row(WHITE, Piece(pc), s);
-        const int16_t *b = ft_row(BLACK, Piece(pc), s);
-        for (int i = 0; i < HL; ++i)
-          acc.v[WHITE][i] += w[i];
-        for (int i = 0; i < HL; ++i)
-          acc.v[BLACK][i] += b[i];
-      }
+  // Fused parent->child updates: one read-modify-write pass per shape, both perspectives handled
+  // by the caller. Shapes: quiet/promo = add1_sub1, capture/ep = add1_sub2, castling = add2_sub2.
+#if defined(SIMD) && defined(ARCH_AVX2)
+
+  void add1_sub1(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0) {
+    for (int i = 0; i < HL; i += 16) {
+      __m256i v = _mm256_load_si256(reinterpret_cast<const __m256i *>(src + i));
+      v         = _mm256_add_epi16(v, _mm256_load_si256(reinterpret_cast<const __m256i *>(a0 + i)));
+      v         = _mm256_sub_epi16(v, _mm256_load_si256(reinterpret_cast<const __m256i *>(s0 + i)));
+      _mm256_store_si256(reinterpret_cast<__m256i *>(dst + i), v);
     }
-    acc.computed = true;
+  }
+  void add1_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0, const int16_t *s1) {
+    for (int i = 0; i < HL; i += 16) {
+      __m256i v = _mm256_load_si256(reinterpret_cast<const __m256i *>(src + i));
+      v         = _mm256_add_epi16(v, _mm256_load_si256(reinterpret_cast<const __m256i *>(a0 + i)));
+      v         = _mm256_sub_epi16(v, _mm256_load_si256(reinterpret_cast<const __m256i *>(s0 + i)));
+      v         = _mm256_sub_epi16(v, _mm256_load_si256(reinterpret_cast<const __m256i *>(s1 + i)));
+      _mm256_store_si256(reinterpret_cast<__m256i *>(dst + i), v);
+    }
+  }
+  void add2_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *a1, const int16_t *s0,
+                 const int16_t *s1) {
+    for (int i = 0; i < HL; i += 16) {
+      __m256i v = _mm256_load_si256(reinterpret_cast<const __m256i *>(src + i));
+      v         = _mm256_add_epi16(v, _mm256_load_si256(reinterpret_cast<const __m256i *>(a0 + i)));
+      v         = _mm256_add_epi16(v, _mm256_load_si256(reinterpret_cast<const __m256i *>(a1 + i)));
+      v         = _mm256_sub_epi16(v, _mm256_load_si256(reinterpret_cast<const __m256i *>(s0 + i)));
+      v         = _mm256_sub_epi16(v, _mm256_load_si256(reinterpret_cast<const __m256i *>(s1 + i)));
+      _mm256_store_si256(reinterpret_cast<__m256i *>(dst + i), v);
+    }
   }
 
-  // Builds `child` from `parent` by applying child.dp, both perspectives in one pass.
-  // Shapes: quiet/promo = (1 add, 1 sub); capture/ep = (1, 2); castling = (2, 2); null = (0, 0).
-  void acc_apply(Accumulator &child, const Accumulator &parent) {
-    const DirtyPiece &dp = child.dp;
-    for (int p = 0; p < 2; ++p) {
-      const Color    persp = Color(p);
-      const int16_t *src   = parent.v[p];
-      int16_t       *dst   = child.v[p];
-
-      const int16_t *a0 = dp.n_add > 0 ? ft_row(persp, dp.add_pc[0], dp.add_sq[0]) : nullptr;
-      const int16_t *a1 = dp.n_add > 1 ? ft_row(persp, dp.add_pc[1], dp.add_sq[1]) : nullptr;
-      const int16_t *s0 = dp.n_sub > 0 ? ft_row(persp, dp.sub_pc[0], dp.sub_sq[0]) : nullptr;
-      const int16_t *s1 = dp.n_sub > 1 ? ft_row(persp, dp.sub_pc[1], dp.sub_sq[1]) : nullptr;
-
-      if (a1) { // castling: 2 adds, 2 subs
-        for (int i = 0; i < HL; ++i)
-          dst[i] = static_cast<int16_t>(src[i] + a0[i] + a1[i] - s0[i] - s1[i]);
-      } else if (s1) { // capture / en passant: 1 add, 2 subs
-        for (int i = 0; i < HL; ++i)
-          dst[i] = static_cast<int16_t>(src[i] + a0[i] - s0[i] - s1[i]);
-      } else if (a0) { // quiet / promotion: 1 add, 1 sub
-        for (int i = 0; i < HL; ++i)
-          dst[i] = static_cast<int16_t>(src[i] + a0[i] - s0[i]);
-      } else { // null move: no feature changes
-        std::memcpy(dst, src, sizeof(int16_t) * HL);
+  // Refresh: tiled so the accumulator tile stays in registers across all piece rows (one pass
+  // over memory per tile instead of one per piece).
+  void refresh_half(int16_t *dst, const int16_t *const *rows, int n) {
+    for (int i = 0; i < HL; i += 64) { // 4 x 16-lane vectors per tile
+      __m256i v0 = _mm256_load_si256(reinterpret_cast<const __m256i *>(g_net.ft_b + i));
+      __m256i v1 = _mm256_load_si256(reinterpret_cast<const __m256i *>(g_net.ft_b + i + 16));
+      __m256i v2 = _mm256_load_si256(reinterpret_cast<const __m256i *>(g_net.ft_b + i + 32));
+      __m256i v3 = _mm256_load_si256(reinterpret_cast<const __m256i *>(g_net.ft_b + i + 48));
+      for (int k = 0; k < n; ++k) {
+        const int16_t *r = rows[k] + i;
+        v0               = _mm256_add_epi16(v0, _mm256_load_si256(reinterpret_cast<const __m256i *>(r)));
+        v1               = _mm256_add_epi16(v1, _mm256_load_si256(reinterpret_cast<const __m256i *>(r + 16)));
+        v2               = _mm256_add_epi16(v2, _mm256_load_si256(reinterpret_cast<const __m256i *>(r + 32)));
+        v3               = _mm256_add_epi16(v3, _mm256_load_si256(reinterpret_cast<const __m256i *>(r + 48)));
       }
+      _mm256_store_si256(reinterpret_cast<__m256i *>(dst + i), v0);
+      _mm256_store_si256(reinterpret_cast<__m256i *>(dst + i + 16), v1);
+      _mm256_store_si256(reinterpret_cast<__m256i *>(dst + i + 32), v2);
+      _mm256_store_si256(reinterpret_cast<__m256i *>(dst + i + 48), v3);
     }
-    child.computed = true;
   }
 
-  // SCReLU output layer: sum over both halves of clamp(a,0,QA)^2 * w, stm half first.
-  // Computed as v*(v*w) so the SIMD versions can use mullo(int16) + madd — v*w fits int16
-  // because the trainer clips |w| so that QA*|w_q| < 32768.
-  int output_dot(const Accumulator &acc, Color stm) {
+  // One half of the SCReLU dot: sum clamp(a,0,QA) * (clamp(a,0,QA) * w) in int32 lanes.
+  // v*w fits int16 (trainer clips |w_q| <= 127); two lane-sum registers break the dependency
+  // chain; the horizontal reduction happens once, in the caller.
+  __m256i dot_half(const int16_t *a, const int16_t *w) {
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i qa   = _mm256_set1_epi16(QA);
+    __m256i       s0 = zero, s1 = zero;
+    for (int i = 0; i < HL; i += 32) {
+      __m256i v0 = _mm256_load_si256(reinterpret_cast<const __m256i *>(a + i));
+      __m256i v1 = _mm256_load_si256(reinterpret_cast<const __m256i *>(a + i + 16));
+      v0         = _mm256_min_epi16(_mm256_max_epi16(v0, zero), qa);
+      v1         = _mm256_min_epi16(_mm256_max_epi16(v1, zero), qa);
+      const __m256i p0 = _mm256_mullo_epi16(v0, _mm256_load_si256(reinterpret_cast<const __m256i *>(w + i)));
+      const __m256i p1 = _mm256_mullo_epi16(v1, _mm256_load_si256(reinterpret_cast<const __m256i *>(w + i + 16)));
+      s0               = _mm256_add_epi32(s0, _mm256_madd_epi16(v0, p0));
+      s1               = _mm256_add_epi32(s1, _mm256_madd_epi16(v1, p1));
+    }
+    return _mm256_add_epi32(s0, s1);
+  }
+
+  int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a) {
+    const __m256i s  = _mm256_add_epi32(dot_half(stm_a, g_net.out_w), dot_half(opp_a, g_net.out_w + HL));
+    __m128i       s4 = _mm_add_epi32(_mm256_castsi256_si128(s), _mm256_extracti128_si256(s, 1));
+    s4               = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0x4E));
+    s4               = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0xB1));
+    return _mm_cvtsi128_si32(s4);
+  }
+
+#elif defined(SIMD) && defined(ARCH_ARM_NEON)
+
+  void add1_sub1(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0) {
+    for (int i = 0; i < HL; i += 8) {
+      int16x8_t v = vld1q_s16(src + i);
+      v           = vaddq_s16(v, vld1q_s16(a0 + i));
+      v           = vsubq_s16(v, vld1q_s16(s0 + i));
+      vst1q_s16(dst + i, v);
+    }
+  }
+  void add1_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0, const int16_t *s1) {
+    for (int i = 0; i < HL; i += 8) {
+      int16x8_t v = vld1q_s16(src + i);
+      v           = vaddq_s16(v, vld1q_s16(a0 + i));
+      v           = vsubq_s16(v, vld1q_s16(s0 + i));
+      v           = vsubq_s16(v, vld1q_s16(s1 + i));
+      vst1q_s16(dst + i, v);
+    }
+  }
+  void add2_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *a1, const int16_t *s0,
+                 const int16_t *s1) {
+    for (int i = 0; i < HL; i += 8) {
+      int16x8_t v = vld1q_s16(src + i);
+      v           = vaddq_s16(v, vld1q_s16(a0 + i));
+      v           = vaddq_s16(v, vld1q_s16(a1 + i));
+      v           = vsubq_s16(v, vld1q_s16(s0 + i));
+      v           = vsubq_s16(v, vld1q_s16(s1 + i));
+      vst1q_s16(dst + i, v);
+    }
+  }
+
+  void refresh_half(int16_t *dst, const int16_t *const *rows, int n) {
+    for (int i = 0; i < HL; i += 32) { // 4 x 8-lane vectors per tile
+      int16x8_t v0 = vld1q_s16(g_net.ft_b + i);
+      int16x8_t v1 = vld1q_s16(g_net.ft_b + i + 8);
+      int16x8_t v2 = vld1q_s16(g_net.ft_b + i + 16);
+      int16x8_t v3 = vld1q_s16(g_net.ft_b + i + 24);
+      for (int k = 0; k < n; ++k) {
+        const int16_t *r = rows[k] + i;
+        v0               = vaddq_s16(v0, vld1q_s16(r));
+        v1               = vaddq_s16(v1, vld1q_s16(r + 8));
+        v2               = vaddq_s16(v2, vld1q_s16(r + 16));
+        v3               = vaddq_s16(v3, vld1q_s16(r + 24));
+      }
+      vst1q_s16(dst + i, v0);
+      vst1q_s16(dst + i + 8, v1);
+      vst1q_s16(dst + i + 16, v2);
+      vst1q_s16(dst + i + 24, v3);
+    }
+  }
+
+  int32x4_t dot_half(const int16_t *a, const int16_t *w) {
+    const int16x8_t zero = vdupq_n_s16(0);
+    const int16x8_t qa   = vdupq_n_s16(QA);
+    int32x4_t       s0 = vdupq_n_s32(0), s1 = vdupq_n_s32(0);
+    for (int i = 0; i < HL; i += 16) {
+      int16x8_t v0 = vminq_s16(vmaxq_s16(vld1q_s16(a + i), zero), qa);
+      int16x8_t v1 = vminq_s16(vmaxq_s16(vld1q_s16(a + i + 8), zero), qa);
+      // v*w fits int16 exactly (|w_q| <= 127), so the low-half multiply is exact — the NEON
+      // equivalent of AVX2's mullo+madd.
+      const int16x8_t p0 = vmulq_s16(v0, vld1q_s16(w + i));
+      const int16x8_t p1 = vmulq_s16(v1, vld1q_s16(w + i + 8));
+      s0                 = vmlal_s16(s0, vget_low_s16(v0), vget_low_s16(p0));
+      s0                 = vmlal_high_s16(s0, v0, p0);
+      s1                 = vmlal_s16(s1, vget_low_s16(v1), vget_low_s16(p1));
+      s1                 = vmlal_high_s16(s1, v1, p1);
+    }
+    return vaddq_s32(s0, s1);
+  }
+
+  int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a) {
+    return vaddvq_s32(vaddq_s32(dot_half(stm_a, g_net.out_w), dot_half(opp_a, g_net.out_w + HL)));
+  }
+
+#else // scalar reference (SIMD off / unknown arch)
+
+  void add1_sub1(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0) {
+    for (int i = 0; i < HL; ++i)
+      dst[i] = static_cast<int16_t>(src[i] + a0[i] - s0[i]);
+  }
+  void add1_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0, const int16_t *s1) {
+    for (int i = 0; i < HL; ++i)
+      dst[i] = static_cast<int16_t>(src[i] + a0[i] - s0[i] - s1[i]);
+  }
+  void add2_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *a1, const int16_t *s0,
+                 const int16_t *s1) {
+    for (int i = 0; i < HL; ++i)
+      dst[i] = static_cast<int16_t>(src[i] + a0[i] + a1[i] - s0[i] - s1[i]);
+  }
+
+  void refresh_half(int16_t *dst, const int16_t *const *rows, int n) {
+    std::memcpy(dst, g_net.ft_b, sizeof(g_net.ft_b));
+    for (int k = 0; k < n; ++k) {
+      const int16_t *r = rows[k];
+      for (int i = 0; i < HL; ++i)
+        dst[i] = static_cast<int16_t>(dst[i] + r[i]);
+    }
+  }
+
+  int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a) {
     int32_t        sum     = 0;
-    const int16_t *half[2] = {acc.v[stm], acc.v[~stm]};
+    const int16_t *half[2] = {stm_a, opp_a};
     for (int h = 0; h < 2; ++h) {
       const int16_t *a = half[h];
       const int16_t *w = &g_net.out_w[h * HL];
@@ -106,6 +245,56 @@ namespace {
         sum += v * v * static_cast<int32_t>(w[i]); // exact: |v*v*w| <= 255*255*127 < 2^31
       }
     }
+    return sum;
+  }
+
+#endif
+
+  // Rebuilds both perspective halves of `acc` from scratch (bias + every piece on the board).
+  void acc_refresh(Accumulator &acc, const Position &pos) {
+    const int16_t *rows[2][64]; // 32 pieces max in a legal game; headroom for weird FEN input
+    int            n = 0;
+    for (int pc = WHITE_PAWN; pc <= BLACK_KING; ++pc) {
+      if (pc > WHITE_KING && pc < BLACK_PAWN)
+        continue; // the gap in the Piece enum (6, 7)
+      Bitboard bb = pos.bitboard_of(Piece(pc));
+      while (bb) {
+        const Square s  = pop_lsb(&bb);
+        rows[WHITE][n]  = ft_row(WHITE, Piece(pc), s);
+        rows[BLACK][n]  = ft_row(BLACK, Piece(pc), s);
+        ++n;
+      }
+    }
+    refresh_half(acc.v[WHITE], rows[WHITE], n);
+    refresh_half(acc.v[BLACK], rows[BLACK], n);
+    acc.computed = true;
+  }
+
+  // Builds `child` from `parent` by applying child.dp, both perspectives in one fused pass.
+  void acc_apply(Accumulator &child, const Accumulator &parent) {
+    const DirtyPiece &dp = child.dp;
+    for (int p = 0; p < 2; ++p) {
+      const Color    persp = Color(p);
+      const int16_t *src   = parent.v[p];
+      int16_t       *dst   = child.v[p];
+
+      if (dp.n_add == 2) // castling: 2 adds, 2 subs
+        add2_sub2(dst, src, ft_row(persp, dp.add_pc[0], dp.add_sq[0]), ft_row(persp, dp.add_pc[1], dp.add_sq[1]),
+                  ft_row(persp, dp.sub_pc[0], dp.sub_sq[0]), ft_row(persp, dp.sub_pc[1], dp.sub_sq[1]));
+      else if (dp.n_sub == 2) // capture / en passant: 1 add, 2 subs
+        add1_sub2(dst, src, ft_row(persp, dp.add_pc[0], dp.add_sq[0]), ft_row(persp, dp.sub_pc[0], dp.sub_sq[0]),
+                  ft_row(persp, dp.sub_pc[1], dp.sub_sq[1]));
+      else if (dp.n_add == 1) // quiet / promotion: 1 add, 1 sub
+        add1_sub1(dst, src, ft_row(persp, dp.add_pc[0], dp.add_sq[0]), ft_row(persp, dp.sub_pc[0], dp.sub_sq[0]));
+      else // null move: no feature changes
+        std::memcpy(dst, src, sizeof(int16_t) * HL);
+    }
+    child.computed = true;
+  }
+
+  // SCReLU output layer: sum over both halves of clamp(a,0,QA)^2 * w, stm half first.
+  int output_dot(const Accumulator &acc, Color stm) {
+    const int32_t sum = dot_reduce(acc.v[stm], acc.v[~stm]);
     // sum is at scale QA^2*QB; one /QA plus the bias (at QA*QB) then rescale to centipawns.
     return ((sum / QA) + g_net.out_b) * SCALE / (QA * QB);
   }

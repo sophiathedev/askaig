@@ -367,6 +367,66 @@ namespace {
               << " eval checks, incremental == refresh\n";
   }
 
+  // --- bench evalnps -----------------------------------------------------------------------------
+  // Micro-benchmark of the NNUE evaluation path a search will drive: cycles of push -> evaluate
+  // (one incremental apply + output dot) then unwind, on a fixed reversible knight-shuffle line
+  // from the start position, plus a separate full-refresh loop. Deterministic; movegen excluded.
+  void bench_evalnps() {
+    if (!nnue::loaded()) {
+      std::cout << "bench evalnps FAIL: no net loaded\n";
+      return;
+    }
+    Position pos;
+    Position::set(DEFAULT_FEN, pos);
+    nnue::Evaluator ev;
+    ev.reset(pos);
+
+    // A 4-ply reversible cycle (knights out and back): the position returns to startpos, so the
+    // loop can run forever without growing the stack beyond 4 plies.
+    const Move cyc[4] = {Move(g1, f3, QUIET), Move(g8, f6, QUIET), Move(f3, g1, QUIET), Move(f6, g8, QUIET)};
+
+    // volatile: LTO can prove the eval functions pure and hoist them out of the loops otherwise
+    // (observed with the refresh loop) — a forced store per eval is noise at these sizes.
+    volatile int64_t sink = 0;
+
+    constexpr int ITERS = 500'000; // x4 evals per iteration
+    auto          t0    = std::chrono::steady_clock::now();
+    for (int it = 0; it < ITERS; ++it) {
+      for (const Move m: cyc) {
+        ev.push(pos, m);
+        play_any_color(pos, m);
+        sink = sink + ev.evaluate(pos);
+      }
+      for (int k = 0; k < 4; ++k) {
+        undo_any_color(pos, cyc[3 - k]);
+        ev.pop();
+      }
+    }
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    const uint64_t evals = uint64_t(ITERS) * 4;
+    std::cout << "incremental: " << evals << " evals in " << us / 1000 << " ms = "
+              << (us > 0 ? evals * 1'000'000 / uint64_t(us) : 0) << " evals/s\n";
+
+    // Refresh loop: walk the same 2-ply cycle so every call sees a different position.
+    constexpr int RITERS = 50'000; // x4 evals per iteration
+    t0                   = std::chrono::steady_clock::now();
+    for (int it = 0; it < RITERS; ++it) {
+      play_any_color(pos, cyc[0]);
+      sink = sink + nnue::evaluate_refresh(pos);
+      play_any_color(pos, cyc[1]);
+      sink = sink + nnue::evaluate_refresh(pos);
+      undo_any_color(pos, cyc[1]);
+      sink = sink + nnue::evaluate_refresh(pos);
+      undo_any_color(pos, cyc[0]);
+      sink = sink + nnue::evaluate_refresh(pos);
+    }
+    us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    const uint64_t revals = uint64_t(RITERS) * 4;
+    std::cout << "refresh:     " << revals << " evals in " << us / 1000 << " ms = "
+              << (us > 0 ? revals * 1'000'000 / uint64_t(us) : 0) << " evals/s\n";
+    std::cout << "checksum " << sink << "\n"; // also a cross-build (NEON/AVX2/scalar) invariant
+  }
+
   // Handles "position [startpos | fen <fen>] [moves <m1> ...]".
   void position_cmd(std::optional<Position> &pos, std::istringstream &is) {
     std::string token;
@@ -483,6 +543,12 @@ void uci::loop() {
           std::cout << "info string EvalFile loaded: " << path << "\n";
       }
       // (unknown options: silently ignored, per the UCI spec)
+    } else if (cmd == "bench") {
+      // Hidden benchmark commands: "bench evalnps".
+      std::string what;
+      is >> what;
+      if (what == "evalnps")
+        bench_evalnps();
     } else if (cmd == "selftest") {
       // Hidden test commands (not advertised): "selftest nnue [games] [maxply]".
       std::string what;
