@@ -3,7 +3,6 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -14,6 +13,7 @@
 #include "nnue.h"
 #include "see.h"
 #include "tt.h"
+#include "ybwc.h"
 
 // Fail-soft negamax with, in rough order of gating: TT cutoffs, static-eval correction
 // history, IIR, razoring, RFP, NMP, ProbCut, singular extensions (with multicut and
@@ -32,28 +32,6 @@ namespace {
 
   using namespace search;
   using Clock = std::chrono::steady_clock;
-
-  struct SplitPoint;
-
-  struct Stack {
-    Move       pv[MAX_PLY + 1];
-    int        pv_len;
-    Move       killers[2];
-    Move       move; // the move made AT this ply (null move: to_from() == 0 with ch == nullptr)
-    Move       excluded; // the move excluded by a singular-verification search
-    int        static_eval;
-    ContTable *ch; // continuation-history slice of `move`
-    int        double_ext; // double-extension budget spent on this path
-    bool       in_check;
-  };
-
-  struct ThreadData {
-    nnue::Evaluator ev;
-    Stack           stack[MAX_PLY + 8];
-    uint64_t        nodes    = 0;
-    int             seldepth = 0, root_depth = 1;
-    SplitPoint     *cur_split = nullptr; // innermost split this thread is claiming from
-  };
 
   // Shared search state. History tables are shared by all threads with plain (benign-race)
   // int16 updates, exactly like the TT — both are statistics, not correctness-critical.
@@ -76,31 +54,6 @@ namespace {
   int lmr_base(int depth, int movecount) { return g_lmr[std::min(depth, 63)][std::min(movecount, 63)]; }
 
   // --- small helpers ----------------------------------------------------------------------------
-
-  void do_move(Position &p, Move m) {
-    if (p.turn() == WHITE)
-      p.play<WHITE>(m);
-    else
-      p.play<BLACK>(m);
-  }
-  void undo_move(Position &p, Move m) {
-    if (p.turn() == WHITE)
-      p.undo<BLACK>(m);
-    else
-      p.undo<WHITE>(m);
-  }
-  bool stm_in_check(const Position &p) { return p.turn() == WHITE ? p.in_check<WHITE>() : p.in_check<BLACK>(); }
-
-  bool is_quiet(Move m) {
-    const MoveFlags f = m.flags();
-    return f == QUIET || f == DOUBLE_PUSH || f == OO || f == OOO;
-  }
-
-  Position clone_position(const Position &src) { // Position is plain data; memcpy is a faithful copy
-    Position dst;
-    std::memcpy(static_cast<void *>(&dst), static_cast<const void *>(&src), sizeof(Position));
-    return dst;
-  }
 
   // The engine Zobrist hash omits castling rights and the en-passant square (they change the
   // legal moves, so two positions differing only there must not share a TT slot) — mix them in.
@@ -125,42 +78,6 @@ namespace {
     const int raw  = t.ev.evaluate(pos);
     const int corr = g_hist.corr[pos.turn()][corr_index(pos)] / 64;
     return std::clamp(raw + corr, -MATE_IN_MAX + 1, MATE_IN_MAX - 1);
-  }
-
-  struct SplitPoint {
-    SplitPoint *parent; // the split this thread was itself claiming from (abort chain)
-    // Snapshots taken at split creation. The master keeps making/unmaking moves on its LIVE
-    // position and stack while claiming — workers must attach to a frozen copy, never to the
-    // master's live objects (cloning those mid-make was a nasty corruption bug).
-    Position             snapshot;
-    static constexpr int CTX = 8; // stack entries [ctx_lo .. 4+ply] the children may read below the node
-    Stack                ctx[CTX];
-    int                  ctx_lo;
-    int                  ply, depth, base_count, lmp_limit, root_depth;
-    bool                 pv_node, cutnode, improving;
-    int                  beta;
-    std::atomic<int>     alpha, best;
-    std::atomic<size_t>  next{0};
-    std::atomic<int>     quiets{0}; // shared quiet count (LMP in the parallel phase)
-    std::atomic<int>     active{0};
-    std::atomic<bool>    cutoff{false};
-    std::vector<Move>    moves;
-    std::mutex           mtx; // guards best/alpha/best_move/pv merges
-    Move                 best_move{};
-    Move                 pv[MAX_PLY + 1];
-    int                  pv_len = 0;
-  };
-
-  // True when this thread's work is moot: global stop, or a beta cutoff anywhere in the chain
-  // of splits it is working under. A search aborted this way returns garbage values — every
-  // consumer (claim loops, think) must discard results once aborted() holds.
-  bool aborted(ThreadData &t) {
-    if (g_stop.load(std::memory_order_relaxed))
-      return true;
-    for (SplitPoint *s = t.cur_split; s; s = s->parent)
-      if (s->cutoff.load(std::memory_order_relaxed))
-        return true;
-    return false;
   }
 
   // A stop/abort poll for the tree: aborted() plus the hard clock.
@@ -228,223 +145,7 @@ namespace {
   // --- YBWC split machinery ---------------------------------------------------------------------
 
 
-  // One parallel sibling: the shared move-loop tail (pruning, LMR, PVS) for moves searched
-  // after the eldest brother. Mirrors the sequential loop's post-first-move logic; singular
-  // extension never applies here (it is TT-move-only, and the TT move is searched first).
-  // Returns INT_MIN when the move was pruned, else the search value.
-  int split_move(ThreadData &t, SplitPoint &sp, Position &pos, Stack *ss, Move m, int move_count) {
-    const int  depth     = sp.depth;
-    const int  ply       = sp.ply;
-    const bool quiet     = is_quiet(m);
-    const bool in_check  = ss->in_check;
-    const int  alpha_now = sp.alpha.load(std::memory_order_relaxed);
-    const int  beta      = sp.beta;
-
-    // Move-loop pruning (a real best already exists: the eldest brother completed).
-    if (quiet && !in_check) {
-      if (depth <= 8 && sp.quiets.load(std::memory_order_relaxed) >= sp.lmp_limit)
-        return INT32_MIN;
-      if (depth <= 6 && std::abs(alpha_now) < MATE_IN_MAX && ss->static_eval + 100 + 120 * depth <= alpha_now)
-        return INT32_MIN;
-      if (depth <= 4 && quiet_hist(ss, pos, m) < -2048 * depth)
-        return INT32_MIN;
-    }
-    if (depth <= 8 && !see_ge(pos, m, quiet ? -50 * depth : -90 * depth))
-      return INT32_MIN;
-
-    int extension = 0;
-    if (in_check && ply < 2 * t.root_depth)
-      extension = 1; // capped check extension
-
-    const Piece moved = pos.at(m.from());
-    ss->move          = m;
-    ss->ch            = &g_hist.cont[moved][m.to()];
-
-    ++t.nodes;
-    if (quiet)
-      sp.quiets.fetch_add(1, std::memory_order_relaxed);
-    t.ev.push(pos, m);
-    do_move(pos, m);
-
-    const int new_depth = depth - 1 + extension;
-    int       v;
-
-    int r = 0;
-    if (depth >= 3 && move_count > 1 + 2 * sp.pv_node && (quiet || move_count > 6)) {
-      r = lmr_base(depth, move_count);
-      r += sp.cutnode;
-      r += !sp.improving;
-      r -= sp.pv_node;
-      if (quiet)
-        r -= std::clamp(quiet_hist(ss, pos, m) / 8192, -2, 2);
-      else
-        r /= 2;
-      r = std::clamp(r, 0, new_depth - 1);
-    }
-
-    v = -negamax<false>(t, pos, ss + 1, -alpha_now - 1, -alpha_now, new_depth - r, ply + 1, true);
-    if (v > alpha_now && r > 0)
-      v = -negamax<false>(t, pos, ss + 1, -alpha_now - 1, -alpha_now, new_depth, ply + 1, !sp.cutnode);
-    if (sp.pv_node && v > alpha_now && v < beta)
-      v = -negamax<true>(t, pos, ss + 1, -beta, -alpha_now, new_depth, ply + 1, false);
-
-    undo_move(pos, m);
-    t.ev.pop();
-    return v;
-  }
-
-  // Claims and searches sibling moves from `sp` until exhausted/cut. Used by the master (on
-  // its own position) and by pool helpers (on a clone). Returns via sp.{best,alpha,cutoff,...}.
-  void split_claim_loop(ThreadData &t, SplitPoint &sp, Position &pos, Stack *ss) {
-    while (!aborted(t)) {
-      const size_t idx = sp.next.fetch_add(1, std::memory_order_relaxed);
-      if (idx >= sp.moves.size())
-        break;
-      const Move m = sp.moves[idx];
-      if (sp.alpha.load(std::memory_order_relaxed) >= sp.beta)
-        break;
-
-      const int v = split_move(t, sp, pos, ss, m, sp.base_count + int(idx) + 1);
-      if (v == INT32_MIN)
-        continue; // pruned
-      if (aborted(t))
-        break; // an aborted search returns garbage — discard it (outer-split cutoffs included)
-
-      std::lock_guard<std::mutex> lk(sp.mtx);
-      if (v > sp.best.load(std::memory_order_relaxed)) {
-        sp.best.store(v, std::memory_order_relaxed);
-        if (v > sp.alpha.load(std::memory_order_relaxed)) {
-          sp.best_move = m;
-          sp.alpha.store(v, std::memory_order_relaxed);
-          if (sp.pv_node) {
-            // The child pv is only valid when the value came from the PV re-search (exact);
-            // a fail-high came from a zero-window search, which never writes child pvs.
-            sp.pv[0] = m;
-            if (v < sp.beta) {
-              std::copy((ss + 1)->pv, (ss + 1)->pv + (ss + 1)->pv_len, sp.pv + 1);
-              sp.pv_len = (ss + 1)->pv_len + 1;
-            } else
-              sp.pv_len = 1;
-          }
-          if (v >= sp.beta)
-            sp.cutoff.store(true, std::memory_order_relaxed);
-        }
-      }
-    }
-  }
-
-  // Helper-thread pool. Helpers sleep until a split with unclaimed moves is registered, attach
-  // to it (own Position clone + accumulator refresh + a copy of the master's stack prefix for
-  // the history/eval context), and claim siblings until the split is drained or cut.
-  class SplitPool {
-  public:
-    void set_size(int helpers) {
-      shutdown();
-      exit_flag = false;
-      tds.clear();
-      for (int i = 0; i < helpers; ++i)
-        tds.emplace_back(std::make_unique<ThreadData>());
-      for (int i = 0; i < helpers; ++i)
-        threads.emplace_back(&SplitPool::worker, this, i);
-    }
-    void shutdown() {
-      {
-        std::lock_guard<std::mutex> lk(mtx);
-        exit_flag = true;
-      }
-      cv.notify_all();
-      for (auto &th: threads)
-        th.join();
-      threads.clear();
-    }
-    ~SplitPool() { shutdown(); }
-
-    bool has_helpers() const { return !tds.empty(); }
-
-    void register_split(SplitPoint *sp) {
-      {
-        std::lock_guard<std::mutex> lk(mtx);
-        active.push_back(sp);
-      }
-      cv.notify_all();
-    }
-    void unregister_split(SplitPoint *sp) {
-      std::lock_guard<std::mutex> lk(mtx);
-      std::erase(active, sp);
-    }
-
-    uint64_t total_nodes() const {
-      uint64_t n = 0;
-      for (const auto &t: tds)
-        n += t->nodes;
-      return n;
-    }
-    void reset_counters(int root_depth) {
-      for (auto &t: tds) {
-        t->nodes      = 0;
-        t->root_depth = root_depth;
-      }
-    }
-    void set_root_depth(int d) {
-      for (auto &t: tds)
-        t->root_depth = d;
-    }
-
-  private:
-    SplitPoint *grab() { // caller holds mtx
-      for (SplitPoint *sp: active)
-        if (!sp->cutoff.load(std::memory_order_relaxed) &&
-            sp->next.load(std::memory_order_relaxed) < sp->moves.size())
-          return sp;
-      return nullptr;
-    }
-
-    void worker(int idx) {
-      ThreadData &t = *tds[size_t(idx)];
-      while (true) {
-        SplitPoint *sp = nullptr;
-        {
-          std::unique_lock<std::mutex> lk(mtx);
-          // active++ must happen INSIDE the lock: the master unregisters (same lock) and then
-          // waits for active == 0 — incrementing after release would race its teardown.
-          cv.wait(lk, [&] {
-            sp = nullptr;
-            if (exit_flag)
-              return true;
-            if ((sp = grab()) != nullptr)
-              sp->active.fetch_add(1, std::memory_order_relaxed);
-            return sp != nullptr;
-          });
-          if (exit_flag)
-            return;
-        }
-        // Attach: clone the frozen snapshot, rebuild the accumulator there, and restore the
-        // stack context around the node so (ss-1)/(ss-2) conthist and improving work.
-        Position pos = clone_position(sp->snapshot);
-        std::memset(t.stack, 0, sizeof(Stack) * size_t(4 + sp->ply + 1));
-        for (int i = sp->ctx_lo; i <= 4 + sp->ply; ++i)
-          t.stack[i] = sp->ctx[i - sp->ctx_lo];
-        Stack *ss    = t.stack + 4 + sp->ply;
-        t.ev.reset(pos);
-        t.cur_split  = sp;
-        t.root_depth = sp->root_depth;
-        split_claim_loop(t, *sp, pos, ss);
-        t.cur_split = nullptr; // fully detach BEFORE releasing the split (sp->parent may die with it)
-        sp->active.fetch_sub(1, std::memory_order_relaxed);
-      }
-    }
-
-    std::vector<std::unique_ptr<ThreadData>> tds;
-    std::vector<std::thread>                 threads;
-    std::vector<SplitPoint *>                active;
-    std::mutex                               mtx;
-    std::condition_variable                  cv;
-    bool                                     exit_flag = false;
-  };
-
-  SplitPool g_pool;
-
-  uint64_t all_nodes() { return g_main.nodes + g_pool.total_nodes(); }
+  uint64_t all_nodes() { return g_main.nodes + pool().total_nodes(); }
 
   // --- quiescence -------------------------------------------------------------------------------
 
@@ -815,7 +516,7 @@ namespace {
       }
 
       // --- YBWC split: the eldest brother is done and didn't cut -> farm out the rest ---
-      if (best < beta && depth >= g_split_depth && g_pool.has_helpers() && move_count >= 1 &&
+      if (best < beta && depth >= g_split_depth && pool().has_helpers() && move_count >= 1 &&
           picker.remaining() >= 2) {
         // Heap, NOT a local: SplitPoint embeds a Position snapshot (~37 KB — history[1024]),
         // and negamax recurses 30+ frames deep on a 512 KB std::thread stack. A stack-local
@@ -845,16 +546,7 @@ namespace {
         sp.best.store(best);
         sp.quiets.store(quiet_count);
 
-        g_pool.register_split(&sp);
-        SplitPoint *prev_split = t.cur_split;
-        t.cur_split            = &sp;
-        split_claim_loop(t, sp, pos, ss); // the master helps drain its own split
-        t.cur_split = prev_split;
-        if (aborted(t)) // aborted from above: tell the helpers their work is moot too
-          sp.cutoff.store(true, std::memory_order_relaxed);
-        g_pool.unregister_split(&sp);
-        while (sp.active.load(std::memory_order_relaxed) > 0)
-          std::this_thread::yield(); // wait for helpers to finish/abort their claimed moves
+        run_split(t, sp, pos, ss); // register + master claim loop + abort + wait (ybwc.cpp)
 
         if (g_stop.load(std::memory_order_relaxed))
           return 0;
@@ -930,11 +622,27 @@ namespace {
 
 } // namespace
 
+// --- hooks for the YBWC machinery (ybwc.cpp) — the negamax templates live above -----------------
+
+int search::ybwc_search(ThreadData &t, Position &pos, Stack *ss, int alpha, int beta, int depth, int ply,
+                        bool cutnode, bool pv) {
+  return pv ? negamax<true>(t, pos, ss, alpha, beta, depth, ply, cutnode)
+            : negamax<false>(t, pos, ss, alpha, beta, depth, ply, cutnode);
+}
+
+search::Histories &search::shared_hist() { return g_hist; }
+
+bool search::stop_requested() { return g_stop.load(std::memory_order_relaxed); }
+
+int search::lmr_reduction(int depth, int movecount) { return lmr_base(depth, movecount); }
+
+int search::quiet_history(const Stack *ss, const Position &pos, Move m) { return quiet_hist(ss, pos, m); }
+
 void search::request_stop() { g_stop.store(true, std::memory_order_relaxed); }
 
 void search::new_game() { g_hist.clear(); }
 
-void search::set_threads(int n) { g_pool.set_size(std::max(0, n - 1)); }
+void search::set_threads(int n) { pool().set_size(std::max(0, n - 1)); }
 
 void search::set_split_depth(int d) { g_split_depth = std::max(1, d); }
 
@@ -948,7 +656,7 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
   std::memset(g_main.stack, 0, sizeof(g_main.stack));
   g_main.ev.reset(pos);
   g_main.cur_split = nullptr;
-  g_pool.reset_counters(1);
+  pool().reset_counters(1);
   tt::new_search();
 
   max_depth = std::clamp(max_depth, 1, MAX_PLY - 1);
@@ -958,7 +666,7 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
   for (int d = 1; d <= max_depth; ++d) {
     g_main.root_depth = d;
     g_main.seldepth   = 0;
-    g_pool.set_root_depth(d);
+    pool().set_root_depth(d);
     const int v = aspiration(pos, d, prev);
     if (g_stop.load(std::memory_order_relaxed) && d > 1)
       break; // discard the aborted iteration; the previous full one stands
