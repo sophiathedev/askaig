@@ -461,6 +461,17 @@ namespace {
     std::ostringstream zob;
     zob << "0x" << std::hex << std::uppercase << pos.get_hash();
 
+    // The static NNUE eval, observer's (White's) POV: + = better for White, - for Black.
+    std::string eval_str = "no net loaded";
+    if (nnue::loaded()) {
+      const int   stm_cp = nnue::evaluate_refresh(pos);
+      const int   cp     = pos.turn() == WHITE ? stm_cp : -stm_cp;
+      const char *col    = cp > 0 ? "\033[92m" : (cp < 0 ? "\033[91m" : RST);
+      char        pawns[16];
+      std::snprintf(pawns, sizeof pawns, "%+.2f", cp / 100.0);
+      eval_str = std::string(col) + pawns + RST + " (cp " + std::to_string(cp) + ")";
+    }
+
     const std::string L = LBL, R = RST;
     const std::string info[] = {
             L + "FEN: " + R + pos.fen() + " " + std::to_string(pos.fifty()) + " " +
@@ -471,6 +482,7 @@ namespace {
             L + "En Passant: " + R + (ep == NO_SQUARE ? "NULL" : SQSTR[ep]),
             L + "Half Moves: " + R + std::to_string(pos.fifty()),
             L + "In Check: " + R + (check ? "true" : "false"),
+            L + "Eval: " + R + eval_str,
     };
 
     std::cout << "   " << DIM << "-----------------" << RST << "\n";
@@ -489,17 +501,7 @@ namespace {
       std::cout << "\n";
     }
     std::cout << "   " << DIM << "-----------------" << RST << "\n";
-    std::cout << "     " << LBL << "A B C D E F G H" << RST << "\n\n";
-
-    if (nnue::loaded()) {
-      const int   stm_cp = nnue::evaluate_refresh(pos);
-      const int   cp     = pos.turn() == WHITE ? stm_cp : -stm_cp; // observer = White's POV
-      const char *col    = cp > 0 ? "\033[92m" : (cp < 0 ? "\033[91m" : RST);
-      char        pawns[16];
-      std::snprintf(pawns, sizeof pawns, "%+.2f", cp / 100.0);
-      std::cout << " " << LBL << "Eval: " << RST << col << pawns << RST << " (cp " << cp << ")\n";
-    } else
-      std::cout << " " << LBL << "Eval: " << RST << "no net loaded\n";
+    std::cout << "     " << LBL << "A B C D E F G H" << RST << "\n";
   }
 
   // Handles "position [startpos | fen <fen>] [moves <m1> ...]".
