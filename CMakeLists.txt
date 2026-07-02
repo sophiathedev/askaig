@@ -13,6 +13,7 @@ add_executable(askaig
     src/types.cpp
     src/tables.cpp
     src/position.cpp
+    src/nnue.cpp
     src/uci.cpp
     src/main.cpp)
 

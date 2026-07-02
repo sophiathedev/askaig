@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "nnue.h"
 #include "position.h"
 #include "tables.h"
 #include "types.h"
@@ -330,6 +331,7 @@ void uci::loop() {
       std::cout << "id name " << ENGINE_NAME << "\n";
       std::cout << "id author " << ENGINE_AUTHOR << "\n";
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
+      std::cout << "option name EvalFile type string default <embedded>\n";
       std::cout << "uciok\n";
     } else if (cmd == "isready") {
       std::cout << "readyok\n";
@@ -342,6 +344,16 @@ void uci::loop() {
       go_cmd(*pos, is);
     } else if (cmd == "d" || cmd == "display") {
       std::cout << *pos;
+    } else if (cmd == "eval") {
+      // Debug helper (like Stockfish's "eval"): the raw static NNUE evaluation of the current
+      // position via a full accumulator refresh. No search — for net testing (see parity.py).
+      if (!nnue::loaded())
+        std::cout << "info string no NNUE net loaded (use setoption name EvalFile value <path>)\n";
+      else {
+        const int cp = nnue::evaluate_refresh(*pos);
+        std::cout << "eval " << cp << " cp (side to move), " << (pos->turn() == WHITE ? cp : -cp)
+                  << " cp (white)\n";
+      }
     } else if (cmd == "setoption") {
       // setoption name <id> [value <x>]
       std::string token;
@@ -351,6 +363,19 @@ void uci::loop() {
         int t = 0;
         if (is >> t)
           g_threads = t < 1 ? 1 : (t > 1024 ? 1024 : t);
+      } else if (name == "EvalFile") {
+        // The value is the rest of the line (paths can contain spaces). A bad file keeps the
+        // currently loaded net (the embedded default) and reports why.
+        std::string path;
+        std::getline(is, path);
+        const size_t start = path.find_first_not_of(' ');
+        path = start == std::string::npos ? std::string{} : path.substr(start);
+        std::string err;
+        if (path.empty() || !nnue::load_file(path, &err))
+          std::cout << "info string EvalFile '" << path << "' rejected (" << (path.empty() ? "empty path" : err)
+                    << "), keeping the current net\n";
+        else
+          std::cout << "info string EvalFile loaded: " << path << "\n";
       }
       // (unknown options: silently ignored, per the UCI spec)
     } else if (cmd == "register" || cmd.empty()) {
