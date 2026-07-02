@@ -149,8 +149,12 @@ Supported commands: `uci`, `isready`, `ucinewgame`,
 evaluation of the current position), `stop`, `quit`.
 
 Hidden/debug commands (not advertised by `uci`): `bench [depth]` (the search-signature
-benchmark), `bench evalnps` (NNUE evaluation throughput), `selftest nnue [games] [maxply]`
-(asserts the incremental accumulator matches a full refresh over random legal playouts).
+benchmark), `bench evalnps` (NNUE evaluation throughput), and a `selftest` regression suite —
+`selftest nnue [games] [maxply]` (incremental accumulator vs. full refresh over random legal
+playouts), `selftest perft` (movegen vs. the classic reference positions), `selftest see`
+(static exchange evaluation), `selftest draw` (repetition/fifty-move detection), `selftest
+search` (PV legality and score sanity at Threads 1/2/4), and `selftest all` (everything, with a
+combined verdict). Runs automatically on every push/PR — see `.github/workflows/ci.yml`.
 
 ### Benchmark
 
