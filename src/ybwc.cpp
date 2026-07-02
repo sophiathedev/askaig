@@ -148,7 +148,14 @@ void search::run_split(ThreadData &t, SplitPoint &sp, Position &pos, Stack *ss) 
   if (aborted(t)) // aborted from above: tell the helpers their work is moot too
     sp.cutoff.store(true, std::memory_order_relaxed);
   g_pool.unregister_split(&sp);
-  while (sp.active.load(std::memory_order_relaxed) > 0)
+  // Acquire: pairs with the release in worker() below. sp.best_move/sp.pv/sp.pv_len are plain
+  // (non-atomic) fields a helper writes under sp.mtx and the caller reads right after this loop
+  // WITHOUT taking sp.mtx itself — relaxed ordering here would let the compiler/CPU reorder
+  // those writes to appear after this load completes, so the caller could read stale or torn
+  // data. Found by ThreadSanitizer (a real race, not one of the intentionally-unsynchronized
+  // statistics counters elsewhere in this file) — acquire/release is the fix, not a mutex,
+  // since it's a plain spin-wait already and no additional field needs protecting past this point.
+  while (sp.active.load(std::memory_order_acquire) > 0)
     std::this_thread::yield(); // wait for helpers to finish/abort their claimed moves
 }
 
@@ -188,6 +195,7 @@ void search::SplitPool::unregister_split(SplitPoint *sp) {
   std::erase(active, sp);
 }
 
+ASKAIG_TSAN_IGNORE
 uint64_t search::SplitPool::total_nodes() const {
   uint64_t n = 0;
   for (const auto &t: tds)
@@ -245,6 +253,9 @@ void search::SplitPool::worker(int idx) {
     t.root_depth = sp->root_depth;
     split_claim_loop(t, *sp, pos, ss);
     t.cur_split = nullptr; // fully detach BEFORE releasing the split (sp->parent may die with it)
-    sp->active.fetch_sub(1, std::memory_order_relaxed);
+    // Release: makes this worker's writes to sp->best_move/pv/pv_len (made under sp->mtx inside
+    // split_claim_loop, above) visible to whichever thread's acquire-load in run_split() next
+    // observes active == 0 — see the comment there.
+    sp->active.fetch_sub(1, std::memory_order_release);
   }
 }

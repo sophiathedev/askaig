@@ -88,6 +88,11 @@ namespace search {
     void register_split(SplitPoint *sp);
     void unregister_split(SplitPoint *sp);
 
+    // Sums each pool thread's plain (non-atomic) ThreadData::nodes counter, live, while those
+    // threads may still be incrementing it — an intentionally unsynchronized statistics read,
+    // same reasoning as the Histories tables in history.h (nps/NodeTM don't need an exact
+    // count, and every parallel search engine sums live per-thread node counters this way).
+    ASKAIG_TSAN_IGNORE
     [[nodiscard]] uint64_t total_nodes() const;
     void                   reset_counters(int root_depth);
     void                   set_root_depth(int d);
