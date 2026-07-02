@@ -47,7 +47,7 @@ jobs:
 
       - name: Install macOS deps
         if: runner.os == 'macOS'
-        run: brew install ninja
+        run: brew install ninja coreutils # coreutils: gives gtimeout (BSD macOS has no `timeout`)
 
       - name: Configure & build
         run: |
@@ -96,7 +96,11 @@ jobs:
           stop
           isready
           quit'
-          out=$(printf '%s\n' "$input" | timeout 20 ./build/askaig)
+          # `timeout` is GNU coreutils: present by default on the Linux runners, but not on
+          # macOS (BSD userland) — there it comes from `brew install coreutils` as `gtimeout`.
+          TIMEOUT_BIN=timeout
+          command -v timeout >/dev/null 2>&1 || TIMEOUT_BIN=gtimeout
+          out=$(printf '%s\n' "$input" | "$TIMEOUT_BIN" 20 ./build/askaig)
           status=$?
           echo "$out"
           [ "$status" -eq 0 ]
