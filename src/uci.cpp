@@ -1,4 +1,5 @@
 #include "uci.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -262,6 +263,110 @@ namespace {
       perft_divide<BLACK>(pos, depth, use_cache);
   }
 
+  // --- selftest nnue -----------------------------------------------------------------------------
+  // Plays seeded-random legal games and asserts at every checked ply that the incremental
+  // accumulator evaluation (push/pop + lazy walk-back) is bit-identical to a full refresh.
+  // Coverage by construction: all 11 MoveFlags cases (the start FENs force castling, en passant
+  // and promotions), multi-ply lazy chains (evaluation is skipped randomly), and mixed
+  // undo/pop back-off sequences. The scalar kernels are the reference; when the SIMD kernels
+  // land, this same test pins them to the scalar results (all paths are exact integer math).
+
+  void play_any_color(Position &p, Move m) {
+    if (p.turn() == WHITE)
+      p.play<WHITE>(m);
+    else
+      p.play<BLACK>(m);
+  }
+  // undo<C> takes the color that MADE the move — the opposite of the side to move afterwards.
+  void undo_any_color(Position &p, Move m) {
+    if (p.turn() == WHITE)
+      p.undo<BLACK>(m);
+    else
+      p.undo<WHITE>(m);
+  }
+  size_t legal_moves(Position &p, Move *out) {
+    if (p.turn() == WHITE) {
+      MoveList<WHITE> l(p);
+      std::copy(l.begin(), l.end(), out);
+      return l.size();
+    }
+    MoveList<BLACK> l(p);
+    std::copy(l.begin(), l.end(), out);
+    return l.size();
+  }
+
+  void selftest_nnue(int games, int maxply) {
+    if (!nnue::loaded()) {
+      std::cout << "selftest nnue FAIL: no net loaded\n";
+      return;
+    }
+    // Start positions chosen so random play quickly reaches every move type: castling rights
+    // both sides (kiwipete), en-passant-rich pawn endings, and promotion storms (pos4 and the
+    // 8-passers race, which also drives accumulator values toward their extremes).
+    constexpr const char *FENS[] = {
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -", // kiwipete
+            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1", // perft pos4 (promotions)
+            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", // perft pos3 (en passant)
+            "8/PPPP4/8/8/8/2k5/4pppp/K7 w - - 0 1", // promotion race (extreme accumulator values)
+    };
+    PRNG            rng(0xA5CA16u);
+    nnue::Evaluator ev;
+    uint64_t        checks = 0;
+
+    const auto check = [&](const Position &pos) {
+      const int inc = ev.evaluate(pos);
+      const int ref = nnue::evaluate_refresh(pos);
+      ++checks;
+      if (inc != ref) {
+        std::cout << "selftest nnue FAIL: incremental " << inc << " != refresh " << ref << "\n  fen " << pos.fen()
+                  << "\n";
+        return false;
+      }
+      return true;
+    };
+
+    for (int g = 0; g < games; ++g) {
+      Position pos;
+      Position::set(FENS[g % std::size(FENS)], pos);
+      ev.reset(pos);
+      std::vector<Move> made;
+
+      for (int ply = 0; ply < maxply; ++ply) {
+        // Occasionally back off a few plies: pop() must land back on already-computed (or
+        // still-lazy) ancestors and the next pushes must rebuild correctly from there.
+        if (!made.empty() && rng.rand<uint64_t>() % 8 == 0) {
+          int k = 1 + static_cast<int>(rng.rand<uint64_t>() % std::min<size_t>(made.size(), 6));
+          while (k--) {
+            undo_any_color(pos, made.back());
+            made.pop_back();
+            ev.pop();
+          }
+          if (!check(pos))
+            return;
+          continue;
+        }
+
+        Move         moves[218];
+        const size_t n = legal_moves(pos, moves);
+        if (n == 0)
+          break; // mate/stalemate — start the next game
+        const Move m = moves[rng.rand<uint64_t>() % n];
+        ev.push(pos, m);
+        play_any_color(pos, m);
+        made.push_back(m);
+
+        // Evaluate only half the time so lazy multi-ply walk-back chains get exercised too.
+        if (rng.rand<uint64_t>() % 2 == 0 && !check(pos))
+          return;
+      }
+      if (!check(pos)) // end-of-game: one final check on whatever the lazy state is
+        return;
+    }
+    std::cout << "selftest nnue PASS: " << games << " games, " << checks
+              << " eval checks, incremental == refresh\n";
+  }
+
   // Handles "position [startpos | fen <fen>] [moves <m1> ...]".
   void position_cmd(std::optional<Position> &pos, std::istringstream &is) {
     std::string token;
@@ -378,6 +483,15 @@ void uci::loop() {
           std::cout << "info string EvalFile loaded: " << path << "\n";
       }
       // (unknown options: silently ignored, per the UCI spec)
+    } else if (cmd == "selftest") {
+      // Hidden test commands (not advertised): "selftest nnue [games] [maxply]".
+      std::string what;
+      is >> what;
+      if (what == "nnue") {
+        int g = 0, p = 0;
+        is >> g >> p;
+        selftest_nnue(g > 0 ? g : 100, p > 0 ? p : 80);
+      }
     } else if (cmd == "register" || cmd.empty()) {
       // accepted but no-op
     } else if (cmd == "quit" || cmd == "exit") {
