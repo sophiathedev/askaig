@@ -27,7 +27,7 @@ transposition table, UCI front-end, SIMD primitives) is built on top of it.
 
 ## Evaluation (NNUE)
 
-A **quantized NNUE** network, mirroring the classic Stockfish-style design:
+A **quantized NNUE** network:
 
 ```
 (768 x 8 king buckets -> 512) x2  ->  1 of 8 material output buckets, SCReLU
