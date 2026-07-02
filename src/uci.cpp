@@ -14,6 +14,7 @@
 #include "nnue.h"
 #include "position.h"
 #include "search.h"
+#include "see.h"
 #include "tables.h"
 #include "tt.h"
 #include "types.h"
@@ -311,10 +312,10 @@ namespace {
     return l.size();
   }
 
-  void selftest_nnue(int games, int maxply) {
+  bool selftest_nnue(int games, int maxply) {
     if (!nnue::loaded()) {
       std::cout << "selftest nnue FAIL: no net loaded\n";
-      return;
+      return false;
     }
     // Start positions chosen so random play quickly reaches every move type: castling rights
     // both sides (kiwipete), en-passant-rich pawn endings, and promotion storms (pos4 and the
@@ -359,7 +360,7 @@ namespace {
             ev.pop();
           }
           if (!check(pos))
-            return;
+            return false;
           continue;
         }
 
@@ -374,13 +375,290 @@ namespace {
 
         // Evaluate only half the time so lazy multi-ply walk-back chains get exercised too.
         if (rng.rand<uint64_t>() % 2 == 0 && !check(pos))
-          return;
+          return false;
       }
       if (!check(pos)) // end-of-game: one final check on whatever the lazy state is
-        return;
+        return false;
     }
     std::cout << "selftest nnue PASS: " << games << " games, " << checks
               << " eval checks, incremental == refresh\n";
+    return true;
+  }
+
+  // --- selftest perft ------------------------------------------------------------------------
+  // Fast movegen regression check: the classic Chess Programming Wiki reference positions
+  // (the same six used for `bench`/NNUE-selftest FENs elsewhere in this file), at depths chosen
+  // to run in well under a second combined while still exercising every special-move class
+  // (castling, en passant, promotions). The expected counts are the well-known published
+  // values, cross-checked against this engine's own (already independently perft-verified —
+  // see the README's `go perft 6` = 119060324 check) output before being hardcoded here.
+  bool selftest_perft() {
+    struct Case {
+      const char *fen;
+      int         depth;
+      uint64_t    expected;
+    };
+    constexpr Case CASES[] = {
+            {"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 5, 4'865'609}, // startpos
+            {"r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 4, 4'085'603}, // kiwipete
+            {"8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 5, 674'624}, // pos3 (en passant)
+            {"r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1", 4, 422'333}, // pos4 (promotions)
+            {"rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8", 4, 2'103'487}, // pos5
+            {"r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10", 4, 3'894'594}, // pos6
+    };
+    bool ok = true;
+    for (const Case &c: CASES) {
+      Position pos;
+      Position::set(c.fen, pos);
+      const uint64_t got = pos.turn() == WHITE ? perft<WHITE>(pos, c.depth, true) : perft<BLACK>(pos, c.depth, true);
+      if (got != c.expected) {
+        std::cout << "selftest perft FAIL: depth " << c.depth << " got " << got << " expected " << c.expected
+                  << " fen " << c.fen << "\n";
+        ok = false;
+      }
+    }
+    if (ok)
+      std::cout << "selftest perft PASS: " << std::size(CASES) << " known positions match exactly\n";
+    return ok;
+  }
+
+  // --- selftest see --------------------------------------------------------------------------
+  // Static exchange evaluation correctness: a handful of hand-traced absolute-value cases
+  // (values follow search::PIECE_VAL: P=100 N=320 B=330 R=500 Q=900) chosen to each exercise a
+  // different branch of the swap algorithm, plus a monotonicity/bounds fuzz pass over random
+  // captures from real playouts — a correct see_ge must be true for every threshold at or below
+  // the exchange's true value and false for every threshold above it (never true-after-false as
+  // the threshold rises), and must saturate to true/false far outside any realistic exchange.
+  bool selftest_see() {
+    bool ok = true;
+    const auto expect = [&](bool cond, const char *what) {
+      if (!cond) {
+        std::cout << "selftest see FAIL: " << what << "\n";
+        ok = false;
+      }
+    };
+
+    { // Undefended capture: Rd1xd4 wins a pawn outright (net +100), nothing else attacks d4.
+      // Exercises the first early-return (threshold > target value: false immediately) and the
+      // full loop with an empty attacker set on the first iteration (true).
+      Position pos;
+      Position::set("4k3/8/8/8/3p4/8/8/3R3K w - - 0 1", pos);
+      const Move m(d1, d4, CAPTURE);
+      expect(search::see_ge(pos, m, 100), "undefended pawn capture: expected SEE >= 100");
+      expect(!search::see_ge(pos, m, 101), "undefended pawn capture: expected SEE < 101");
+    }
+    { // Pawn-defended capture: Rd1xd4 wins a knight (+320) but a black pawn on c5 recaptures the
+      // rook (-500): net -180. Exercises the second early-return (recapture-for-free check).
+      Position pos;
+      Position::set("4k3/8/8/2p5/3n4/8/8/3R3K w - - 0 1", pos);
+      const Move m(d1, d4, CAPTURE);
+      expect(search::see_ge(pos, m, -180), "pawn-defended knight capture: expected SEE >= -180");
+      expect(!search::see_ge(pos, m, -179), "pawn-defended knight capture: expected SEE < -179");
+    }
+    { // Equal trade: Rd1xd4 (a black rook) is recaptured by a second black rook on d8 (open
+      // file, no blockers) — net exactly 0. Exercises the full loop running one extra ply deep.
+      Position pos;
+      Position::set("3rk3/8/8/8/3r4/8/8/3R3K w - - 0 1", pos);
+      const Move m(d1, d4, CAPTURE);
+      expect(search::see_ge(pos, m, 0), "even rook trade: expected SEE >= 0");
+      expect(!search::see_ge(pos, m, 1), "even rook trade: expected SEE < 1");
+    }
+
+    { // Fuzz: every capture seen across a few plies of random legal play in three structurally
+      // different openings, checked for monotonicity and sane saturation at extreme thresholds.
+      PRNG                  rng(0xC0FFEEu);
+      constexpr const char *FENS[] = {
+              "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -",
+              "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -", // kiwipete
+              "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1", // perft pos4
+      };
+      constexpr int THRESH[] = {-2000, -900, -500, -320, -100, -1, 0, 1, 100, 320, 500, 900, 2000};
+      int           checked  = 0;
+      for (const char *fen: FENS) {
+        Position pos;
+        Position::set(fen, pos);
+        for (int ply = 0; ply < 60 && checked < 300; ++ply) {
+          Move         moves[218];
+          const size_t n = legal_moves(pos, moves);
+          if (n == 0)
+            break;
+          for (size_t i = 0; i < n && checked < 300; ++i) {
+            if (!moves[i].is_capture())
+              continue;
+            bool prev = true; // see_ge at -infinity is always true
+            for (int th: THRESH) {
+              const bool cur = search::see_ge(pos, moves[i], th);
+              if (cur && !prev) {
+                std::cout << "selftest see FAIL: non-monotonic at threshold " << th << " fen " << pos.fen() << "\n";
+                return false;
+              }
+              prev = cur;
+            }
+            expect(search::see_ge(pos, moves[i], -100'000), "see_ge must hold far below any real exchange");
+            expect(!search::see_ge(pos, moves[i], 100'000), "see_ge must fail far above any real exchange");
+            ++checked;
+          }
+          const Move m = moves[rng.rand<uint64_t>() % n];
+          play_any_color(pos, m);
+        }
+      }
+      if (ok)
+        std::cout << "  (" << checked << " random captures fuzzed for monotonicity/bounds)\n";
+    }
+
+    if (ok)
+      std::cout << "selftest see PASS: hand-traced cases and the fuzz pass all correct\n";
+    return ok;
+  }
+
+  // --- selftest draw ---------------------------------------------------------------------------
+  // Position::is_draw() flags a draw on the SECOND occurrence of a position (a repeat), not the
+  // literal FIDE threefold — the search treats any repeated line as drawish rather than waiting
+  // for a third occurrence that a hypothetical search line will rarely reach. Verified directly
+  // against Position, independent of search/NNUE.
+  bool selftest_draw() {
+    bool ok = true;
+    const auto expect = [&](bool cond, const char *what) {
+      if (!cond) {
+        std::cout << "selftest draw FAIL: " << what << "\n";
+        ok = false;
+      }
+    };
+
+    { // Negative control: a fresh position must never be flagged a draw.
+      Position pos;
+      Position::set(DEFAULT_FEN, pos);
+      expect(!pos.is_draw(), "startpos incorrectly flagged as a draw");
+    }
+    { // A king-shuffle round trip (4 plies) returns to the exact starting position — its SECOND
+      // occurrence — and must flip is_draw() to true exactly there, not on the 3 plies before it.
+      Position pos;
+      Position::set("4k3/8/8/8/8/8/8/4K3 w - - 0 1", pos);
+      constexpr const char *SHUFFLE[] = {"e1d1", "e8d8", "d1e1", "d8e8"};
+      for (int i = 0; i < 4; ++i) {
+        if (!play_uci_move(pos, SHUFFLE[i])) {
+          std::cout << "selftest draw FAIL: illegal shuffle move " << SHUFFLE[i] << "\n";
+          return false;
+        }
+        const bool should_be_draw = (i == 3);
+        expect(pos.is_draw() == should_be_draw,
+               should_be_draw ? "repetition not detected after the round trip"
+                              : "false positive: draw flagged before the position actually repeated");
+      }
+    }
+    { // Fifty-move rule: one halfmove short of the limit, then one quiet move over it.
+      Position pos;
+      Position::set("4k3/8/8/8/8/8/8/4K3 w - - 99 1", pos);
+      expect(!pos.is_draw(), "fifty-move rule fired one halfmove early");
+      if (!play_uci_move(pos, "e1d1")) {
+        std::cout << "selftest draw FAIL: illegal fifty-move test move\n";
+        return false;
+      }
+      expect(pos.is_draw(), "fifty-move rule did not fire at halfmove 100");
+    }
+
+    if (ok)
+      std::cout << "selftest draw PASS: negative control, repetition, and fifty-move rule all correct\n";
+    return ok;
+  }
+
+  // --- selftest search -------------------------------------------------------------------------
+  // Runs a small, varied position set through the real search at Threads in {1, 2, 4} and
+  // checks, independent of the search's own move generator, that: the reported bestmove is
+  // legal, the FULL reported PV replays as legal moves one by one, and the score is within the
+  // representable mate range. This is the in-engine version of the ad-hoc PV-legality checks
+  // used throughout development — YBWC bugs (a stale split snapshot, a dangling cur_split, a
+  // stale child PV on a fail-high) have historically shown up exactly as illegal PV moves at
+  // Threads > 1, so this is the most direct regression guard against that class of bug.
+  bool selftest_search() {
+    if (!nnue::loaded()) {
+      std::cout << "selftest search FAIL: no net loaded\n";
+      return false;
+    }
+    struct Case {
+      const char *fen;
+      int         depth;
+    };
+    constexpr Case CASES[] = {
+            {"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 9}, // quiet startpos
+            {"r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 8}, // kiwipete
+            {"2rr3k/pp3pp1/1nnqbN1p/3pN3/2pP4/2P3Q1/PPB4P/R4RK1 w - - 0 1", 10}, // WAC.001, mate in 2
+            {"8/PPPP4/8/8/8/2k5/4pppp/K7 w - - 0 1", 8}, // promotion race
+    };
+
+    const int  saved_threads = g_threads;
+    const auto legal_replay  = [](const char *fen, const std::vector<Move> &pv) {
+      Position rp;
+      Position::set(fen, rp);
+      for (Move m: pv) {
+        Move         moves[218];
+        const size_t n     = legal_moves(rp, moves);
+        bool         found = false;
+        for (size_t i = 0; i < n; ++i)
+          if (moves[i].to_from() == m.to_from()) {
+            found = true;
+            break;
+          }
+        if (!found)
+          return false;
+        play_any_color(rp, m);
+      }
+      return true;
+    };
+
+    bool ok = true;
+    for (const int threads: {1, 2, 4}) {
+      g_threads = threads;
+      search::set_threads(threads);
+      for (const Case &c: CASES) {
+        Position pos;
+        Position::set(c.fen, pos);
+        tt::clear();
+        search::new_game();
+        const search::Result r = search::think(pos, c.depth, nullptr, 0, 0);
+
+        Move         legal[218];
+        const size_t n     = legal_moves(pos, legal);
+        bool         found = r.best.to_from() == 0;
+        for (size_t i = 0; i < n && !found; ++i)
+          found = legal[i].to_from() == r.best.to_from();
+        if (!found) {
+          std::cout << "selftest search FAIL: T" << threads << " illegal bestmove on " << c.fen << "\n";
+          ok = false;
+        }
+        if (!legal_replay(c.fen, r.pv)) {
+          std::cout << "selftest search FAIL: T" << threads << " illegal PV move on " << c.fen << "\n";
+          ok = false;
+        }
+        if (std::abs(r.score) > search::MATE) {
+          std::cout << "selftest search FAIL: T" << threads << " score " << r.score << " out of range on " << c.fen
+                    << "\n";
+          ok = false;
+        }
+      }
+    }
+    g_threads = saved_threads;
+    search::set_threads(saved_threads);
+    tt::clear();
+    search::new_game();
+
+    if (ok)
+      std::cout << "selftest search PASS: " << std::size(CASES) << " positions x {1,2,4} threads, legal PV + sane score\n";
+    return ok;
+  }
+
+  // --- selftest all ----------------------------------------------------------------------------
+  // Runs every selftest and reports a combined verdict. Uses &= (not &&) deliberately: every
+  // suite runs regardless of an earlier failure, so a single pass reports everything that's
+  // broken instead of stopping at the first one.
+  void selftest_all() {
+    bool ok = true;
+    ok &= selftest_perft();
+    ok &= selftest_see();
+    ok &= selftest_draw();
+    ok &= selftest_nnue(500, 80);
+    ok &= selftest_search();
+    std::cout << (ok ? "selftest all: ALL PASS\n" : "selftest all: SOME FAILED (see above)\n");
   }
 
   // --- bench evalnps -----------------------------------------------------------------------------
@@ -798,14 +1076,26 @@ void uci::loop() {
         bench_cmd(d > 0 ? d : BENCH_DEPTH);
       }
     } else if (cmd == "selftest") {
-      // Hidden test commands (not advertised): "selftest nnue [games] [maxply]".
+      // Hidden test commands (not advertised): "selftest {nnue [games] [maxply] | perft | see |
+      // draw | search | all}". selftest_search drives the shared TT/history/YBWC pool directly,
+      // so stop any running search first, exactly like bench.
+      stop_search();
       std::string what;
       is >> what;
       if (what == "nnue") {
         int g = 0, p = 0;
         is >> g >> p;
         selftest_nnue(g > 0 ? g : 100, p > 0 ? p : 80);
-      }
+      } else if (what == "perft")
+        selftest_perft();
+      else if (what == "see")
+        selftest_see();
+      else if (what == "draw")
+        selftest_draw();
+      else if (what == "search")
+        selftest_search();
+      else if (what == "all")
+        selftest_all();
     } else if (cmd == "register" || cmd.empty()) {
       // accepted but no-op
     } else if (cmd == "quit" || cmd == "exit") {
