@@ -1,8 +1,10 @@
 name: ci
 
 # Runs on every push to main and every PR: build a few representative configurations and run
-# the in-engine regression suite (selftest all + a perft correctness check). Unlike release.yml
-# this never publishes anything — it's purely a fast pass/fail gate, and it's the thing that
+# the in-engine regression suite (selftest all + perft correctness), plus dedicated jobs for
+# things the matrix build can't catch on its own — assert()-active Debug builds, and
+# AddressSanitizer/UndefinedBehaviorSanitizer/ThreadSanitizer runs. Unlike release.yml this
+# never publishes anything — it's purely a fast pass/fail gate, and it's the thing that
 # actually makes `selftest`/`go perft` worth having: a test nobody remembers to run by hand
 # catches nothing.
 on:
@@ -31,7 +33,7 @@ jobs:
             simd: "OFF"
             cxx: g++-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: jwlawson/actions-setup-cmake@v2
         with:
@@ -56,11 +58,14 @@ jobs:
             ${{ matrix.cxx && format('-DCMAKE_CXX_COMPILER={0}', matrix.cxx) || '' }}
           cmake --build build -j
 
-      - name: Perft correctness (startpos depth 6 must be exactly 119060324)
+      - name: Perft correctness (startpos depth 6, kiwipete depth 5 — exact node counts)
         run: |
           out=$(printf 'position startpos\ngo perft 6\nquit\n' | ./build/askaig)
           echo "$out"
           echo "$out" | grep -qx "Nodes searched: 119060324"
+          out=$(printf 'position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1\ngo perft 5\nquit\n' | ./build/askaig)
+          echo "$out"
+          echo "$out" | grep -qx "Nodes searched: 193690690"
 
       - name: selftest all (perft suite, SEE, draw detection, NNUE, search x {1,2,4} threads)
         run: |
@@ -70,3 +75,108 @@ jobs:
 
       - name: bench (smoke check — must run to completion without crashing/hanging)
         run: printf 'bench\nquit\n' | ./build/askaig | tail -5
+
+      - name: UCI robustness (malformed/edge-case input must never crash, always stay responsive)
+        run: |
+          input='uci
+          isready
+
+          garbage_command_nobody_asked_for
+          go
+          stop
+          position fen this is not a fen at all
+          d
+          position fen 4k3/8/8/8/8/8/8/4K3 w - - 0 1
+          setoption name Threads value not_a_number
+          setoption name Hash value -5
+          setoption name NoSuchOption value 123
+          go wtime -100 btime -100
+          stop
+          go depth 99999
+          stop
+          isready
+          quit'
+          out=$(printf '%s\n' "$input" | timeout 20 ./build/askaig)
+          status=$?
+          echo "$out"
+          [ "$status" -eq 0 ]
+          [ "$(echo "$out" | grep -c '^readyok$')" -eq 2 ]
+
+  debug-assert-build:
+    name: debug (assertions active)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: latest
+      - run: sudo apt-get update && sudo apt-get install -y g++-14 ninja-build
+      - name: Configure & build (Debug — NDEBUG unset, every assert() actually runs)
+        run: |
+          cmake --preset debug -DCMAKE_CXX_COMPILER=g++-14
+          cmake --build --preset debug -j
+      - name: selftest all
+        run: |
+          out=$(printf 'selftest all\nquit\n' | ./cmake-build-debug/askaig)
+          echo "$out"
+          echo "$out" | grep -q "selftest all: ALL PASS"
+      - run: printf 'go perft 6\nquit\n' | ./cmake-build-debug/askaig
+
+  sanitize-asan-ubsan:
+    name: sanitizers (ASan + UBSan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: latest
+      - run: sudo apt-get update && sudo apt-get install -y g++-14 ninja-build
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build -j
+      - name: selftest all under ASan+UBSan
+        run: |
+          out=$(printf 'selftest all\nquit\n' | ./build/askaig)
+          echo "$out"
+          echo "$out" | grep -q "selftest all: ALL PASS"
+      - run: printf 'position startpos\ngo perft 5\nquit\n' | ./build/askaig
+
+  sanitize-tsan:
+    name: sanitizers (TSan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: latest
+      - run: sudo apt-get update && sudo apt-get install -y g++-14 ninja-build
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+          cmake --build build -j
+      # selftest_search (Threads 1/2/4) is the one component with real concurrency (the YBWC
+      # split pool) -- run it a few times since a data race isn't guaranteed to show up every
+      # run. The Histories tables and ThreadData::nodes are intentionally unsynchronized
+      # statistics (see history.h/ybwc.h ASKAIG_TSAN_IGNORE) and must NOT reappear here; any
+      # other race TSan reports is real and should fail this job.
+      - name: selftest search under TSan (x5)
+        run: |
+          for i in 1 2 3 4 5; do
+            out=$(printf 'selftest search\nquit\n' | ./build/askaig)
+            echo "$out"
+            echo "$out" | grep -q "selftest search PASS"
+          done
+      - name: selftest all under TSan
+        run: |
+          out=$(printf 'selftest all\nquit\n' | ./build/askaig)
+          echo "$out"
+          echo "$out" | grep -q "selftest all: ALL PASS"

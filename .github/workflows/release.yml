@@ -66,7 +66,7 @@ jobs:
             mingw_triple: aarch64-w64-mingw32
             mingw_proc: arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: jwlawson/actions-setup-cmake@v2
         with:
@@ -166,7 +166,7 @@ jobs:
           fi
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pkg.outputs.archive }}
           path: ${{ steps.pkg.outputs.archive }}
@@ -178,11 +178,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ needs.meta.outputs.date }}
           name: Askaig ${{ needs.meta.outputs.date }}
