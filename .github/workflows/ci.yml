@@ -1,0 +1,72 @@
+name: ci
+
+# Runs on every push to main and every PR: build a few representative configurations and run
+# the in-engine regression suite (selftest all + a perft correctness check). Unlike release.yml
+# this never publishes anything — it's purely a fast pass/fail gate, and it's the thing that
+# actually makes `selftest`/`go perft` worth having: a test nobody remembers to run by hand
+# catches nothing.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64-avx2
+            runner: ubuntu-24.04
+            arch: AVX2
+            cxx: g++-14
+          - name: macos-arm64-neon
+            runner: macos-15
+            arch: ARM_NEON
+          - name: linux-scalar-fallback
+            runner: ubuntu-24.04
+            simd: "OFF"
+            cxx: g++-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: latest
+
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-14 ninja-build
+
+      - name: Install macOS deps
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSIMD=${{ matrix.simd || 'ON' }} \
+            ${{ matrix.arch && format('-DARCH={0}', matrix.arch) || '' }} \
+            ${{ matrix.cxx && format('-DCMAKE_CXX_COMPILER={0}', matrix.cxx) || '' }}
+          cmake --build build -j
+
+      - name: Perft correctness (startpos depth 6 must be exactly 119060324)
+        run: |
+          out=$(printf 'position startpos\ngo perft 6\nquit\n' | ./build/askaig)
+          echo "$out"
+          echo "$out" | grep -qx "Nodes searched: 119060324"
+
+      - name: selftest all (perft suite, SEE, draw detection, NNUE, search x {1,2,4} threads)
+        run: |
+          out=$(printf 'selftest all\nquit\n' | ./build/askaig)
+          echo "$out"
+          echo "$out" | grep -q "selftest all: ALL PASS"
+
+      - name: bench (smoke check — must run to completion without crashing/hanging)
+        run: printf 'bench\nquit\n' | ./build/askaig | tail -5
