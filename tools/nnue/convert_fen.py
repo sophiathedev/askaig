@@ -117,11 +117,15 @@ def pieces_to_board_field(pieces):
     return "/".join(rows)
 
 
+try:  # orjson: ~2-3x faster json for the 394M-line Lichess dump; stdlib fallback
+    import orjson as _json
+except ImportError:
+    import json as _json
+
+
 def parse_jsonl(line):
     """One Lichess eval-DB JSON line -> (board_field, white_to_move, cp_white, result2) or None."""
-    import json
-
-    o = json.loads(line)
+    o = _json.loads(line)
     fen, evals = o.get("fen"), o.get("evals")
     if not fen or not evals:
         return None
