@@ -80,16 +80,25 @@ A **fail-soft negamax** (alpha-beta) search with **iterative deepening**, parall
   **ProbCut**, late-move pruning, futility pruning, **history pruning**, and **SEE pruning** of
   both captures and quiets in the main search (depth-scaled thresholds).
 - **Reductions**: log-formula **LMR**, adjusted by the cut-node flag, the *improving* flag, and
-  quiet history.
+  quiet history; when a reduced search beats alpha, the confirmation re-search picks its own
+  depth from how convincingly it did so (a ply deeper if it cleared the current best by a wide
+  margin, a ply shallower if it only just beat alpha) instead of always using the nominal depth.
 - **Extensions**: capped check extensions and **singular extensions** (with **multicut** and
   double/triple/negative extensions off the singular-verification result), all bounded so a
   search line can't runaway-extend.
-- **Static-eval correction history**, keyed by pawn structure, nudging the static eval used for
-  pruning/quiescence toward what the search has actually found there before.
+- **Static-eval correction history** — five independent tables (pawn skeleton, non-pawn material
+  imbalance, minor-piece placement, major-piece placement, and the previous move) summed and
+  applied together, nudging the static eval used for pruning/quiescence toward what the search
+  has actually found there before.
 - **Draw detection** — repetition and the fifty-move rule scored as draws (per-ply hash +
   halfmove clock).
 - **Time management** — soft/hard budgets from `wtime`/`btime`/`winc`/`binc`/`movestogo`, or a
   fixed `movetime`; the hard deadline is polled every 2048 nodes so a runaway line can't miss it.
+  The soft deadline additionally scales by how much of the iteration's effort went into the move
+  already believed best (node-based time management): heavily focused effort ends the search
+  early, effort spread across candidates extends it (capped at 1.5x, never past the hard limit).
+  A separate, unconditional floor never plans to leave less than 200 ms on the clock, closing
+  over both a `go` that already starts low on time and a search that runs unexpectedly long.
 
 ### Parallel search: YBWC, not Lazy SMP
 
@@ -120,7 +129,7 @@ Presets are also provided:
 
 ```bash
 cmake --preset release-simd && cmake --build --preset release-simd   # -O3 + SIMD
-cmake --preset debug        && cmake --build --preset debug          # -O0, no SIMD
+cmake --preset debug        && cmake --build --preset debug          # -O0, NDEBUG unset (assert() active), SIMD still on
 ```
 
 Useful knobs: `-DCMAKE_BUILD_TYPE=Debug`, `-DSIMD=OFF` (portable fallback for both the bitboard
@@ -153,8 +162,11 @@ benchmark), `bench evalnps` (NNUE evaluation throughput), and a `selftest` regre
 `selftest nnue [games] [maxply]` (incremental accumulator vs. full refresh over random legal
 playouts), `selftest perft` (movegen vs. the classic reference positions), `selftest see`
 (static exchange evaluation), `selftest draw` (repetition/fifty-move detection), `selftest
-search` (PV legality and score sanity at Threads 1/2/4), and `selftest all` (everything, with a
-combined verdict). Runs automatically on every push/PR — see `.github/workflows/ci.yml`.
+search` (PV legality and score sanity at Threads 1/2/4), `selftest stop` (a pre-set stop is
+honoured immediately, not silently discarded by a racing search thread), and `selftest all`
+(everything, with a combined verdict). Runs automatically on every push/PR, including under
+AddressSanitizer/UndefinedBehaviorSanitizer/ThreadSanitizer and an assertions-enabled Debug
+build — see `.github/workflows/ci.yml`.
 
 ### Benchmark
 
