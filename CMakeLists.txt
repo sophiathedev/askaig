@@ -13,13 +13,7 @@ add_executable(askaig
     src/types.cpp
     src/tables.cpp
     src/position.cpp
-    src/eval.cpp
-    src/tt.cpp
-    src/search.cpp
-    src/tune.cpp
     src/uci.cpp
-    src/wdl.cpp
-    src/kpk.cpp
     src/main.cpp)
 
 target_include_directories(askaig PRIVATE src)
@@ -93,7 +87,7 @@ if(NOT PGO STREQUAL "")
             target_link_options(askaig PRIVATE -fprofile-generate)
         else()
             # partial-training/missing-profile: don't pessimise or warn about code the training run
-            # never exercised (UCI parsing, tune); correction: tolerate the threaded counters.
+            # never exercised (UCI parsing); correction: tolerate the threaded counters.
             target_compile_options(askaig PRIVATE -fprofile-use -fprofile-correction -fprofile-partial-training -Wno-missing-profile)
             target_link_options(askaig PRIVATE -fprofile-use -fprofile-correction)
         endif()

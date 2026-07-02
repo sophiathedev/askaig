@@ -101,7 +101,7 @@ jobs:
           cmake --build build -j
 
       # PGO (behaviour-neutral, ~3-8% nps): instrument -> run the same training workload as
-      # tools/build_pgo.sh (bench + bench 10 + perft 6) -> rebuild optimised. Only on targets whose
+      # tools/build_pgo.sh (perft, cached + noncache) -> rebuild optimised. Only on targets whose
       # build host can RUN the binary to collect a profile. The node count is unchanged by PGO, so no
       # SPRT is needed; a broken profile build just fails this job (and blocks the release — it never
       # ships an un-profiled-but-mislabelled binary).
@@ -113,9 +113,9 @@ jobs:
           cmake $common -DPGO=generate
           cmake --build build -j
           # GCC writes .gcda into build/; the 'use' stage below must reuse this same dir.
-          ./build/askaig bench    >/dev/null 2>&1 || true
-          ./build/askaig bench 10 >/dev/null 2>&1 || true
           printf 'position startpos\ngo perft 6\nquit\n' | ./build/askaig >/dev/null 2>&1 || true
+          printf 'position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1\ngo perft 5\nquit\n' | ./build/askaig >/dev/null 2>&1 || true
+          printf 'position startpos\ngo perft 5 noncache\nquit\n' | ./build/askaig >/dev/null 2>&1 || true
           cmake $common -DPGO=use
           cmake --build build -j
 
@@ -127,9 +127,9 @@ jobs:
           cmake $common -DPGO=generate
           cmake --build build -j
           rm -f build/pgo-*.profraw
-          LLVM_PROFILE_FILE="build/pgo-%p.profraw" ./build/askaig bench    >/dev/null 2>&1 || true
-          LLVM_PROFILE_FILE="build/pgo-%p.profraw" ./build/askaig bench 10 >/dev/null 2>&1 || true
           printf 'position startpos\ngo perft 6\nquit\n' | LLVM_PROFILE_FILE="build/pgo-%p.profraw" ./build/askaig >/dev/null 2>&1 || true
+          printf 'position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1\ngo perft 5\nquit\n' | LLVM_PROFILE_FILE="build/pgo-%p.profraw" ./build/askaig >/dev/null 2>&1 || true
+          printf 'position startpos\ngo perft 5 noncache\nquit\n' | LLVM_PROFILE_FILE="build/pgo-%p.profraw" ./build/askaig >/dev/null 2>&1 || true
           xcrun llvm-profdata merge -output=build/pgo.profdata build/pgo-*.profraw
           cmake $common -DPGO=use -DPGO_PROFILE="$PWD/build/pgo.profdata"
           cmake --build build -j

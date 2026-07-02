@@ -148,8 +148,6 @@ void Position::set(const std::string &fen, Position &p) {
 
 // Moves a piece to a (possibly empty) square on the board and updates the hash
 void Position::move_piece(Square from, Square to) {
-  psqt_mg_score += psqt::score_mg(board[from], to) - psqt::score_mg(board[from], from) - psqt::score_mg(board[to], to);
-  psqt_eg_score += psqt::score_eg(board[from], to) - psqt::score_eg(board[from], from) - psqt::score_eg(board[to], to);
   hash ^= zobrist::zobrist_table[board[from]][from] ^ zobrist::zobrist_table[board[from]][to] ^
           zobrist::zobrist_table[board[to]][to];
   Bitboard mask = SQUARE_BB[from] | SQUARE_BB[to];
@@ -161,8 +159,6 @@ void Position::move_piece(Square from, Square to) {
 
 // Moves a piece to an empty square. Note that it is an error if the <to> square contains a piece
 void Position::move_piece_quiet(Square from, Square to) {
-  psqt_mg_score += psqt::score_mg(board[from], to) - psqt::score_mg(board[from], from);
-  psqt_eg_score += psqt::score_eg(board[from], to) - psqt::score_eg(board[from], from);
   hash ^= zobrist::zobrist_table[board[from]][from] ^ zobrist::zobrist_table[board[from]][to];
   piece_bb[board[from]] ^= (SQUARE_BB[from] | SQUARE_BB[to]);
   board[to]   = board[from];

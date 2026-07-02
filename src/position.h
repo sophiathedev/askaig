@@ -3,7 +3,6 @@
 #include <ostream>
 #include <string>
 #include <utility>
-#include "psqt.h"
 #include "tables.h"
 #include "types.h"
 
@@ -85,12 +84,6 @@ private:
   // make/unmake
   uint64_t hash;
 
-  // Incremental material + piece-square score from White's perspective, kept in sync by
-  // put_piece/remove_piece/move_piece so eval doesn't have to re-sum it over every piece. Two
-  // accumulators (middlegame / endgame tables) which eval interpolates by game phase.
-  int psqt_mg_score = 0;
-  int psqt_eg_score = 0;
-
 public:
   // Upper bound on the undo stack: it must hold the whole *game* (every ply played via `play`) PLUS
   // the deepest search line stacked on top (the search makes its moves on the same Position, so it
@@ -126,15 +119,11 @@ public:
     board[s] = pc;
     piece_bb[pc] |= SQUARE_BB[s];
     hash ^= zobrist::zobrist_table[pc][s];
-    psqt_mg_score += psqt::score_mg(pc, s);
-    psqt_eg_score += psqt::score_eg(pc, s);
   }
 
   // Removes a piece from a particular square and updates the hash.
   inline void remove_piece(Square s) {
     const Piece pc = board[s];
-    psqt_mg_score -= psqt::score_mg(pc, s);
-    psqt_eg_score -= psqt::score_eg(pc, s);
     hash ^= zobrist::zobrist_table[pc][s];
     piece_bb[pc] &= ~SQUARE_BB[s];
     board[s] = NO_PIECE;
@@ -154,15 +143,8 @@ public:
   [[nodiscard]] inline Bitboard bitboard_of(Color c, PieceType pt) const { return piece_bb[make_piece(c, pt)]; }
   [[nodiscard]] inline Piece    at(Square sq) const { return board[sq]; }
   [[nodiscard]] inline Color    turn() const { return side_to_play; }
-  inline void                   set_turn(Color c) {
-    side_to_play = c;
-  } // for the tuner's scratch positions only:
-    // does NOT touch the hash (search relies on
-    // play/undo/set keeping them consistent)
   [[nodiscard]] inline int      ply() const { return game_ply; }
   [[nodiscard]] inline uint64_t get_hash() const { return hash; }
-  [[nodiscard]] inline int      psqt_mg() const { return psqt_mg_score; } // incremental material+PST, MG table
-  [[nodiscard]] inline int      psqt_eg() const { return psqt_eg_score; } // incremental material+PST, EG table
   [[nodiscard]] inline int      fifty() const { return history[game_ply].fifty; } // halfmove clock
   // Castling "entry" bitboard: squares whose king/rook have moved or been captured on. A side has
   // lost a castling right when its OO/OOO mask intersects this (used by eval's trapped-rook term).
