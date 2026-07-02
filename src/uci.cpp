@@ -595,6 +595,7 @@ namespace {
 
   constexpr int     DEFAULT_DEPTH    = 12;
   constexpr int64_t MOVE_OVERHEAD_MS = 30; // safety buffer for GUI/transport lag
+  constexpr int64_t URGENT_MS        = 200; // panic floor: never plan to leave less than this on the clock
 
   // Handles "go ...". "go perft <depth> [noncache]" counts move-generation nodes; otherwise
   // it runs the iterative-deepening search. Recognised limits: depth <n>, infinite,
@@ -656,6 +657,12 @@ namespace {
       const int64_t reserve = std::clamp<int64_t>(t / 10, MOVE_OVERHEAD_MS, 500);
       soft_ms               = std::max<int64_t>(opt, 1);
       hard_ms = std::max<int64_t>(1, std::min<int64_t>({3 * opt, std::max<int64_t>(avail / 2, 1), t - reserve}));
+      // Urgent floor: whatever the budget formula above says, never let the hard deadline plan
+      // to leave less than URGENT_MS on the clock. Since the deadline is polled every 2048
+      // nodes and after every root move (see time_up() in search.cpp), this also catches the
+      // position dynamically running long mid-search — not just a `go` that already starts
+      // with little time left — and returns whatever bestmove the search has by then.
+      hard_ms = std::min(hard_ms, std::max<int64_t>(t - URGENT_MS, 1));
       soft_ms = std::min(soft_ms, hard_ms);
     } else if (infinite) {
       max_depth = search::MAX_PLY; // effectively until "stop"
