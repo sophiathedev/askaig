@@ -99,9 +99,12 @@ A **fail-soft negamax** (alpha-beta) search with **iterative deepening**, parall
   to merely equal.
 - **Time management** — soft/hard budgets from `wtime`/`btime`/`winc`/`binc`/`movestogo`, or a
   fixed `movetime`; the hard deadline is polled every 2048 nodes so a runaway line can't miss it.
-  The soft deadline additionally scales by how much of the iteration's effort went into the move
-  already believed best (node-based time management): heavily focused effort ends the search
-  early, effort spread across candidates extends it (capped at 1.5x, never past the hard limit).
+  The soft deadline additionally scales by three multiplied signals from the last completed
+  iteration: node concentration (heavily focused effort on the already-best move ends the search
+  early, effort spread across candidates extends it), best-move stability (each iteration that
+  re-confirms the same move shaves 5%, floor 0.85x; a move that just changed spends up to 1.25x),
+  and eval trend (a falling score stretches the budget up to 1.4x, a rising one mildly shrinks
+  it). The product is clamped to [0.4x, 2x] and never passes the hard limit.
   A separate, unconditional floor never plans to leave less than 200 ms on the clock, closing
   over both a `go` that already starts low on time and a search that runs unexpectedly long.
 

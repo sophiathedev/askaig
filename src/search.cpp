@@ -790,7 +790,9 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
   max_depth = std::clamp(max_depth, 1, MAX_PLY - 1);
 
   Result res;
-  int    prev = 0;
+  int    prev      = 0;
+  Move   last_best{}; // best move of the previous completed iteration (stability tracking)
+  int    stability = 0; // consecutive iterations that confirmed the same best move
   for (int d = 1; d <= max_depth; ++d) {
     g_main.root_depth = d;
     g_main.seldepth   = 0;
@@ -799,14 +801,22 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
     if (g_stop.load(std::memory_order_relaxed) && d > 1)
       break; // discard the aborted iteration; the previous full one stands
 
-    Stack *ss    = g_main.stack + 4;
+    Stack   *ss         = g_main.stack + 4;
+    const int prev_score = prev; // previous ITERATION's score, before it's overwritten below
     prev         = v;
     res.score    = v;
     res.nodes    = all_nodes();
     res.seldepth = g_main.seldepth;
     res.pv.assign(ss->pv, ss->pv + ss->pv_len);
-    if (!res.pv.empty())
+    if (!res.pv.empty()) {
       res.best = res.pv[0];
+      // Best-move stability: count consecutive completed iterations confirming one move.
+      if (res.pv[0].to_from() == last_best.to_from())
+        ++stability;
+      else
+        stability = 0;
+      last_best = res.pv[0];
+    }
 
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - g_t0).count();
     if (info)
@@ -814,19 +824,31 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
     if (g_stop.load(std::memory_order_relaxed))
       break;
 
-    // Node-based time management: scale the soft deadline by how much of this iteration's
-    // effort went into the move we already believe is best. Only meaningful once move
-    // ordering / node counts have had a few plies to settle, and only when g_root_m1_move
-    // actually IS the reported best move (the rarer case where a later move overtook it is
-    // left alone — standard soft-deadline behaviour, no scaling applied).
+    // Time management: scale the soft deadline from three signals of the just-completed
+    // iteration, multiplied together (the hard deadline always caps the result).
     int64_t effective_soft = soft_ms;
-    if (soft_ms > 0 && d >= 5 && res.nodes >= 1000 && !res.pv.empty() &&
-        g_root_m1_move.to_from() == res.pv[0].to_from()) {
-      const double frac = double(g_root_m1_nodes) / double(res.nodes);
-      // Heavily focused on one move (frac -> 1) => confident, cut the budget down to half;
-      // effort spread thin across candidates (frac -> 0) => unclear, allow up to 1.5x.
-      const double scale = std::clamp(1.5 - frac, 0.5, 1.5);
-      effective_soft      = int64_t(double(soft_ms) * scale);
+    if (soft_ms > 0 && d >= 5 && res.nodes >= 1000 && !res.pv.empty()) {
+      double scale = 1.0;
+      // Node concentration: how much of this iteration's effort went into the move we
+      // already believe is best (see g_root_m1_nodes). Heavily focused (frac -> 1) =>
+      // confident, cut toward half; spread thin (frac -> 0) => unclear, allow up to 1.5x.
+      // Only meaningful when g_root_m1_move actually IS the reported best move — the rarer
+      // case where a later move overtook it gets no concentration scaling.
+      if (g_root_m1_move.to_from() == res.pv[0].to_from()) {
+        const double frac = double(g_root_m1_nodes) / double(res.nodes);
+        scale *= std::clamp(1.5 - frac, 0.5, 1.5);
+      }
+      // Best-move stability: a move that keeps being re-confirmed needs less and less
+      // verification (each confirmation shaves 5%, floor 0.85x after 8); a move that JUST
+      // changed is suspect — spend up to 1.25x resolving it.
+      scale *= 1.25 - 0.05 * double(std::min(stability, 8));
+      // Falling eval: the score dropping since the last iteration means the position is
+      // turning out worse than believed — stretch the budget (~1.25x at a 50cp drop, capped
+      // 1.4x); a rising score shrinks it mildly, floored at 0.85x.
+      scale *= std::clamp(1.0 + double(prev_score - v) * 0.005, 0.85, 1.4);
+      // Keep the product inside sane bounds: never below 0.4x nor past 2x the base budget.
+      scale          = std::clamp(scale, 0.4, 2.0);
+      effective_soft = int64_t(double(soft_ms) * scale);
       if (hard_ms > 0)
         effective_soft = std::min(effective_soft, hard_ms);
     }
