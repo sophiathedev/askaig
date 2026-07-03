@@ -156,15 +156,29 @@ public:
   // lost a castling right when its OO/OOO mask intersects this (used by eval's trapped-rook term).
   [[nodiscard]] inline Bitboard castle_entry() const { return history[game_ply].entry; }
 
-  // True if the current position is a draw by repetition or the fifty-move rule. The repetition
-  // scan steps back two plies at a time (same side to move) and is bounded by the halfmove clock:
-  // positions before the last irreversible move (pawn move / capture / castle / promotion) had a
-  // different pawn structure or material and cannot recur. A single earlier occurrence is enough —
-  // in a search line either side can force the threefold, so it is treated as a draw immediately.
+  // True if the current position is a draw by repetition, the fifty-move rule, or dead
+  // material. The repetition scan steps back two plies at a time (same side to move) and is
+  // bounded by the halfmove clock: positions before the last irreversible move (pawn move /
+  // capture / castle / promotion) had a different pawn structure or material and cannot recur.
+  // A single earlier occurrence is enough — in a search line either side can force the
+  // threefold, so it is treated as a draw immediately.
   [[gnu::hot, nodiscard]] inline bool is_draw() const {
     const int f = history[game_ply].fifty;
     if (f >= 100) [[unlikely]]
       return true; // fifty-move rule (100 halfmoves)
+    // Dead material: bare kings plus at most one minor anywhere (KvK, KNvK, KBvK) cannot
+    // mate by any play — without this the engine can hold an NNUE "+0.3" forever, or (with
+    // Contempt) actively dodge a simplification into a position it could never lose OR win.
+    // Gated on "no pawns" so the common case pays one OR and a taken branch. KNNvK stays
+    // out: mates exist there (unforceable, but a position with legal mates is not dead).
+    if (!(piece_bb[WHITE_PAWN] | piece_bb[BLACK_PAWN])) [[unlikely]] {
+      const Bitboard majors =
+              piece_bb[WHITE_ROOK] | piece_bb[BLACK_ROOK] | piece_bb[WHITE_QUEEN] | piece_bb[BLACK_QUEEN];
+      const Bitboard minors =
+              piece_bb[WHITE_KNIGHT] | piece_bb[BLACK_KNIGHT] | piece_bb[WHITE_BISHOP] | piece_bb[BLACK_BISHOP];
+      if (!majors && pop_count(minors) <= 1)
+        return true;
+    }
     const int end = game_ply - f; // nothing before the last irreversible move can match
     for (int i = game_ply - 4; i >= end && i >= 0; i -= 2)
       if (history[i].hash == hash)

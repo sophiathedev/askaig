@@ -146,8 +146,16 @@ namespace {
   // as a side effect — not just a local computation — so `pure` would be incorrect here even
   // though the observable result is deterministic. Called at nearly every node; discarding the
   // result would always be a bug.
+  //
+  // Fifty-move damping: the raw net output is scaled toward zero as the halfmove clock climbs
+  // (full at clock 0, about half at 99), so an advantage the search cannot convert decays
+  // instead of the engine shuffling forever at "+0.3" — and, symmetrically, a defender sees
+  // the incoming fifty-move draw as increasingly survivable. The min() guards hand-written
+  // FENs with a clock past 100; in play the search returns a draw at 100 before evaluating.
+  // The damped value is what lands in the TT eval field, carrying the storing node's clock —
+  // same-hash nodes at a different clock get a slightly stale eval, an accepted imprecision.
   [[gnu::hot, nodiscard]] int evaluate(ThreadData &t, const Position &pos, const Stack *ss) {
-    const int raw = t.ev.evaluate(pos);
+    const int raw = t.ev.evaluate(pos) * (200 - std::min(pos.fifty(), 100)) / 200;
     return std::clamp(raw + correction(pos, ss), -MATE_IN_MAX + 1, MATE_IN_MAX - 1);
   }
 
