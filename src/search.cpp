@@ -19,8 +19,8 @@
 // history, IIR, razoring, RFP, NMP, ProbCut, singular extensions (with multicut and
 // double/negative extensions), LMP, futility pruning, history pruning, SEE pruning (captures
 // and quiets), log-formula LMR, PVS, and a SEE/delta-pruned quiescence. Move ordering in
-// movepick.h uses the TT move, MVV + capture history, killers, and butterfly + continuation
-// (CMH/FMH) history.
+// movepick.h uses the TT move, MVV + capture history (SEE-verified lazily at yield time),
+// killers, and butterfly + continuation (CMH/FMH) history.
 //
 // Parallelism is YBWC (Young Brothers Wait Concept), NOT Lazy SMP: at a node with
 // depth >= the "Split" UCI option, the first ("eldest") move is always searched sequentially;
@@ -272,8 +272,12 @@ namespace {
     Move best_move{};
     for (Move m; (m = picker.next()).to_from() != 0;) {
       if (!in_check) {
-        // QS SEE pruning: don't even try losing captures.
-        if (!see_ge(pos, m, 0))
+        // QS SEE pruning: don't even try losing captures. The lazy-SEE picker already proved
+        // its capture bands (winning kept, losing demoted) — only a move it never verified
+        // (the TT move, or a quiet queen push onto a defended promotion square) needs the
+        // see_ge call here.
+        const auto band = picker.yielded_see();
+        if (band == MovePicker::SEE_LOSING || (band == MovePicker::SEE_UNKNOWN && !see_ge(pos, m, 0)))
           continue;
         // QS futility (delta) pruning: stand pat + margin + captured value can't reach alpha.
         const PieceType captured = m.flags() == EN_PASSANT ? PAWN : type_of(pos.at(m.to()));
@@ -502,8 +506,11 @@ namespace {
           if (depth <= 4 && quiet_hist(ss, pos, m) < -2048 * depth)
             continue;
         }
-        // PVS SEE pruning, depth-scaled thresholds (captures and quiets).
-        if (depth <= 8 && !see_ge(pos, m, quiet ? -50 * depth : -90 * depth))
+        // PVS SEE pruning, depth-scaled thresholds (captures and quiets). A winning-band
+        // capture from the lazy-SEE picker already passed see_ge(m, 0), which implies any
+        // negative threshold (see_ge is monotone in the threshold) — skip the call for those.
+        if (depth <= 8 && picker.yielded_see() != MovePicker::SEE_WINNING &&
+            !see_ge(pos, m, quiet ? -50 * depth : -90 * depth))
           continue;
       }
 
