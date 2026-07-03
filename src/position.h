@@ -221,7 +221,12 @@ public:
     --game_ply;
   }
 
-  template<Color Us>
+  // CAPTURES_ONLY skips every quiet emission (king/piece quiets, pushes, castling, and all
+  // quiet underpromotions — quiet QUEEN promotions are kept: they are quiescence moves) while
+  // leaving the legality machinery identical, for the quiescence move picker. Callers must
+  // not rely on it while in check: quiet evasions (blocks, king retreats) are skipped too, so
+  // the in-check quiescence path generates fully instead.
+  template<Color Us, bool CAPTURES_ONLY = false>
   Move *generate_legals(Move *list);
 };
 
@@ -457,7 +462,7 @@ template<Color C>
 
 
 // Generates all legal moves in a position for the given side. Advances the move pointer and returns it.
-template<Color Us>
+template<Color Us, bool CAPTURES_ONLY>
 [[gnu::hot]] Move *Position::generate_legals(Move *list) {
   constexpr Color Them = ~Us;
 
@@ -500,8 +505,9 @@ template<Color Us>
 
   // The king can move to all of its surrounding squares, except ones that are attacked, and
   // ones that have our own pieces on them
-  b1   = attacks<KING>(our_king, all) & ~(us_bb | danger);
-  list = make<QUIET>(our_king, b1 & ~them_bb, list);
+  b1 = attacks<KING>(our_king, all) & ~(us_bb | danger);
+  if constexpr (!CAPTURES_ONLY)
+    list = make<QUIET>(our_king, b1 & ~them_bb, list);
   list = make<CAPTURE>(our_king, b1 & them_bb, list);
 
   // The capture mask filters destination squares to those that contain an enemy piece that is checking the
@@ -645,11 +651,13 @@ template<Color Us>
       // 1. The king and the rook have both not moved
       // 2. No piece is attacking between the the rook and the king
       // 3. The king is not in check
-      if (!((history[game_ply].entry & oo_mask<Us>()) | ((all | danger) & oo_blockers_mask<Us>())))
-        *list++ = Us == WHITE ? Move(e1, h1, OO) : Move(e8, h8, OO);
-      if (!((history[game_ply].entry & ooo_mask<Us>()) |
-            ((all | (danger & ~ignore_ooo_danger<Us>())) & ooo_blockers_mask<Us>())))
-        *list++ = Us == WHITE ? Move(e1, c1, OOO) : Move(e8, c8, OOO);
+      if constexpr (!CAPTURES_ONLY) {
+        if (!((history[game_ply].entry & oo_mask<Us>()) | ((all | danger) & oo_blockers_mask<Us>())))
+          *list++ = Us == WHITE ? Move(e1, h1, OO) : Move(e8, h8, OO);
+        if (!((history[game_ply].entry & ooo_mask<Us>()) |
+              ((all | (danger & ~ignore_ooo_danger<Us>())) & ooo_blockers_mask<Us>())))
+          *list++ = Us == WHITE ? Move(e1, c1, OOO) : Move(e8, c8, OOO);
+      }
 
       // For each pinned rook, bishop or queen...
       b1 = ~(not_pinned | bitboard_of(Us, KNIGHT));
@@ -658,8 +666,9 @@ template<Color Us>
 
         //...only include attacks that are aligned with our king, since pinned pieces
         // are constrained to move in this direction only
-        b2   = attacks(type_of(board[s]), s, all) & LINE[our_king][s];
-        list = make<QUIET>(s, b2 & quiet_mask, list);
+        b2 = attacks(type_of(board[s]), s, all) & LINE[our_king][s];
+        if constexpr (!CAPTURES_ONLY)
+          list = make<QUIET>(s, b2 & quiet_mask, list);
         list = make<CAPTURE>(s, b2 & capture_mask, list);
       }
 
@@ -678,12 +687,14 @@ template<Color Us>
           b2   = pawn_attacks<Us>(s) & them_bb & LINE[s][our_king];
           list = make<CAPTURE>(s, b2, list);
 
-          // Single pawn pushes
-          b2 = shift<relative_dir<Us>(NORTH)>(SQUARE_BB[s]) & ~all & LINE[our_king][s];
-          // Double pawn pushes (only pawns on rank 3/6 are eligible)
-          b3   = shift<relative_dir<Us>(NORTH)>(b2 & MASK_RANK[relative_rank<Us>(RANK3)]) & ~all & LINE[our_king][s];
-          list = make<QUIET>(s, b2, list);
-          list = make<DOUBLE_PUSH>(s, b3, list);
+          if constexpr (!CAPTURES_ONLY) {
+            // Single pawn pushes
+            b2 = shift<relative_dir<Us>(NORTH)>(SQUARE_BB[s]) & ~all & LINE[our_king][s];
+            // Double pawn pushes (only pawns on rank 3/6 are eligible)
+            b3   = shift<relative_dir<Us>(NORTH)>(b2 & MASK_RANK[relative_rank<Us>(RANK3)]) & ~all & LINE[our_king][s];
+            list = make<QUIET>(s, b2, list);
+            list = make<DOUBLE_PUSH>(s, b3, list);
+          }
         }
       }
 
@@ -695,51 +706,56 @@ template<Color Us>
   // Non-pinned knight moves
   b1 = bitboard_of(Us, KNIGHT) & not_pinned;
   while (b1) {
-    s    = pop_lsb(&b1);
-    b2   = attacks<KNIGHT>(s, all);
-    list = make<QUIET>(s, b2 & quiet_mask, list);
+    s  = pop_lsb(&b1);
+    b2 = attacks<KNIGHT>(s, all);
+    if constexpr (!CAPTURES_ONLY)
+      list = make<QUIET>(s, b2 & quiet_mask, list);
     list = make<CAPTURE>(s, b2 & capture_mask, list);
   }
 
   // Non-pinned bishops and queens
   b1 = our_diag_sliders & not_pinned;
   while (b1) {
-    s    = pop_lsb(&b1);
-    b2   = attacks<BISHOP>(s, all);
-    list = make<QUIET>(s, b2 & quiet_mask, list);
+    s  = pop_lsb(&b1);
+    b2 = attacks<BISHOP>(s, all);
+    if constexpr (!CAPTURES_ONLY)
+      list = make<QUIET>(s, b2 & quiet_mask, list);
     list = make<CAPTURE>(s, b2 & capture_mask, list);
   }
 
   // Non-pinned rooks and queens
   b1 = our_orth_sliders & not_pinned;
   while (b1) {
-    s    = pop_lsb(&b1);
-    b2   = attacks<ROOK>(s, all);
-    list = make<QUIET>(s, b2 & quiet_mask, list);
+    s  = pop_lsb(&b1);
+    b2 = attacks<ROOK>(s, all);
+    if constexpr (!CAPTURES_ONLY)
+      list = make<QUIET>(s, b2 & quiet_mask, list);
     list = make<CAPTURE>(s, b2 & capture_mask, list);
   }
 
   // b1 contains non-pinned pawns which are not on the last rank
   b1 = bitboard_of(Us, PAWN) & not_pinned & ~MASK_RANK[relative_rank<Us>(RANK7)];
 
-  // Single pawn pushes
-  b2 = shift<relative_dir<Us>(NORTH)>(b1) & ~all;
+  if constexpr (!CAPTURES_ONLY) {
+    // Single pawn pushes
+    b2 = shift<relative_dir<Us>(NORTH)>(b1) & ~all;
 
-  // Double pawn pushes (only pawns on rank 3/6 are eligible)
-  b3 = shift<relative_dir<Us>(NORTH)>(b2 & MASK_RANK[relative_rank<Us>(RANK3)]) & quiet_mask;
+    // Double pawn pushes (only pawns on rank 3/6 are eligible)
+    b3 = shift<relative_dir<Us>(NORTH)>(b2 & MASK_RANK[relative_rank<Us>(RANK3)]) & quiet_mask;
 
-  // We & this with the quiet mask only later, as a non-check-blocking single push does NOT mean that the
-  // corresponding double push is not blocking check either.
-  b2 &= quiet_mask;
+    // We & this with the quiet mask only later, as a non-check-blocking single push does NOT mean that the
+    // corresponding double push is not blocking check either.
+    b2 &= quiet_mask;
 
-  while (b2) {
-    s       = pop_lsb(&b2);
-    *list++ = Move(s - relative_dir<Us>(NORTH), s, QUIET);
-  }
+    while (b2) {
+      s       = pop_lsb(&b2);
+      *list++ = Move(s - relative_dir<Us>(NORTH), s, QUIET);
+    }
 
-  while (b3) {
-    s       = pop_lsb(&b3);
-    *list++ = Move(s - relative_dir<Us>(NORTH_NORTH), s, DOUBLE_PUSH);
+    while (b3) {
+      s       = pop_lsb(&b3);
+      *list++ = Move(s - relative_dir<Us>(NORTH_NORTH), s, DOUBLE_PUSH);
+    }
   }
 
   // Pawn captures
@@ -759,14 +775,17 @@ template<Color Us>
   // b1 now contains non-pinned pawns which ARE on the last rank (about to promote)
   b1 = bitboard_of(Us, PAWN) & not_pinned & MASK_RANK[relative_rank<Us>(RANK7)];
   if (b1) {
-    // Quiet promotions
+    // Quiet promotions. CAPTURES_ONLY keeps the queen promotion (a quiescence move, the same
+    // one the QS picker used to keep from the full list) and drops the underpromotions.
     b2 = shift<relative_dir<Us>(NORTH)>(b1) & quiet_mask;
     while (b2) {
       s = pop_lsb(&b2);
       // One move is added for each promotion piece
-      *list++ = Move(s - relative_dir<Us>(NORTH), s, PR_KNIGHT);
-      *list++ = Move(s - relative_dir<Us>(NORTH), s, PR_BISHOP);
-      *list++ = Move(s - relative_dir<Us>(NORTH), s, PR_ROOK);
+      if constexpr (!CAPTURES_ONLY) {
+        *list++ = Move(s - relative_dir<Us>(NORTH), s, PR_KNIGHT);
+        *list++ = Move(s - relative_dir<Us>(NORTH), s, PR_BISHOP);
+        *list++ = Move(s - relative_dir<Us>(NORTH), s, PR_ROOK);
+      }
       *list++ = Move(s - relative_dir<Us>(NORTH), s, PR_QUEEN);
     }
 
