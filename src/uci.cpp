@@ -699,6 +699,65 @@ namespace {
     return ok;
   }
 
+  // --- selftest contempt -----------------------------------------------------------------------
+  // Regression test for the "Contempt" option: with it at 0, draw_score() must reproduce the old
+  // unconditional draw==0 exactly, so a position where the honest best line is worse than a
+  // drawing resource (repetition/perpetual) gets searched to a ~0 score. With Contempt clearly
+  // positive, that same resource must score noticeably *worse* than 0 from the root side's own
+  // perspective, since draw_score() now charges it -Contempt instead of handing it out for free —
+  // pushing the search to prefer fighting on unless every alternative is even worse. Compares the
+  // two scores rather than pinning either to an exact value: robust to future search tuning
+  // shifting the honest evaluation, while still catching a broken/reverted contempt wire-up (the
+  // two scores would then be equal).
+  bool selftest_contempt() {
+    if (!nnue::loaded()) {
+      std::cout << "selftest contempt FAIL: no net loaded\n";
+      return false;
+    }
+    // Q+K vs Q+K+a-pawn: White (to move) is down a pawn but has real perpetual-check/repetition
+    // resources, so at moderate depth the "honest" line is worse than the drawing one.
+    constexpr const char *FEN   = "3qk3/p7/8/8/8/8/8/3QK3 w - - 0 1";
+    constexpr int         DEPTH = 12;
+
+    const int saved_threads  = g_threads;
+    g_threads                = 1; // determinism: score comparisons need a bit-reproducible search
+    search::set_threads(1);
+
+    Position pos;
+    Position::set(FEN, pos);
+    tt::clear();
+    search::new_game();
+    search::set_contempt(0);
+    const int score_c0 = search::think(pos, DEPTH, nullptr, 0, 0).score;
+
+    Position::set(FEN, pos);
+    tt::clear();
+    search::new_game();
+    search::set_contempt(80);
+    const int score_c80 = search::think(pos, DEPTH, nullptr, 0, 0).score;
+
+    search::set_contempt(0); // leave global state clean for whatever runs next
+    g_threads = saved_threads;
+    search::set_threads(saved_threads);
+    tt::clear();
+    search::new_game();
+
+    bool ok = true;
+    if (score_c0 > 5) {
+      std::cout << "selftest contempt FAIL: Contempt=0 score " << score_c0 << " (expected ~0, a free draw taken)\n";
+      ok = false;
+    }
+    if (score_c80 > score_c0 - 30) {
+      std::cout << "selftest contempt FAIL: Contempt=80 score " << score_c80 << " not clearly below Contempt=0 score "
+                << score_c0 << "\n";
+      ok = false;
+    }
+    if (ok)
+      std::cout << "selftest contempt PASS: Contempt=0 score " << score_c0 << ", Contempt=80 score " << score_c80
+                << "\n";
+    return ok;
+  }
+
   // --- selftest all ----------------------------------------------------------------------------
   // Runs every selftest and reports a combined verdict. Uses &= (not &&) deliberately: every
   // suite runs regardless of an earlier failure, so a single pass reports everything that's
@@ -710,6 +769,7 @@ namespace {
     ok &= selftest_draw();
     ok &= selftest_nnue(500, 80);
     ok &= selftest_search();
+    ok &= selftest_contempt();
     ok &= selftest_stop();
     std::cout << (ok ? "selftest all: ALL PASS\n" : "selftest all: SOME FAILED (see above)\n");
   }
@@ -1067,6 +1127,7 @@ void uci::loop() {
       std::cout << "option name Hash type spin default " << tt::DEFAULT_HASH_MB << " min 1 max 65536\n";
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
       std::cout << "option name Split type spin default 10 min 4 max 64\n"; // YBWC split depth
+      std::cout << "option name Contempt type spin default 0 min -100 max 100\n"; // cp cost of a draw
       std::cout << "option name EvalFile type string default <embedded>\n";
       std::cout << "uciok\n";
     } else if (cmd == "isready") {
@@ -1122,6 +1183,12 @@ void uci::loop() {
         int d = 0;
         if (is >> d)
           search::set_split_depth(std::clamp(d, 4, 64));
+      } else if (name == "Contempt") {
+        // Centipawns the engine's own side pays to avoid a draw (negative: seeks draws). 0
+        // reproduces the old unconditional draw==0 exactly.
+        int cp = 0;
+        if (is >> cp)
+          search::set_contempt(std::clamp(cp, -100, 100));
       } else if (name == "EvalFile") {
         // The value is the rest of the line (paths can contain spaces). A bad file keeps the
         // currently loaded net (the embedded default) and reports why.
@@ -1150,8 +1217,8 @@ void uci::loop() {
       }
     } else if (cmd == "selftest") {
       // Hidden test commands (not advertised): "selftest {nnue [games] [maxply] | perft | see |
-      // draw | search | all}". selftest_search drives the shared TT/history/YBWC pool directly,
-      // so stop any running search first, exactly like bench.
+      // draw | search | contempt | stop | all}". selftest_search drives the shared TT/history/
+      // YBWC pool directly, so stop any running search first, exactly like bench.
       stop_search();
       std::string what;
       is >> what;
@@ -1167,6 +1234,8 @@ void uci::loop() {
         selftest_draw();
       else if (what == "search")
         selftest_search();
+      else if (what == "contempt")
+        selftest_contempt();
       else if (what == "stop")
         selftest_stop();
       else if (what == "all")

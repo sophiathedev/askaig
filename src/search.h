@@ -46,4 +46,8 @@ namespace search {
   void set_threads(int n);
   void set_split_depth(int d);
 
+  // Centipawns the root side is willing to give up to avoid a draw (the "Contempt" option;
+  // negative seeks draws instead). 0 (default) reproduces the old unconditional draw==0 exactly.
+  void set_contempt(int cp);
+
 } // namespace search

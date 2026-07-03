@@ -91,7 +91,12 @@ A **fail-soft negamax** (alpha-beta) search with **iterative deepening**, parall
   applied together, nudging the static eval used for pruning/quiescence toward what the search
   has actually found there before.
 - **Draw detection** — repetition and the fifty-move rule scored as draws (per-ply hash +
-  halfmove clock).
+  halfmove clock); a single earlier occurrence of a position is treated as drawn immediately
+  (either side could force the literal threefold from there, so search doesn't wait for it).
+  Draws are worth exactly 0 by default; the **`Contempt`** option (spin, default **0**) charges
+  the root side that many centipawns for any draw instead, so the search only settles for a
+  repetition when the alternatives really are that much worse, rather than the instant they dip
+  to merely equal.
 - **Time management** — soft/hard budgets from `wtime`/`btime`/`winc`/`binc`/`movestogo`, or a
   fixed `movetime`; the hard deadline is polled every 2048 nodes so a runaway line can't miss it.
   The soft deadline additionally scales by how much of the iteration's effort went into the move
@@ -153,6 +158,8 @@ Supported commands: `uci`, `isready`, `ucinewgame`,
 `go infinite` (search until `stop`), `go perft <depth> [noncache]`,
 `setoption name Hash value <MB>`, `setoption name Threads value <n>`,
 `setoption name Split value <depth>` (YBWC split-point depth threshold),
+`setoption name Contempt value <cp>` (centipawn cost of a draw to the side to move; negative
+seeks draws instead),
 `setoption name EvalFile value <path>` (load a `.nnue` file, or fall back to the embedded net),
 `d` / `display` (board + position facts + the current static NNUE eval), `eval` (raw static
 evaluation of the current position), `stop`, `quit`.
@@ -162,9 +169,10 @@ benchmark), `bench evalnps` (NNUE evaluation throughput), and a `selftest` regre
 `selftest nnue [games] [maxply]` (incremental accumulator vs. full refresh over random legal
 playouts), `selftest perft` (movegen vs. the classic reference positions), `selftest see`
 (static exchange evaluation), `selftest draw` (repetition/fifty-move detection), `selftest
-search` (PV legality and score sanity at Threads 1/2/4), `selftest stop` (a pre-set stop is
-honoured immediately, not silently discarded by a racing search thread), and `selftest all`
-(everything, with a combined verdict). Runs automatically on every push/PR, including under
+search` (PV legality and score sanity at Threads 1/2/4), `selftest contempt` (Contempt=0
+reproduces the old free draw, Contempt>0 measurably discourages one), `selftest stop` (a pre-set
+stop is honoured immediately, not silently discarded by a racing search thread), and `selftest
+all` (everything, with a combined verdict). Runs automatically on every push/PR, including under
 AddressSanitizer/UndefinedBehaviorSanitizer/ThreadSanitizer and an assertions-enabled Debug
 build — see `.github/workflows/ci.yml`.
 

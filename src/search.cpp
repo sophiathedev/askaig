@@ -41,6 +41,8 @@ namespace {
   int64_t            g_hard_ms = 0;
   Clock::time_point  g_t0;
   int                g_split_depth = 10; // the "Split" UCI option
+  int                g_contempt    = 0;  // the "Contempt" UCI option, in centipawns
+  Color              g_root_color  = WHITE; // side to move at the root of the current think()
 
   // Node-based time management: how many of the just-completed iteration's nodes went into
   // the root's first-searched move (the TT/PV move from move ordering — the one we already
@@ -117,6 +119,16 @@ namespace {
   }
   [[gnu::const, gnu::always_inline]] inline int from_tt(int v, int ply) {
     return v >= MATE_IN_MAX ? v - ply : v <= -MATE_IN_MAX ? v + ply : v;
+  }
+
+  // Draw value, from the current node's side-to-move perspective (as every search function
+  // must return). g_contempt is a fixed cost the ROOT side pays for any draw, however deep and
+  // whoever's move it's detected on: negamax flips sign once per ply on the way back up, so
+  // returning -contempt when it's the root color's own turn here and +contempt when it's the
+  // opponent's turn here both collapse to "root is down `contempt` cp" once propagated to the
+  // root. g_contempt == 0 (default) makes this identical to the old bare `return 0`.
+  [[gnu::pure, gnu::always_inline]] inline int draw_score(const Position &pos) {
+    return pos.turn() == g_root_color ? -g_contempt : g_contempt;
   }
 
   // Sum of all correction-history tables for this node: pawn skeleton, non-pawn material,
@@ -224,7 +236,7 @@ namespace {
     if (time_up(t))
       return 0;
     if (pos.is_draw())
-      return 0;
+      return draw_score(pos);
     if (ply >= MAX_PLY) [[unlikely]] // needs a 120-ply-deep line; essentially never happens
       return evaluate(t, pos, ss);
 
@@ -327,7 +339,7 @@ namespace {
       g_root_m1_nodes = 0, g_root_m1_move = Move();
     if (!root) {
       if (pos.is_draw())
-        return 0;
+        return draw_score(pos);
       if (ply >= MAX_PLY) [[unlikely]] // needs a 120-ply-deep line; essentially never happens
         return evaluate(t, pos, ss);
       // Mate distance pruning: only bites once a shorter mate is already known on another
@@ -741,6 +753,7 @@ void search::new_game() { g_hist.clear(); }
 void search::set_threads(int n) { pool().set_size(std::max(0, n - 1)); }
 
 void search::set_split_depth(int d) { g_split_depth = std::max(1, d); }
+void search::set_contempt(int cp) { g_contempt = cp; }
 
 // The caller must have already called search::clear_stop() SYNCHRONOUSLY on whatever thread
 // might race a subsequent request_stop() (see search.h) before invoking this — think() itself
@@ -749,6 +762,7 @@ void search::set_split_depth(int d) { g_split_depth = std::max(1, d); }
 search::Result search::think(Position &pos, int max_depth, const InfoFn &info, int64_t soft_ms, int64_t hard_ms) {
   if (!g_lmr_init)
     init_lmr();
+  g_root_color = pos.turn(); // fixes the draw_score() reference side for this whole search
   g_main.nodes = 0;
   g_hard_ms    = hard_ms;
   g_t0         = Clock::now();
