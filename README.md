@@ -107,7 +107,7 @@ A **fail-soft negamax** (alpha-beta) search with **iterative deepening**, parall
 
 ### Parallel search: YBWC, not Lazy SMP
 
-At a node whose depth is at least the **`Split`** option (spin, default **10**), the first
+At a node whose depth is at least the **`Split`** option (spin, default **6**), the first
 ("eldest") move is always searched sequentially; only if it fails to raise alpha to a cutoff are
 the *remaining* sibling moves handed to a pool of helper threads (`Threads − 1` helpers, plus the
 master itself) via a `SplitPoint`. Helpers attach to a frozen snapshot of the position and the

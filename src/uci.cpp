@@ -1142,7 +1142,7 @@ void uci::loop() {
       std::cout << "id author " << ENGINE_AUTHOR << "\n";
       std::cout << "option name Hash type spin default " << tt::DEFAULT_HASH_MB << " min 1 max 65536\n";
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
-      std::cout << "option name Split type spin default 10 min 4 max 64\n"; // YBWC split depth
+      std::cout << "option name Split type spin default 6 min 4 max 64\n"; // YBWC split depth
       std::cout << "option name Contempt type spin default 50 min -100 max 100\n"; // cp cost of a draw
       std::cout << "option name EvalFile type string default <embedded>\n";
       std::cout << "uciok\n";
