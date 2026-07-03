@@ -3,6 +3,7 @@
 #include <cstring>
 #include "movepick.h" // (via history.h users) — see_ge/PIECE_VAL come from see.h
 #include "see.h"
+#include "tt.h"
 
 // The YBWC split machinery: SplitPoint claim loops, the helper pool, and the abort chain.
 // The per-move search logic here (split_move) mirrors the sequential move loop's
@@ -56,6 +57,7 @@ namespace {
       sp.quiets.fetch_add(1, std::memory_order_relaxed);
     t.ev.push(pos, m);
     do_move(pos, m);
+    tt::prefetch(tt_key(pos));
 
     const int new_depth = depth - 1 + extension;
     int       v;

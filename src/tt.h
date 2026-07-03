@@ -36,6 +36,11 @@ namespace tt {
   [[gnu::hot]] void              store(Entry *e, uint64_t key, Move m, int score, int eval, int depth, Bound b,
                                        bool pv);
 
+  // Starts pulling `key`'s cluster toward L1 without blocking. Called right after every make
+  // in the search with the CHILD's key, so the probe at the top of the recursive call finds
+  // the line already in flight instead of eating the full memory latency there.
+  [[gnu::hot]] void prefetch(uint64_t key);
+
   size_t size_mb();
   int    hashfull(); // per-mille of recently-written entries, sampled
 

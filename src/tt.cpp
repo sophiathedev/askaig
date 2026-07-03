@@ -69,6 +69,11 @@ void tt::new_search() { g_gen += 8; }
   return victim;
 }
 
+// Called at every make in the search (see tt.h). A cluster is 32 bytes and 64-byte aligned,
+// so a single prefetch covers it. Deliberately not `pure`/`const`: the whole point is the
+// side effect on the cache, which those attributes would license the compiler to discard.
+[[gnu::hot]] void tt::prefetch(uint64_t key) { __builtin_prefetch(&g_table[key & (g_clusters - 1)]); }
+
 // Called at (almost) every negamax/qsearch node on the way back up — hot, and inherently
 // side-effecting (writes the slot), so no purity attributes apply.
 [[gnu::hot]] void tt::store(Entry *e, uint64_t key, Move m, int score, int eval, int depth, Bound b, bool pv) {

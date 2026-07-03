@@ -153,5 +153,12 @@ namespace search {
   [[gnu::pure, gnu::always_inline]] inline bool stm_in_check(const Position &p) {
     return p.turn() == WHITE ? p.in_check<WHITE>() : p.in_check<BLACK>();
   }
+  // The engine Zobrist hash omits castling rights and the en-passant square (they change the
+  // legal moves, so two positions differing only there must not share a TT slot) — mix them in.
+  // Shared by the tree search (probe/store) and both make sites' child-key prefetches.
+  [[gnu::pure, gnu::always_inline]] inline uint64_t tt_key(const Position &p) {
+    return p.get_hash() ^ ((p.castle_entry() & ALL_CASTLING_MASK) * 0x9E3779B97F4A7C15ull) ^
+           (uint64_t(uint16_t(p.history[p.ply()].epsq)) * 0xC2B2AE3D27D4EB4Full);
+  }
 
 } // namespace search
