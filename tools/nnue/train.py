@@ -44,6 +44,13 @@ def main():
 
     from data import open_bf
     total = len(open_bf(args.data))
+    # n_val is forced to at least one full batch so validation is never empty/partial; on a
+    # dataset smaller than 2 batches (e.g. a quick smoke test) that alone can exceed `total`,
+    # driving the training split negative — Batches(..., stop<0) then fails deep inside torch
+    # with an opaque "__len__() should return >= 0". Fail here instead, with the actual fix.
+    assert total >= 2 * args.batch, (
+        f"{args.data}: only {total} records, need >= {2 * args.batch} for --batch {args.batch} "
+        f"(pass a smaller --batch, e.g. --batch {max(1, total // 4)}, or grow the dataset)")
     n_val = max(args.batch, int(total * args.val_frac)) // args.batch * args.batch
     train = Batches(args.data, args.batch, device, start=0, stop=total - n_val)
     val = Batches(args.data, args.batch, device, start=total - n_val, stop=total)
