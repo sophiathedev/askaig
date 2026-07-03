@@ -20,8 +20,9 @@
 //
 // The accumulator updates incrementally per perspective; a king move that stays inside its
 // (bucket, mirror) context is a normal add/sub, crossing a boundary forces that perspective's
-// half to be rebuilt (lazily, at evaluate time). The output layer picks 1 of 8 heads by the
-// material count: bucket = (popcount(occupancy) - 2) / 4.
+// half to be rebuilt (lazily, at evaluate time) — as a diff against the RefreshTable cache
+// below, not from scratch. The output layer picks 1 of 8 heads by the material count:
+// bucket = (popcount(occupancy) - 2) / 4.
 //
 // Quantization (matching tools/nnue/export.py): FT weights/biases int16 at scale QA, output
 // weights int16 at scale QB, output biases int32 at QA*QB. SCReLU is computed as v*(v*w) with
@@ -101,6 +102,21 @@ namespace nnue {
     bool       computed[2];
   };
 
+  // Accumulator-refresh cache ("finny tables"): one cached half per (perspective, mirror,
+  // king bucket). A refresh — king crossing a bucket/mirror boundary, or a lazy walk-back
+  // with no usable ancestor — becomes a DIFF between the position's piece placement and the
+  // placement the cached accumulator was last built from, instead of a from-scratch rebuild
+  // over every piece: a king re-entering a context it visited before typically finds almost
+  // the whole board unchanged. ~37 KB per Evaluator (per thread), never shared.
+  struct RefreshEntry {
+    alignas(64) int16_t v[HL]; // bias + rows of every piece in bb, in this entry's context
+    Bitboard bb[NPIECES]; // the piece placement v was built from (enum-gap slots stay 0)
+  };
+  struct RefreshTable {
+    RefreshEntry e[NCOLORS][2][KING_BUCKETS]; // [perspective][mirror][king bucket]
+    bool         inited = false; // false until first use: entries refill from the loaded net
+  };
+
   // One per search thread. Usage around make/unmake:
   //   ev.reset(rootpos);                 // once per new root
   //   ev.push(pos, m); pos.play<C>(m);   // push BEFORE play (reads the captured piece)
@@ -120,8 +136,14 @@ namespace nnue {
 
   private:
     void ensure_half(Color persp, const Position &pos);
+    // Rebuilds stack[top]'s `persp` half through the refresh cache (diff against the cached
+    // placement for the position's king context) — the member path's replacement for a
+    // from-scratch refresh_half. Reset() marks the cache stale instead of refilling it, so a
+    // net swapped in between searches (EvalFile) can never leak stale weights out of it.
+    void refresh_half_cached(Color persp, const Position &pos);
 
     std::unique_ptr<Accumulator[]> stack; // MAX_PLY+8 entries — heap, not per-Position
+    std::unique_ptr<RefreshTable>  finny; // refresh cache, invalidated by reset()
     int                            top;
   };
 

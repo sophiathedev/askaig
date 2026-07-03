@@ -128,6 +128,36 @@ namespace {
     }
   }
 
+  // In-place diff apply for the refresh cache: acc += sum(add rows) - sum(sub rows), tiled
+  // like refresh_kernel so each accumulator tile is loaded and stored exactly once.
+  [[gnu::hot]] void apply_rows_kernel(int16_t *acc, const int16_t *const *add, int na, const int16_t *const *sub,
+                                      int ns) {
+    for (int i = 0; i < HL; i += 64) { // 4 x 16-lane vectors per tile
+      __m256i v0 = _mm256_load_si256(reinterpret_cast<const __m256i *>(acc + i));
+      __m256i v1 = _mm256_load_si256(reinterpret_cast<const __m256i *>(acc + i + 16));
+      __m256i v2 = _mm256_load_si256(reinterpret_cast<const __m256i *>(acc + i + 32));
+      __m256i v3 = _mm256_load_si256(reinterpret_cast<const __m256i *>(acc + i + 48));
+      for (int k = 0; k < na; ++k) {
+        const int16_t *r = add[k] + i;
+        v0               = _mm256_add_epi16(v0, _mm256_load_si256(reinterpret_cast<const __m256i *>(r)));
+        v1               = _mm256_add_epi16(v1, _mm256_load_si256(reinterpret_cast<const __m256i *>(r + 16)));
+        v2               = _mm256_add_epi16(v2, _mm256_load_si256(reinterpret_cast<const __m256i *>(r + 32)));
+        v3               = _mm256_add_epi16(v3, _mm256_load_si256(reinterpret_cast<const __m256i *>(r + 48)));
+      }
+      for (int k = 0; k < ns; ++k) {
+        const int16_t *r = sub[k] + i;
+        v0               = _mm256_sub_epi16(v0, _mm256_load_si256(reinterpret_cast<const __m256i *>(r)));
+        v1               = _mm256_sub_epi16(v1, _mm256_load_si256(reinterpret_cast<const __m256i *>(r + 16)));
+        v2               = _mm256_sub_epi16(v2, _mm256_load_si256(reinterpret_cast<const __m256i *>(r + 32)));
+        v3               = _mm256_sub_epi16(v3, _mm256_load_si256(reinterpret_cast<const __m256i *>(r + 48)));
+      }
+      _mm256_store_si256(reinterpret_cast<__m256i *>(acc + i), v0);
+      _mm256_store_si256(reinterpret_cast<__m256i *>(acc + i + 16), v1);
+      _mm256_store_si256(reinterpret_cast<__m256i *>(acc + i + 32), v2);
+      _mm256_store_si256(reinterpret_cast<__m256i *>(acc + i + 48), v3);
+    }
+  }
+
   // One half of the SCReLU dot: sum clamp(a,0,QA) * (clamp(a,0,QA) * w) in int32 lanes.
   [[gnu::pure, gnu::hot]] __m256i dot_half(const int16_t *a, const int16_t *w) {
     const __m256i zero = _mm256_setzero_si256();
@@ -205,6 +235,35 @@ namespace {
     }
   }
 
+  // In-place diff apply for the refresh cache — see the AVX2 twin above.
+  [[gnu::hot]] void apply_rows_kernel(int16_t *acc, const int16_t *const *add, int na, const int16_t *const *sub,
+                                      int ns) {
+    for (int i = 0; i < HL; i += 32) { // 4 x 8-lane vectors per tile
+      int16x8_t v0 = vld1q_s16(acc + i);
+      int16x8_t v1 = vld1q_s16(acc + i + 8);
+      int16x8_t v2 = vld1q_s16(acc + i + 16);
+      int16x8_t v3 = vld1q_s16(acc + i + 24);
+      for (int k = 0; k < na; ++k) {
+        const int16_t *r = add[k] + i;
+        v0               = vaddq_s16(v0, vld1q_s16(r));
+        v1               = vaddq_s16(v1, vld1q_s16(r + 8));
+        v2               = vaddq_s16(v2, vld1q_s16(r + 16));
+        v3               = vaddq_s16(v3, vld1q_s16(r + 24));
+      }
+      for (int k = 0; k < ns; ++k) {
+        const int16_t *r = sub[k] + i;
+        v0               = vsubq_s16(v0, vld1q_s16(r));
+        v1               = vsubq_s16(v1, vld1q_s16(r + 8));
+        v2               = vsubq_s16(v2, vld1q_s16(r + 16));
+        v3               = vsubq_s16(v3, vld1q_s16(r + 24));
+      }
+      vst1q_s16(acc + i, v0);
+      vst1q_s16(acc + i + 8, v1);
+      vst1q_s16(acc + i + 16, v2);
+      vst1q_s16(acc + i + 24, v3);
+    }
+  }
+
   [[gnu::pure, gnu::hot]] int32x4_t dot_half(const int16_t *a, const int16_t *w) {
     const int16x8_t zero = vdupq_n_s16(0);
     const int16x8_t qa   = vdupq_n_s16(QA);
@@ -252,6 +311,22 @@ namespace {
     }
   }
 
+  // In-place diff apply for the refresh cache — see the AVX2/NEON twins above. All three are
+  // exact int16 wraparound arithmetic, so the paths stay bit-identical.
+  [[gnu::hot]] void apply_rows_kernel(int16_t *acc, const int16_t *const *add, int na, const int16_t *const *sub,
+                                      int ns) {
+    for (int k = 0; k < na; ++k) {
+      const int16_t *r = add[k];
+      for (int i = 0; i < HL; ++i)
+        acc[i] = static_cast<int16_t>(acc[i] + r[i]);
+    }
+    for (int k = 0; k < ns; ++k) {
+      const int16_t *r = sub[k];
+      for (int i = 0; i < HL; ++i)
+        acc[i] = static_cast<int16_t>(acc[i] - r[i]);
+    }
+  }
+
   [[gnu::pure, gnu::hot]] int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a, const int16_t *w) {
     int32_t        sum     = 0;
     const int16_t *half[2] = {stm_a, opp_a};
@@ -269,6 +344,9 @@ namespace {
 #endif
 
   // Rebuilds one perspective half of `acc` from scratch (bias + every piece, kings included).
+  // The from-scratch reference path: only evaluate_refresh (UCI eval/d, parity selftests) uses
+  // it — the search's Evaluator refreshes through its cache instead (refresh_half_cached),
+  // which selftest nnue pins bit-exactly against this.
   [[gnu::hot]] void refresh_half(Accumulator &acc, Color persp, const Position &pos) {
     const KingCtx  c = king_ctx_of(pos, persp);
     const int16_t *rows[40]; // 32 pieces max in a legal game; headroom for weird FEN input
@@ -402,14 +480,72 @@ bool nnue::loaded() { return g_loaded; }
 
 // --- Evaluator -----------------------------------------------------------------------------
 
-nnue::Evaluator::Evaluator() : stack(new Accumulator[MAX_PLY + 8]), top(0) {
+nnue::Evaluator::Evaluator() : stack(new Accumulator[MAX_PLY + 8]), finny(new RefreshTable), top(0) {
   stack[0].computed[WHITE] = stack[0].computed[BLACK] = false;
 }
 
 void nnue::Evaluator::reset(const Position &pos) {
-  top = 0;
-  refresh_half(stack[0], WHITE, pos);
-  refresh_half(stack[0], BLACK, pos);
+  top           = 0;
+  finny->inited = false; // net weights may have changed since the last search (EvalFile)
+  refresh_half_cached(WHITE, pos);
+  refresh_half_cached(BLACK, pos);
+}
+
+// Rebuilds stack[top]'s `persp` half through the refresh cache: diff the position's piece
+// placement against what the cached accumulator for this (perspective, mirror, bucket)
+// context was built from, apply just the difference in one kernel pass, and copy the result
+// out. In real play the diff is a handful of rows (the pieces that moved since the king last
+// sat in this context) versus the ~32 a from-scratch rebuild always pays.
+[[gnu::hot]] void nnue::Evaluator::refresh_half_cached(Color persp, const Position &pos) {
+  const KingCtx c = king_ctx_of(pos, persp);
+  if (!finny->inited) [[unlikely]] {
+    // First use after reset(): every cached context restarts from the empty board (just the
+    // bias), so the first refresh per context degenerates to a from-scratch rebuild.
+    for (auto &per_persp: finny->e)
+      for (auto &per_mirror: per_persp)
+        for (RefreshEntry &e: per_mirror) {
+          std::memcpy(e.v, g_net.ft_b, sizeof(e.v));
+          std::memset(e.bb, 0, sizeof(e.bb));
+        }
+    finny->inited = true;
+  }
+  RefreshEntry &e = finny->e[persp][c.mirror][c.bucket];
+
+  const int16_t *add[40], *sub[40]; // 32 pieces max in a legal game; headroom for weird FENs
+  int            na = 0, ns = 0;
+  bool           over = false;
+  for (int pc = WHITE_PAWN; pc <= BLACK_KING && !over; ++pc) {
+    if (pc > WHITE_KING && pc < BLACK_PAWN)
+      continue; // the gap in the Piece enum (6, 7)
+    const Bitboard now = pos.bitboard_of(Piece(pc));
+    Bitboard       a = now & ~e.bb[pc], s = e.bb[pc] & ~now;
+    while (a && !(over = na == 40))
+      add[na++] = ft_row(persp, Piece(pc), pop_lsb(&a), c);
+    while (s && !(over = ns == 40))
+      sub[ns++] = ft_row(persp, Piece(pc), pop_lsb(&s), c);
+    e.bb[pc] = now;
+  }
+  if (over) [[unlikely]] {
+    // A non-game FEN blew the diff headroom: rebuild the entry from scratch instead, with
+    // refresh_half's own 40-row cap (such positions get a best-effort eval there too).
+    const int16_t *rows[40];
+    int            n = 0;
+    for (int pc = WHITE_PAWN; pc <= BLACK_KING; ++pc) {
+      if (pc > WHITE_KING && pc < BLACK_PAWN)
+        continue;
+      Bitboard bb = pos.bitboard_of(Piece(pc));
+      e.bb[pc]    = bb;
+      while (bb && n < 40)
+        rows[n++] = ft_row(persp, Piece(pc), pop_lsb(&bb), c);
+    }
+    refresh_kernel(e.v, rows, n);
+  } else
+    apply_rows_kernel(e.v, add, na, sub, ns);
+
+  Accumulator &acc = stack[top];
+  std::memcpy(acc.v[persp], e.v, sizeof(e.v));
+  acc.ctx[persp]      = c;
+  acc.computed[persp] = true;
 }
 
 // Records the feature changes of `m` (to be played on `before`) into a new stack entry.
@@ -508,9 +644,9 @@ void nnue::Evaluator::push_null() {
 
 // Makes stack[top]'s `persp` half valid: walk back to the nearest computed ancestor and apply
 // the recorded updates forward — unless an own-king move CHANGES the (bucket, mirror) context
-// anywhere in the chain (or the chain is too long / has no computed ancestor), in which case a
-// full refresh of the half from `pos` is the only (and cheaper) option. Writes into `stack[]`
-// (the lazy-evaluation memoization) as a side effect, so it is NOT `pure`.
+// anywhere in the chain (or the chain is too long / has no computed ancestor), in which case
+// the half is rebuilt through the refresh cache instead (refresh_half_cached). Writes into
+// `stack[]` (the lazy-evaluation memoization) as a side effect, so it is NOT `pure`.
 [[gnu::hot]] void nnue::Evaluator::ensure_half(Color persp, const Position &pos) {
   if (stack[top].computed[persp])
     return;
@@ -520,7 +656,7 @@ void nnue::Evaluator::push_null() {
   while (j > 0 && !stack[j].computed[persp] && top - j < MAX_BACKTRACK)
     --j;
   if (!stack[j].computed[persp]) {
-    refresh_half(stack[top], persp, pos);
+    refresh_half_cached(persp, pos);
     return;
   }
 
@@ -530,7 +666,7 @@ void nnue::Evaluator::push_null() {
     if (moves_own_king(stack[k].dp, persp)) {
       const KingCtx nc = ctx_after(stack[k].dp, persp);
       if (!(nc == c)) {
-        refresh_half(stack[top], persp, pos);
+        refresh_half_cached(persp, pos);
         return;
       }
       c = nc;
