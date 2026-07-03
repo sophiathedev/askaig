@@ -7,9 +7,10 @@
 #include "see.h"
 #include "types.h"
 
-// Move ordering. The movegen produces all legal moves at once (there is no staged generator),
-// so the picker scores everything up front into bands and yields moves by selection-sort —
-// O(n) per pick, and typically only a few picks happen before a beta cutoff.
+// Move ordering. The movegen produces its legal moves at once (there is no staged generator;
+// quiescence outside check uses the CAPTURES_ONLY variant), so the picker scores everything
+// up front into bands and yields moves by selection-sort — O(n) per pick, and typically only
+// a few picks happen before a beta cutoff.
 //
 // Bands (high to low): TT move, winning/equal captures (SEE >= 0, by MVV + capture history),
 // killers, quiets (butterfly + continuation history), losing captures.
@@ -46,16 +47,20 @@ namespace search {
     [[gnu::hot]] MovePicker(Position &pos, const Histories &hist, Move ttm, const Move *killers,
                             const ContTable *ch1, const ContTable *ch2, bool quiescence)
         : pos(&pos), n(0), cur(0) {
-      Move buf[218];
-      const size_t cnt =
-              pos.turn() == WHITE ? size_t(pos.generate_legals<WHITE>(buf) - buf) : size_t(pos.generate_legals<BLACK>(buf) - buf);
-      const bool in_check = pos.turn() == WHITE ? pos.in_check<WHITE>() : pos.in_check<BLACK>();
+      // Quiescence outside check generates captures + quiet queen promotions ONLY (the
+      // CAPTURES_ONLY movegen) instead of generating everything and discarding the quiets —
+      // same move set, in the same generation order, without emitting what QS never scores.
+      // In check the full generator runs: QS searches every evasion there.
+      const bool in_check  = pos.turn() == WHITE ? pos.in_check<WHITE>() : pos.in_check<BLACK>();
+      const bool caps_only = quiescence && !in_check;
+      Move       buf[218];
+      Move      *end = pos.turn() == WHITE
+                               ? (caps_only ? pos.generate_legals<WHITE, true>(buf) : pos.generate_legals<WHITE>(buf))
+                               : (caps_only ? pos.generate_legals<BLACK, true>(buf) : pos.generate_legals<BLACK>(buf));
+      const size_t cnt = size_t(end - buf);
 
       for (size_t i = 0; i < cnt; ++i) {
         const Move m = buf[i];
-        // Quiescence outside check: captures and queen promotions only.
-        if (quiescence && !in_check && !m.is_capture() && m.flags() != PR_QUEEN)
-          continue;
 
         int score;
         if (ttm.to_from() != 0 && m.to_from() == ttm.to_from())
