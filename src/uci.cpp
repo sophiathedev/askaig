@@ -514,8 +514,10 @@ namespace {
   // --- selftest draw ---------------------------------------------------------------------------
   // Position::is_draw() flags a draw on the SECOND occurrence of a position (a repeat), not the
   // literal FIDE threefold — the search treats any repeated line as drawish rather than waiting
-  // for a third occurrence that a hypothetical search line will rarely reach. Verified directly
-  // against Position, independent of search/NNUE.
+  // for a third occurrence that a hypothetical search line will rarely reach — plus the
+  // fifty-move rule and dead material (bare kings + at most one minor). Verified directly
+  // against Position, independent of search/NNUE. The shuffle/fifty cases keep a rook per side
+  // on the board precisely so the dead-material rule cannot fire before the rule under test.
   bool selftest_draw() {
     bool ok = true;
     const auto expect = [&](bool cond, const char *what) {
@@ -533,7 +535,7 @@ namespace {
     { // A king-shuffle round trip (4 plies) returns to the exact starting position — its SECOND
       // occurrence — and must flip is_draw() to true exactly there, not on the 3 plies before it.
       Position pos;
-      Position::set("4k3/8/8/8/8/8/8/4K3 w - - 0 1", pos);
+      Position::set("r3k3/8/8/8/8/8/8/R3K3 w - - 0 1", pos);
       constexpr const char *SHUFFLE[] = {"e1d1", "e8d8", "d1e1", "d8e8"};
       for (int i = 0; i < 4; ++i) {
         if (!play_uci_move(pos, SHUFFLE[i])) {
@@ -548,7 +550,7 @@ namespace {
     }
     { // Fifty-move rule: one halfmove short of the limit, then one quiet move over it.
       Position pos;
-      Position::set("4k3/8/8/8/8/8/8/4K3 w - - 99 1", pos);
+      Position::set("r3k3/8/8/8/8/8/8/R3K3 w - - 99 1", pos);
       expect(!pos.is_draw(), "fifty-move rule fired one halfmove early");
       if (!play_uci_move(pos, "e1d1")) {
         std::cout << "selftest draw FAIL: illegal fifty-move test move\n";
@@ -556,9 +558,23 @@ namespace {
       }
       expect(pos.is_draw(), "fifty-move rule did not fire at halfmove 100");
     }
+    { // Dead material: KvK, KBvK and KNvK can never mate — drawn on the spot, whoever moves.
+      // KRvK, KPvK and KNNvK all still contain legal mates and must NOT be flagged.
+      const auto draws = [](const char *fen) {
+        Position pos;
+        Position::set(fen, pos);
+        return pos.is_draw();
+      };
+      expect(draws("4k3/8/8/8/8/8/8/4K3 w - - 0 1"), "K vs K not flagged as a dead draw");
+      expect(draws("4k3/8/8/8/8/8/2B5/4K3 b - - 0 1"), "KB vs K not flagged as a dead draw");
+      expect(draws("4k3/8/2n5/8/8/8/8/4K3 w - - 0 1"), "KN vs K not flagged as a dead draw");
+      expect(!draws("4k3/8/8/8/8/8/8/2R1K3 w - - 0 1"), "KR vs K wrongly flagged as a draw");
+      expect(!draws("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1"), "KP vs K wrongly flagged as a draw");
+      expect(!draws("4k3/8/8/8/8/8/1NN5/4K3 b - - 0 1"), "KNN vs K wrongly flagged as a draw");
+    }
 
     if (ok)
-      std::cout << "selftest draw PASS: negative control, repetition, and fifty-move rule all correct\n";
+      std::cout << "selftest draw PASS: negative control, repetition, fifty-move rule, and dead material all correct\n";
     return ok;
   }
 
