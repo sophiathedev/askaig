@@ -40,7 +40,7 @@ namespace {
   std::atomic<bool>  g_stop{false};
   int64_t            g_hard_ms = 0;
   Clock::time_point  g_t0;
-  int                g_split_depth = 10; // the "Split" UCI option
+  int                g_split_depth = 6; // the "Split" UCI option
   int                g_contempt    = 50; // the "Contempt" UCI option, in centipawns
   Color              g_root_color  = WHITE; // side to move at the root of the current think()
 
