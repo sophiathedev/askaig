@@ -77,12 +77,8 @@ namespace {
   // reads (pure arithmetic on by-value arguments); `pure` for functions that read memory
   // (Position, history tables) but have no side effects of their own.
 
-  // The engine Zobrist hash omits castling rights and the en-passant square (they change the
-  // legal moves, so two positions differing only there must not share a TT slot) — mix them in.
-  [[gnu::pure, gnu::always_inline]] inline uint64_t tt_key(const Position &p) {
-    return p.get_hash() ^ ((p.castle_entry() & ALL_CASTLING_MASK) * 0x9E3779B97F4A7C15ull) ^
-           (uint64_t(uint16_t(p.history[p.ply()].epsq)) * 0xC2B2AE3D27D4EB4Full);
-  }
+  // tt_key (the castling/en-passant mix over the incremental Zobrist hash) lives in ybwc.h
+  // with the other shared make/unmake helpers — the split machinery prefetches with it too.
 
   // Correction-history keys. Each is a cheap position-derived hash into a CORR_SIZE table —
   // collisions just blend unrelated positions' corrections, no correctness impact.
@@ -288,6 +284,7 @@ namespace {
       ++t.nodes;
       t.ev.push(pos, m);
       do_move(pos, m);
+      tt::prefetch(tt_key(pos));
       const int v = -qsearch<PV>(t, pos, ss + 1, -beta, -alpha, ply + 1);
       undo_move(pos, m);
       t.ev.pop();
@@ -426,6 +423,7 @@ namespace {
         ss->ch      = nullptr;
         t.ev.push_null();
         pos.play_null();
+        tt::prefetch(tt_key(pos));
         const int v = -negamax<false>(t, pos, ss + 1, -beta, -beta + 1, depth - R, ply + 1, !cutnode);
         pos.undo_null();
         t.ev.pop();
@@ -450,6 +448,7 @@ namespace {
           ++t.nodes;
           t.ev.push(pos, m);
           do_move(pos, m);
+          tt::prefetch(tt_key(pos));
           int v = -qsearch<false>(t, pos, ss + 1, -pc_beta, -pc_beta + 1, ply + 1);
           if (v >= pc_beta) // qsearch agrees: confirm with a reduced full search
             v = -negamax<false>(t, pos, ss + 1, -pc_beta, -pc_beta + 1, depth - 4, ply + 1, !cutnode);
@@ -539,6 +538,7 @@ namespace {
       ++t.nodes;
       t.ev.push(pos, m);
       do_move(pos, m);
+      tt::prefetch(tt_key(pos));
 
       const int new_depth = depth - 1 + extension;
       int       v         = -INF;
