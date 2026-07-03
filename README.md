@@ -93,7 +93,7 @@ A **fail-soft negamax** (alpha-beta) search with **iterative deepening**, parall
 - **Draw detection** — repetition and the fifty-move rule scored as draws (per-ply hash +
   halfmove clock); a single earlier occurrence of a position is treated as drawn immediately
   (either side could force the literal threefold from there, so search doesn't wait for it).
-  The **`Contempt`** option (spin, default **50**) charges the root side that many centipawns
+  The **`Contempt`** option (spin, default **0**) charges the root side that many centipawns
   for any draw, so the search only settles for a repetition when the alternatives really are
   that much worse, rather than the instant they dip
   to merely equal.
