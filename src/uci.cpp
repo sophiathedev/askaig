@@ -736,7 +736,7 @@ namespace {
     search::set_contempt(80);
     const int score_c80 = search::think(pos, DEPTH, nullptr, 0, 0).score;
 
-    search::set_contempt(0); // leave global state clean for whatever runs next
+    search::set_contempt(50); // leave global state at the actual default for whatever runs next
     g_threads = saved_threads;
     search::set_threads(saved_threads);
     tt::clear();
@@ -1127,7 +1127,7 @@ void uci::loop() {
       std::cout << "option name Hash type spin default " << tt::DEFAULT_HASH_MB << " min 1 max 65536\n";
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
       std::cout << "option name Split type spin default 10 min 4 max 64\n"; // YBWC split depth
-      std::cout << "option name Contempt type spin default 0 min -100 max 100\n"; // cp cost of a draw
+      std::cout << "option name Contempt type spin default 50 min -100 max 100\n"; // cp cost of a draw
       std::cout << "option name EvalFile type string default <embedded>\n";
       std::cout << "uciok\n";
     } else if (cmd == "isready") {

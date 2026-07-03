@@ -41,7 +41,7 @@ namespace {
   int64_t            g_hard_ms = 0;
   Clock::time_point  g_t0;
   int                g_split_depth = 10; // the "Split" UCI option
-  int                g_contempt    = 0;  // the "Contempt" UCI option, in centipawns
+  int                g_contempt    = 50; // the "Contempt" UCI option, in centipawns
   Color              g_root_color  = WHITE; // side to move at the root of the current think()
 
   // Node-based time management: how many of the just-completed iteration's nodes went into
