@@ -10,15 +10,15 @@
 // toward zero and saturates at +-HIST_MAX without explicit clamping.
 
 // A few counters/tables in the search (this file's Histories, and ThreadData::nodes in
-// ybwc.h) are shared across threads with NO synchronization at all, on purpose: they are
+// smp.h) are shared across threads with NO synchronization at all, on purpose: they are
 // statistics — a torn/stale/lost update costs at most slightly worse move ordering or a
 // slightly-off node count, never a wrong result — and the cost of an atomic or a mutex on the
 // hottest code path in the engine (every cutoff, every node) isn't worth paying for that.
 // Formally still a data race (the C++ memory model has no "benign" exception), so
 // ThreadSanitizer correctly flags it. ASKAIG_TSAN_IGNORE/ASKAIG_TSAN_BUILD mark exactly these
 // intentionally-accepted races so CI's TSan job stays a meaningful gate against any OTHER,
-// unintended one — which is exactly how it caught a real bug in the YBWC merge path (see
-// ybwc.cpp's SplitPoint::active comments): that one got a proper acquire/release fix instead.
+// unintended one — in the YBWC era that gate caught a real merge-path race that then got a
+// proper acquire/release fix instead of a suppression.
 #if defined(__has_feature)
   #if __has_feature(thread_sanitizer)
     #define ASKAIG_TSAN_BUILD 1

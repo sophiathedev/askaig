@@ -4,16 +4,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <memory>
-#include <mutex>
-#include <thread>
 #include <vector>
 #include "history.h"
 #include "movepick.h"
 #include "nnue.h"
 #include "see.h"
+#include "smp.h"
 #include "tt.h"
-#include "ybwc.h"
 
 // Fail-soft negamax with, in rough order of gating: TT cutoffs, static-eval correction
 // history, IIR, razoring, RFP, NMP, ProbCut, singular extensions (with multicut and
@@ -22,12 +19,12 @@
 // movepick.h uses the TT move, MVV + capture history (SEE-verified lazily at yield time),
 // killers, and butterfly + continuation (CMH/FMH) history.
 //
-// Parallelism is YBWC (Young Brothers Wait Concept), NOT Lazy SMP: at a node with
-// depth >= the "Split" UCI option, the first ("eldest") move is always searched sequentially;
-// only if it fails to cut are the remaining siblings distributed over the helper threads of a
-// global pool. Helpers claim sibling moves from a SplitPoint, sharing alpha/best atomically;
-// a beta cutoff raises the split's abort flag, which every claimant polls (and which chains
-// through nested splits). Perft keeps its own independent worker scheme in uci.cpp.
+// Parallelism is Lazy SMP (smp.h/smp.cpp): every helper thread runs its own full
+// iterative-deepening search of the root on a private Position copy, sharing only the
+// transposition table and the history tables with the main thread. Nothing is ever read back
+// from a helper — their value is the TT/history warm-up. The main thread alone reports
+// iterations, manages time and produces the bestmove; helpers stop when it raises
+// g_helper_stop at the end of think(). Perft keeps its own worker scheme in uci.cpp.
 namespace {
 
   using namespace search;
@@ -38,22 +35,23 @@ namespace {
   Histories          g_hist;
   ThreadData         g_main;
   std::atomic<bool>  g_stop{false};
+  // Raised by think() once ITS search is done, so the lazy-SMP helpers (each running an
+  // open-ended iterative deepening of their own) wind down before think() returns. A separate
+  // flag from g_stop on purpose: g_stop belongs to the caller (see clear_stop()'s contract) —
+  // think() may never touch it, but it fully owns the helpers' lifetime.
+  std::atomic<bool>  g_helper_stop{false};
   int64_t            g_hard_ms = 0;
   Clock::time_point  g_t0;
-  int                g_split_depth = 6; // the "Split" UCI option
-  int                g_contempt    = 0; // the "Contempt" UCI option, in centipawns
-  Color              g_root_color  = WHITE; // side to move at the root of the current think()
+  int                g_contempt   = 0; // the "Contempt" UCI option, in centipawns
+  Color              g_root_color = WHITE; // side to move at the root of the current think()
 
-  // Node-based time management: how many of the just-completed iteration's nodes went into
-  // the root's first-searched move (the TT/PV move from move ordering — the one we already
-  // believe is best). Reset at the start of every root call so a widened aspiration re-try
-  // only keeps the LAST attempt's count; read back in think() once the iteration returns.
-  // Deliberately tracks only this one move rather than every root move: it is always searched
-  // fully sequentially (splitting only ever farms out the SIBLINGS after it), so no split-path
-  // instrumentation is needed, and it usually IS the eventual best move — think() checks that
-  // and simply skips the adjustment on the rarer iterations where it wasn't.
-  uint64_t g_root_m1_nodes = 0;
-  Move     g_root_m1_move{};
+  // Node-based time management instrumentation (ThreadData::root_m1_nodes/root_m1_move): how
+  // many of the just-completed iteration's nodes went into the root's first-searched move
+  // (the TT/PV move from move ordering — the one we already believe is best). Reset at the
+  // start of every root call so a widened aspiration re-try only keeps the LAST attempt's
+  // count; think() reads the MAIN thread's copy back once the iteration returns (per-thread
+  // fields so helper roots can't clobber it). It usually IS the eventual best move — think()
+  // checks that and skips the adjustment on the rarer iterations where it wasn't.
 
   // LMR reduction table, ln(depth)*ln(moves) scaled (the "most principled" log formula).
   int  g_lmr[64][64];
@@ -77,8 +75,8 @@ namespace {
   // reads (pure arithmetic on by-value arguments); `pure` for functions that read memory
   // (Position, history tables) but have no side effects of their own.
 
-  // tt_key (the castling/en-passant mix over the incremental Zobrist hash) lives in ybwc.h
-  // with the other shared make/unmake helpers — the split machinery prefetches with it too.
+  // tt_key (the castling/en-passant mix over the incremental Zobrist hash) lives in smp.h
+  // with the other shared make/unmake helpers.
 
   // Correction-history keys. Each is a cheap position-derived hash into a CORR_SIZE table —
   // collisions just blend unrelated positions' corrections, no correctness impact.
@@ -159,10 +157,17 @@ namespace {
     return std::clamp(raw + correction(pos, ss), -MATE_IN_MAX + 1, MATE_IN_MAX - 1);
   }
 
-  // A stop/abort poll for the tree: aborted() plus the hard clock. NOT pure — it can flip
-  // g_stop on timeout, a real side effect every other node in this file relies on.
+  // True when this thread's search is moot: the caller's stop, or think() winding the lazy-SMP
+  // helpers down. Every consumer must discard results once this holds.
+  [[gnu::hot]] inline bool stopped() {
+    return g_stop.load(std::memory_order_relaxed) || g_helper_stop.load(std::memory_order_relaxed);
+  }
+
+  // A stop/abort poll for the tree: stopped() plus the hard clock. NOT pure — it can flip
+  // g_stop on timeout, a real side effect every other node in this file relies on. Helpers
+  // poll the hard clock too, so they never outlive the time budget on their own.
   [[gnu::hot]] bool time_up(ThreadData &t) {
-    if (aborted(t))
+    if (stopped())
       return true;
     if (g_hard_ms > 0 && (t.nodes & 2047) == 0) {
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - g_t0).count();
@@ -225,9 +230,8 @@ namespace {
   [[gnu::hot]] int negamax(ThreadData &t, Position &pos, Stack *ss, int alpha, int beta, int depth, int ply,
                            bool cutnode);
 
-  // --- YBWC split machinery ---------------------------------------------------------------------
-
-
+  // The reported node/nps totals: the main thread plus every lazy-SMP helper, summed live
+  // (see ThreadPool::total_nodes for the intentionally-unsynchronized read).
   uint64_t all_nodes() { return g_main.nodes + pool().total_nodes(); }
 
   // --- quiescence -------------------------------------------------------------------------------
@@ -300,9 +304,9 @@ namespace {
       const int v = -qsearch<PV>(t, pos, ss + 1, -beta, -alpha, ply + 1);
       undo_move(pos, m);
       t.ev.pop();
-      // Checked on every move at every node; true exactly once, ever, for the whole search
-      // (when time runs out) — about as skewed a branch as exists in this file.
-      if (g_stop.load(std::memory_order_relaxed)) [[unlikely]]
+      // Checked on every move at every node; true at most once per thread for the whole
+      // search (time out / wind-down) — about as skewed a branch as exists in this file.
+      if (stopped()) [[unlikely]]
         return 0;
 
       if (v > best) {
@@ -345,7 +349,7 @@ namespace {
 
     const bool root = ply == 0;
     if (root) // fresh attempt (first call, or an aspiration re-try after a widened window)
-      g_root_m1_nodes = 0, g_root_m1_move = Move();
+      t.root_m1_nodes = 0, t.root_m1_move = Move();
     if (!root) {
       if (pos.is_draw())
         return draw_score(pos);
@@ -439,7 +443,7 @@ namespace {
         const int v = -negamax<false>(t, pos, ss + 1, -beta, -beta + 1, depth - R, ply + 1, !cutnode);
         pos.undo_null();
         t.ev.pop();
-        if (g_stop.load(std::memory_order_relaxed)) [[unlikely]] // see the qsearch move loop
+        if (stopped()) [[unlikely]] // see the qsearch move loop
           return 0;
         if (v >= beta)
           return v >= MATE_IN_MAX ? beta : v; // don't return unproven mates
@@ -466,7 +470,7 @@ namespace {
             v = -negamax<false>(t, pos, ss + 1, -pc_beta, -pc_beta + 1, depth - 4, ply + 1, !cutnode);
           undo_move(pos, m);
           t.ev.pop();
-          if (g_stop.load(std::memory_order_relaxed)) [[unlikely]] // see the qsearch move loop
+          if (stopped()) [[unlikely]] // see the qsearch move loop
             return 0;
           if (v >= pc_beta) {
             tt::store(tte, key, m, to_tt(v, ply), raw_eval, depth - 3, tt::LOWER, false);
@@ -590,8 +594,8 @@ namespace {
       undo_move(pos, m);
       t.ev.pop();
       if (root && move_count == 1) { // node-based time management reads this back in think()
-        g_root_m1_nodes = t.nodes - nodes_before;
-        g_root_m1_move  = m;
+        t.root_m1_nodes = t.nodes - nodes_before;
+        t.root_m1_move  = m;
       }
       if (time_up(t)) [[unlikely]] // see the qsearch move loop
         return 0;
@@ -628,67 +632,6 @@ namespace {
         }
       }
 
-      // --- YBWC split: the eldest brother is done and didn't cut -> farm out the rest ---
-      if (best < beta && depth >= g_split_depth && pool().has_helpers() && move_count >= 1 &&
-          picker.remaining() >= 2) {
-        // Heap, NOT a local: SplitPoint embeds a Position snapshot (~37 KB — history[1024]),
-        // and negamax recurses 30+ frames deep on a 512 KB std::thread stack. A stack-local
-        // here blew the search thread's stack (SIGBUS) the moment depth reached the split gate.
-        const auto  spp = std::make_unique<SplitPoint>();
-        SplitPoint &sp  = *spp;
-        for (Move mm; (mm = picker.next()).to_from() != 0;)
-          if (mm.to_from() != ss->excluded.to_from())
-            sp.moves.push_back(mm);
-
-        sp.parent = t.cur_split;
-        // Position::operator= is deleted (it would reset UndoInfo state); byte-copy like clone_position.
-        std::memcpy(static_cast<void *>(&sp.snapshot), static_cast<const void *>(&pos), sizeof(Position));
-        sp.ctx_lo = std::max(0, 4 + ply - (SplitPoint::CTX - 1));
-        for (int i = sp.ctx_lo; i <= 4 + ply; ++i)
-          sp.ctx[i - sp.ctx_lo] = t.stack[i];
-        sp.ply          = ply;
-        sp.depth        = depth;
-        sp.base_count   = move_count;
-        sp.lmp_limit    = lmp_limit;
-        sp.root_depth   = t.root_depth;
-        sp.pv_node      = PV;
-        sp.cutnode      = cutnode;
-        sp.improving    = improving;
-        sp.beta         = beta;
-        sp.alpha.store(alpha);
-        sp.best.store(best);
-        sp.quiets.store(quiet_count);
-
-        run_split(t, sp, pos, ss); // register + master claim loop + abort + wait (ybwc.cpp)
-
-        if (g_stop.load(std::memory_order_relaxed)) [[unlikely]] // see the qsearch move loop
-          return 0;
-
-        // Merge the split result.
-        const int sp_best = sp.best.load(std::memory_order_relaxed);
-        if (sp_best > best) {
-          best = sp_best;
-          if (sp.best_move.to_from() != 0) {
-            best_move = sp.best_move;
-            alpha     = std::max(alpha, best);
-            bound     = best >= beta ? tt::LOWER : tt::EXACT;
-            if constexpr (PV) {
-              if (sp.pv_len > 0) {
-                std::copy(sp.pv, sp.pv + sp.pv_len, ss->pv);
-                ss->pv_len = sp.pv_len;
-              }
-            }
-            if (best >= beta) {
-              // Parallel cutoff: reward the cutoff move (tried-move penalties are skipped —
-              // the tried set is scattered across threads).
-              if (is_quiet(best_move))
-                update_quiet_hists(ss, pos, best_move, quiets_tried, n_quiets, depth);
-              update_capture_hists(pos, best_move, nullptr, 0, depth);
-            }
-          }
-        }
-        break; // the split consumed the rest of the move list
-      }
     }
 
     if (best == -INF) // every move was pruned away: fall back to a fail-low bound
@@ -717,9 +660,10 @@ namespace {
     return best;
   }
 
-  // Aspiration windows around the previous iteration's score, widening on failure.
-  int aspiration(Position &pos, int depth, int prev) {
-    Stack *ss    = g_main.stack + 4;
+  // Aspiration windows around the previous iteration's score, widening on failure. Runs on
+  // `t` — the main thread from think(), or a helper from smp_worker_iterate.
+  int aspiration(ThreadData &t, Position &pos, int depth, int prev) {
+    Stack *ss    = t.stack + 4;
     int    delta = 14;
     int    alpha = -INF, beta = INF;
     if (depth >= 4) {
@@ -727,8 +671,8 @@ namespace {
       beta  = std::min(prev + delta, INF);
     }
     while (true) {
-      const int v = negamax<true>(g_main, pos, ss, alpha, beta, depth, 0, false);
-      if (g_stop.load(std::memory_order_relaxed))
+      const int v = negamax<true>(t, pos, ss, alpha, beta, depth, 0, false);
+      if (stopped())
         return v;
       if (v <= alpha) {
         beta  = (alpha + beta) / 2;
@@ -743,21 +687,26 @@ namespace {
 
 } // namespace
 
-// --- hooks for the YBWC machinery (ybwc.cpp) — the negamax templates live above -----------------
-
-int search::ybwc_search(ThreadData &t, Position &pos, Stack *ss, int alpha, int beta, int depth, int ply,
-                        bool cutnode, bool pv) {
-  return pv ? negamax<true>(t, pos, ss, alpha, beta, depth, ply, cutnode)
-            : negamax<false>(t, pos, ss, alpha, beta, depth, ply, cutnode);
+// One lazy-SMP helper's whole search (called from ThreadPool::worker in smp.cpp): a private
+// iterative-deepening loop over the helper's own copy of the root, stopping when the main
+// thread raises g_helper_stop (or the caller's g_stop / the hard clock fires — time_up polls
+// all of them). Odd-indexed helpers start one ply deeper so the pool doesn't move in
+// lockstep; everything a helper learns reaches the main thread through the shared TT and
+// history tables, its Result is never read.
+void search::smp_worker_iterate(ThreadData &t, Position &pos, int max_depth, int idx) {
+  std::memset(t.stack, 0, sizeof(t.stack));
+  t.ev.reset(pos);
+  int prev = 0;
+  for (int d = 1 + (idx & 1); d <= max_depth && !stopped(); ++d) {
+    t.root_depth = d;
+    const int v  = aspiration(t, pos, d, prev);
+    if (stopped())
+      break;
+    prev = v;
+  }
+  // A helper that exhausts max_depth (fixed-depth searches) simply idles out: searching past
+  // the requested depth could only produce results the main thread never looks at.
 }
-
-search::Histories &search::shared_hist() { return g_hist; }
-
-bool search::stop_requested() { return g_stop.load(std::memory_order_relaxed); }
-
-int search::lmr_reduction(int depth, int movecount) { return lmr_base(depth, movecount); }
-
-int search::quiet_history(const Stack *ss, const Position &pos, Move m) { return quiet_hist(ss, pos, m); }
 
 void search::request_stop() { g_stop.store(true, std::memory_order_relaxed); }
 
@@ -767,7 +716,6 @@ void search::new_game() { g_hist.clear(); }
 
 void search::set_threads(int n) { pool().set_size(std::max(0, n - 1)); }
 
-void search::set_split_depth(int d) { g_split_depth = std::max(1, d); }
 void search::set_contempt(int cp) { g_contempt = cp; }
 
 // The caller must have already called search::clear_stop() SYNCHRONOUSLY on whatever thread
@@ -783,11 +731,16 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
   g_t0         = Clock::now();
   std::memset(g_main.stack, 0, sizeof(g_main.stack));
   g_main.ev.reset(pos);
-  g_main.cur_split = nullptr;
-  pool().reset_counters(1);
+  pool().reset_counters();
   tt::new_search();
 
   max_depth = std::clamp(max_depth, 1, MAX_PLY - 1);
+
+  // Kick the lazy-SMP helpers into their own iterative-deepening loops. Safe to reset the
+  // wind-down flag here: wait_idle() at the end of the previous think() guaranteed every
+  // helper is asleep again, so nothing can still be reading it.
+  g_helper_stop.store(false, std::memory_order_relaxed);
+  pool().start_search(pos, max_depth);
 
   Result res;
   int    prev      = 0;
@@ -796,8 +749,7 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
   for (int d = 1; d <= max_depth; ++d) {
     g_main.root_depth = d;
     g_main.seldepth   = 0;
-    pool().set_root_depth(d);
-    const int v = aspiration(pos, d, prev);
+    const int v = aspiration(g_main, pos, d, prev);
     if (g_stop.load(std::memory_order_relaxed) && d > 1)
       break; // discard the aborted iteration; the previous full one stands
 
@@ -830,12 +782,13 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
     if (soft_ms > 0 && d >= 5 && res.nodes >= 1000 && !res.pv.empty()) {
       double scale = 1.0;
       // Node concentration: how much of this iteration's effort went into the move we
-      // already believe is best (see g_root_m1_nodes). Heavily focused (frac -> 1) =>
-      // confident, cut toward half; spread thin (frac -> 0) => unclear, allow up to 1.5x.
-      // Only meaningful when g_root_m1_move actually IS the reported best move — the rarer
-      // case where a later move overtook it gets no concentration scaling.
-      if (g_root_m1_move.to_from() == res.pv[0].to_from()) {
-        const double frac = double(g_root_m1_nodes) / double(res.nodes);
+      // already believe is best (see ThreadData::root_m1_nodes — the MAIN thread's own
+      // counters, measured against its own nodes, not the pool total). Heavily focused
+      // (frac -> 1) => confident, cut toward half; spread thin (frac -> 0) => unclear, allow
+      // up to 1.5x. Only meaningful when root_m1_move actually IS the reported best move —
+      // the rarer case where a later move overtook it gets no concentration scaling.
+      if (g_main.root_m1_move.to_from() == res.pv[0].to_from() && g_main.nodes > 0) {
+        const double frac = double(g_main.root_m1_nodes) / double(g_main.nodes);
         scale *= std::clamp(1.5 - frac, 0.5, 1.5);
       }
       // Best-move stability: a move that keeps being re-confirmed needs less and less
@@ -855,6 +808,12 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
     if (soft_ms > 0 && ms >= effective_soft)
       break;
   }
+
+  // Wind the helpers down and wait them out BEFORE returning: the caller prints bestmove the
+  // moment this returns, and a UCI engine must not keep burning CPU past that. Also makes the
+  // final node total below exact rather than a live racing read.
+  g_helper_stop.store(true, std::memory_order_relaxed);
+  pool().wait_idle();
 
   // Guarantee a legal bestmove even if depth 1 was aborted before completing.
   if (res.best.to_from() == 0) {

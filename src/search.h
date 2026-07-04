@@ -8,7 +8,7 @@
 
 // The search: fail-soft negamax with alpha-beta, iterative deepening and (see search.cpp for
 // the full list) PVS, aspiration windows, TT cutoffs, quiescence, and the standard modern
-// pruning/extension/history stack. Single-threaded.
+// pruning/extension/history stack. Parallelised with lazy SMP (smp.h/smp.cpp).
 namespace search {
 
   constexpr int MAX_PLY = 120;
@@ -41,10 +41,9 @@ namespace search {
   void clear_stop();
   void new_game(); // clears history tables (TT cleared separately via tt::clear)
 
-  // YBWC parallelism: `n` total threads (n-1 pool helpers; 1 = single-threaded, bit-identical
-  // to no pool), splitting only at nodes with depth >= the split depth (the "Split" option).
+  // Lazy SMP: `n` total threads (n-1 pool helpers; 1 = single-threaded, bit-identical to no
+  // pool). Helpers run their own iterative deepening and share only the TT/history tables.
   void set_threads(int n);
-  void set_split_depth(int d);
 
   // Centipawns the root side is willing to give up to avoid a draw (the "Contempt" option;
   // negative seeks draws instead). 0 (default) reproduces the old unconditional draw==0 exactly.
