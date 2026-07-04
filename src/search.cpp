@@ -392,8 +392,18 @@ namespace {
         t.ev.pop();
         if (stopped()) [[unlikely]]
           return 0;
-        if (v >= beta)
-          return v >= MATE_IN_MAX ? beta : v; // don't return unproven mates
+        if (v >= beta) {
+          // High-depth fail-highs are verified with a reduced null-less search before being
+          // trusted — the zugzwang guard above only covers the crudest cases.
+          if (depth >= 12 && std::abs(v) < MATE_IN_MAX) {
+            const int w = negamax<false>(t, pos, ss, beta - 1, beta, depth - R, ply, cutnode);
+            if (stopped()) [[unlikely]]
+              return 0;
+            if (w >= beta)
+              return v;
+          } else
+            return v >= MATE_IN_MAX ? beta : v; // don't return unproven mates
+        }
       }
 
       // ProbCut: a good capture that beats beta by a margin at reduced depth almost certainly
