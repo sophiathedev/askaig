@@ -97,11 +97,13 @@ namespace {
     return pos.turn() == g_root_color ? -g_contempt : g_contempt;
   }
 
-  // Static eval: NNUE output, fifty-move damped, plus the correction-history sum (/256 so
-  // five tables agreeing can't overshoot one confident table). The correction tables are hit
-  // at random indices — the keys are computed first and prefetched so the line fills overlap
-  // the accumulator walk-back + output dot. The damped value is what lands in the TT eval
-  // field, carrying the storing node's halfmove clock (accepted imprecision).
+  // Static eval: NNUE output, scaled by non-pawn material (advantages deflate as material
+  // leaves the board — thin endgames are drawish beyond what the output buckets capture),
+  // fifty-move damped, plus the correction-history sum (/256 so five tables agreeing can't
+  // overshoot one confident table). The correction tables are hit at random indices — the
+  // keys are computed first and prefetched so the line fills overlap the accumulator
+  // walk-back + output dot. The damped value is what lands in the TT eval field, carrying
+  // the storing node's halfmove clock (accepted imprecision).
   [[gnu::hot, nodiscard]] int evaluate(ThreadData &t, const Position &pos, const Stack *ss) {
     const Color  c     = pos.turn();
     const size_t i_paw = pawn_corr_index(pos), i_mat = material_corr_index(pos);
@@ -111,7 +113,13 @@ namespace {
     __builtin_prefetch(&g_hist.corr_minor[c][i_min]);
     __builtin_prefetch(&g_hist.corr_major[c][i_maj]);
 
-    const int raw = t.ev.evaluate(pos) * (200 - std::min(pos.fifty(), 100)) / 200;
+    // npm in pawn units over BOTH sides: 62 at the start, 0 with bare kings -> x1.0 .. x0.72.
+    const int npm = 3 * pop_count(pos.bitboard_of(WHITE_KNIGHT) | pos.bitboard_of(BLACK_KNIGHT) |
+                                  pos.bitboard_of(WHITE_BISHOP) | pos.bitboard_of(BLACK_BISHOP)) +
+                    5 * pop_count(pos.bitboard_of(WHITE_ROOK) | pos.bitboard_of(BLACK_ROOK)) +
+                    9 * pop_count(pos.bitboard_of(WHITE_QUEEN) | pos.bitboard_of(BLACK_QUEEN));
+    int raw = t.ev.evaluate(pos) * (736 + 5 * npm) / 1024;
+    raw     = raw * (200 - std::min(pos.fifty(), 100)) / 200;
 
     int corr = g_hist.corr_pawn[c][i_paw] + g_hist.corr_material[c][i_mat] + g_hist.corr_minor[c][i_min] +
                g_hist.corr_major[c][i_maj];
