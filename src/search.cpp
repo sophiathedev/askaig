@@ -125,25 +125,20 @@ namespace {
     return pos.turn() == g_root_color ? -g_contempt : g_contempt;
   }
 
-  // Sum of all correction-history tables for this node: pawn skeleton, non-pawn material,
-  // minor- and major-piece placement, and the continuation table keyed by the previous move
-  // (piece, to) — skipped at the root and right after a null move, where there is none.
-  // Divided by a larger constant than a single table would need (256 vs. the old 64) so five
-  // tables agreeing doesn't blow the correction past what one confident table used to give.
-  [[gnu::pure, gnu::hot]] int correction(const Position &pos, const Stack *ss) {
-    const Color c    = pos.turn();
-    int         corr = g_hist.corr_pawn[c][pawn_corr_index(pos)] + g_hist.corr_material[c][material_corr_index(pos)] +
-                g_hist.corr_minor[c][minor_corr_index(pos)] + g_hist.corr_major[c][major_corr_index(pos)];
-    if ((ss - 1)->move.to_from() != 0)
-      corr += g_hist.corr_cont[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()];
-    return corr / 256;
-  }
-
   // Static eval + the learned corrections, clamped out of the mate range. NOT pure: t.ev's
   // lazy accumulator walk-back writes into t's (real, cross-call-persistent) accumulator cache
   // as a side effect — not just a local computation — so `pure` would be incorrect here even
   // though the observable result is deterministic. Called at nearly every node; discarding the
   // result would always be a bug.
+  //
+  // Correction sum: pawn skeleton, non-pawn material, minor- and major-piece placement, and
+  // the continuation table keyed by the previous move (piece, to) — skipped at the root and
+  // right after a null move, where there is none. Divided by a larger constant than a single
+  // table would need (256 vs. 64) so five tables agreeing doesn't blow the correction past
+  // what one confident table used to give. The four structural tables are 64 KB each and hit
+  // at effectively random indices — near-guaranteed cache misses — so their keys are computed
+  // FIRST and the line fills issued before the (long) accumulator walk-back + output dot,
+  // which then runs with the misses in flight; the sum reads warm lines afterwards.
   //
   // Fifty-move damping: the raw net output is scaled toward zero as the halfmove clock climbs
   // (full at clock 0, about half at 99), so an advantage the search cannot convert decays
@@ -153,8 +148,21 @@ namespace {
   // The damped value is what lands in the TT eval field, carrying the storing node's clock —
   // same-hash nodes at a different clock get a slightly stale eval, an accepted imprecision.
   [[gnu::hot, nodiscard]] int evaluate(ThreadData &t, const Position &pos, const Stack *ss) {
+    const Color  c     = pos.turn();
+    const size_t i_paw = pawn_corr_index(pos), i_mat = material_corr_index(pos);
+    const size_t i_min = minor_corr_index(pos), i_maj = major_corr_index(pos);
+    __builtin_prefetch(&g_hist.corr_pawn[c][i_paw]);
+    __builtin_prefetch(&g_hist.corr_material[c][i_mat]);
+    __builtin_prefetch(&g_hist.corr_minor[c][i_min]);
+    __builtin_prefetch(&g_hist.corr_major[c][i_maj]);
+
     const int raw = t.ev.evaluate(pos) * (200 - std::min(pos.fifty(), 100)) / 200;
-    return std::clamp(raw + correction(pos, ss), -MATE_IN_MAX + 1, MATE_IN_MAX - 1);
+
+    int corr = g_hist.corr_pawn[c][i_paw] + g_hist.corr_material[c][i_mat] + g_hist.corr_minor[c][i_min] +
+               g_hist.corr_major[c][i_maj];
+    if ((ss - 1)->move.to_from() != 0)
+      corr += g_hist.corr_cont[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()];
+    return std::clamp(raw + corr / 256, -MATE_IN_MAX + 1, MATE_IN_MAX - 1);
   }
 
   // True when this thread's search is moot: the caller's stop, or think() winding the lazy-SMP
