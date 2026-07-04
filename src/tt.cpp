@@ -1,5 +1,4 @@
 #include "tt.h"
-#include <cstdlib>
 #include <cstring>
 #include <new>
 
@@ -27,14 +26,18 @@ namespace {
 void tt::resize(size_t mb) {
   if (mb == g_mb && g_table)
     return;
-  std::free(g_table);
+  // Aligned operator new/delete, NOT std::aligned_alloc: the latter is C11 and simply does
+  // not exist on the Windows CRT (LLVM-MinGW's libc++ has no ::aligned_alloc to re-export),
+  // while aligned new is core C++17 and works on every toolchain the release CI builds with.
+  if (g_table)
+    ::operator delete[](static_cast<void *>(g_table), std::align_val_t(64));
   size_t clusters = mb * 1024 * 1024 / sizeof(Cluster);
   size_t pow2     = 1;
   while (pow2 * 2 <= clusters)
     pow2 *= 2;
   g_clusters = pow2;
   g_mb       = mb;
-  g_table    = static_cast<Cluster *>(std::aligned_alloc(64, g_clusters * sizeof(Cluster)));
+  g_table    = static_cast<Cluster *>(::operator new[](g_clusters * sizeof(Cluster), std::align_val_t(64)));
   clear();
 }
 
