@@ -33,8 +33,6 @@ namespace {
   bool    g_loaded = false;
 
   // King context of a perspective given its PERSPECTIVE-ORIENTED king square (black: sq^56).
-  // Reads the immutable global KING_BUCKET table -> `pure`, not `const` (const forbids any
-  // memory dereference, even of an unwritable global). Called per accumulator refresh/update.
   [[gnu::pure, gnu::always_inline]] inline KingCtx king_ctx(Square oriented_ksq) {
     const bool mir = file_of(oriented_ksq) >= EFILE;
     const int  sq  = mir ? (oriented_ksq ^ 7) : oriented_ksq;
@@ -46,10 +44,7 @@ namespace {
     return king_ctx(persp == WHITE ? k : Square(k ^ 56));
   }
 
-  // Feature index of (pc, s) from `persp`'s point of view under king context `c`. Every
-  // argument is passed by value and only bit-twiddled — zero memory access, so `const`
-  // (stronger than `pure`) applies. Called per active feature, per accumulator update/refresh:
-  // one of the hottest functions in the whole engine.
+  // Feature index of (pc, s) from `persp`'s point of view under king context `c`.
   [[gnu::const, gnu::always_inline]] inline int feature_index(Color persp, Piece pc, Square s, KingCtx c) {
     const int rel = color_of(pc) == persp ? 0 : 1;
     int       sq  = persp == WHITE ? s : (s ^ 56);
@@ -58,12 +53,11 @@ namespace {
     return 768 * c.bucket + 64 * (6 * rel + type_of(pc)) + sq;
   }
 
-  // Reads the network weights (immutable once loaded) -> `pure`.
   [[gnu::pure, gnu::always_inline]] inline const int16_t *ft_row(Color persp, Piece pc, Square s, KingCtx c) {
     return &g_net.ft_w[feature_index(persp, pc, s, c) * HL];
   }
 
-  // The material output bucket: 2..32 pieces -> 0..7. Called once per evaluate().
+  // The material output bucket: 2..32 pieces -> 0..7.
   [[gnu::pure, gnu::always_inline]] inline int out_bucket(const Position &pos) {
     return (pop_count(pos.all_pieces<WHITE>() | pos.all_pieces<BLACK>()) - 2) / 4;
   }
@@ -343,9 +337,8 @@ namespace {
 
 #endif
 
-  // Rebuilds one perspective half of `acc` from scratch (bias + every piece, kings included).
-  // The from-scratch reference path: only evaluate_refresh (UCI eval/d, parity selftests) uses
-  // it — the search's Evaluator refreshes through its cache instead (refresh_half_cached),
+  // Rebuilds one perspective half from scratch (bias + every piece). Reference path for
+  // evaluate_refresh only; the search refreshes through the cache (refresh_half_cached),
   // which selftest nnue pins bit-exactly against this.
   [[gnu::hot]] void refresh_half(Accumulator &acc, Color persp, const Position &pos) {
     const KingCtx  c = king_ctx_of(pos, persp);
@@ -386,9 +379,7 @@ namespace {
     child.computed[persp] = true;
   }
 
-  // True when `dp` moves `persp`'s own king (adds always contain the mover). Reads `dp` through
-  // a reference (a dereference), so `pure`, not `const`; no side effects, tiny, called once per
-  // scanned stack entry in the lazy walk-back.
+  // True when `dp` moves `persp`'s own king (adds always contain the mover).
   [[gnu::pure, gnu::always_inline]] inline bool moves_own_king(const DirtyPiece &dp, Color persp) {
     for (int i = 0; i < dp.n_add; ++i)
       if (dp.add_pc[i] == make_piece(persp, KING))
@@ -404,9 +395,7 @@ namespace {
     return {0, false}; // unreachable
   }
 
-  // SCReLU output layer through the position's material bucket, stm half first. Reads the
-  // accumulator and the (immutable once loaded) network, writes nothing — `pure`; called once
-  // per evaluate(), the tail of the hottest call chain in the engine.
+  // SCReLU output layer through the position's material bucket, stm half first.
   [[gnu::pure, gnu::hot]] int output_dot(const Accumulator &acc, Color stm, int bucket) {
     const int32_t sum = dot_reduce(acc.v[stm], acc.v[~stm], g_net.out_w[bucket]);
     // sum is at scale QA^2*QB; one /QA plus the bias (at QA*QB) then rescale to centipawns.
@@ -492,15 +481,12 @@ void nnue::Evaluator::reset(const Position &pos) {
 }
 
 // Rebuilds stack[top]'s `persp` half through the refresh cache: diff the position's piece
-// placement against what the cached accumulator for this (perspective, mirror, bucket)
-// context was built from, apply just the difference in one kernel pass, and copy the result
-// out. In real play the diff is a handful of rows (the pieces that moved since the king last
-// sat in this context) versus the ~32 a from-scratch rebuild always pays.
+// placement against the cached one for this (perspective, mirror, bucket) context and apply
+// just the difference — a handful of rows versus the ~32 a from-scratch rebuild pays.
 [[gnu::hot]] void nnue::Evaluator::refresh_half_cached(Color persp, const Position &pos) {
   const KingCtx c = king_ctx_of(pos, persp);
   if (!finny->inited) [[unlikely]] {
-    // First use after reset(): every cached context restarts from the empty board (just the
-    // bias), so the first refresh per context degenerates to a from-scratch rebuild.
+    // First use after reset(): every cached context restarts from the empty board.
     for (auto &per_persp: finny->e)
       for (auto &per_mirror: per_persp)
         for (RefreshEntry &e: per_mirror) {
@@ -526,8 +512,7 @@ void nnue::Evaluator::reset(const Position &pos) {
     e.bb[pc] = now;
   }
   if (over) [[unlikely]] {
-    // A non-game FEN blew the diff headroom: rebuild the entry from scratch instead, with
-    // refresh_half's own 40-row cap (such positions get a best-effort eval there too).
+    // A non-game FEN blew the diff headroom: rebuild the entry from scratch instead.
     const int16_t *rows[40];
     int            n = 0;
     for (int pc = WHITE_PAWN; pc <= BLACK_KING; ++pc) {
@@ -549,10 +534,8 @@ void nnue::Evaluator::reset(const Position &pos) {
 }
 
 // Records the feature changes of `m` (to be played on `before`) into a new stack entry.
-// Mirrors the play<C>() switch exactly — note castling squares are hardcoded per color
-// (the Move stores king-to-rook, e1h1), and the captured piece is read from `before`.
-// Called at every make in the whole tree — hot, and inherently side-effecting (pushes a new
-// stack entry), so no purity attributes apply.
+// Mirrors the play<C>() switch exactly; castling squares are hardcoded per color and the
+// captured piece is read from `before`.
 [[gnu::hot]] void nnue::Evaluator::push(const Position &before, Move m) {
   assert(top + 1 < MAX_PLY + 8);
   Accumulator &a     = stack[++top];
@@ -643,10 +626,9 @@ void nnue::Evaluator::push_null() {
 }
 
 // Makes stack[top]'s `persp` half valid: walk back to the nearest computed ancestor and apply
-// the recorded updates forward — unless an own-king move CHANGES the (bucket, mirror) context
-// anywhere in the chain (or the chain is too long / has no computed ancestor), in which case
-// the half is rebuilt through the refresh cache instead (refresh_half_cached). Writes into
-// `stack[]` (the lazy-evaluation memoization) as a side effect, so it is NOT `pure`.
+// the recorded updates forward — unless an own-king move changes the (bucket, mirror) context
+// anywhere in the chain (or there is no usable ancestor), in which case the half is rebuilt
+// through the refresh cache (refresh_half_cached).
 [[gnu::hot]] void nnue::Evaluator::ensure_half(Color persp, const Position &pos) {
   if (stack[top].computed[persp])
     return;
@@ -676,12 +658,7 @@ void nnue::Evaluator::push_null() {
     apply_half(stack[k], stack[k - 1], persp);
 }
 
-// The main search's static-eval entry point. NOT pure: ensure_half's lazy walk-back writes into
-// this Evaluator's own accumulator stack as a memoization side effect (the result is still
-// deterministic given the push/pop history, but that's not what GNU `pure` certifies — it
-// forbids memory writes through the object regardless of observable effect). `nodiscard`
-// because every call site needs the value; calling this for its cache-filling side effect
-// alone would be pointless.
+// The main search's static-eval entry point (lazy: pays for the walk-back only when called).
 [[gnu::hot, nodiscard]] int nnue::Evaluator::evaluate(const Position &pos) {
   assert(g_loaded);
   ensure_half(WHITE, pos);
@@ -689,10 +666,8 @@ void nnue::Evaluator::push_null() {
   return output_dot(stack[top], pos.turn(), out_bucket(pos));
 }
 
-// One-shot eval via a full LOCAL refresh (used by the `eval`/`d` UCI commands and parity
-// tests). Unlike the member evaluate() above, the Accumulator it mutates is a stack-local
-// variable invisible outside this call — no externally observable side effects — so `pure`
-// correctly applies here.
+// One-shot eval via a full LOCAL from-scratch refresh: the reference path for the UCI
+// `eval`/`d` commands and the parity selftests.
 [[gnu::pure, nodiscard]] int nnue::evaluate_refresh(const Position &pos) {
   assert(g_loaded);
   Accumulator acc;

@@ -2,8 +2,8 @@
 #include <algorithm>
 #include <cstring>
 
-// Lazy SMP pool lifecycle — see smp.h for the model. All the actual searching lives in
-// search.cpp (smp_worker_iterate); this file only owns threads, wake-ups and counters.
+// Lazy SMP pool lifecycle — see smp.h. The searching lives in search.cpp (smp_worker_iterate);
+// this file only owns threads, wake-ups and counters.
 namespace {
 
   search::ThreadPool g_pool;
@@ -53,15 +53,12 @@ void search::ThreadPool::start_search(const Position &pos, int md) {
     return;
   {
     std::lock_guard<std::mutex> lk(mtx);
-    // Position::operator= is deleted (it would reset UndoInfo state); byte-copy, same as the
-    // helpers do when they clone it back out.
+    // Position::operator= is deleted; byte-copy, same as the helpers clone it back out.
     std::memcpy(static_cast<void *>(&root), static_cast<const void *>(&pos), sizeof(Position));
     max_depth = md;
     ++gen;
-    // Count every helper as searching UP FRONT, not when it actually wakes: think() may hit
-    // wait_idle() before a slow helper has even woken for this generation, and must still
-    // wait for it — a late helper decrements exactly once when it finishes, so the count
-    // can never terminate early.
+    // Count every helper as searching UP FRONT: think() may reach wait_idle() before a slow
+    // helper even wakes for this generation, and must still wait for it.
     searching = int(tds.size());
   }
   cv.notify_all();

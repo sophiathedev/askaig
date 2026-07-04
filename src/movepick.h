@@ -7,59 +7,44 @@
 #include "see.h"
 #include "types.h"
 
-// Move ordering. The movegen produces its legal moves at once (there is no staged generator;
-// quiescence outside check uses the CAPTURES_ONLY variant), directly into the picker's own
-// array, and the constructor scores everything up front into bands.
+// Move ordering. Legal moves are generated in one shot into the picker's array (quiescence
+// outside check uses the CAPTURES_ONLY movegen) and scored up front into bands:
 //
-// Bands (high to low): TT move, winning/equal captures (SEE >= 0, by MVV + capture history),
-// killers, quiets (butterfly + continuation history), losing captures.
+//   TT move > winning/equal captures (MVV + capture history) > killers >
+//   quiets (butterfly + continuation history) > losing captures.
 //
-// Yielding is HYBRID, driven by the profile: most nodes cut after 1-3 picks, where a linear
-// max-scan of the unsorted array is the cheapest possible pick — but at ALL-nodes that
-// re-scan per pick was ~21% of total engine time. So the first SORT_AFTER yields use the
-// scan; a node still picking after that is treated as an ALL-node and the remaining tail is
-// insertion-sorted ONCE (stable: ties keep generation order), after which next() is a plain
-// sequential walk.
+// Yielding is hybrid: the first SORT_AFTER picks use a linear max-scan (most nodes cut within
+// a few moves and never pay more); a node still picking after that sorts the remaining tail
+// once (stable insertion sort, ties keep generation order) and walks it sequentially.
 //
-// SEE is LAZY: the constructor scores every capture into the winning band without calling
-// see_ge, and next() verifies a capture only when it actually surfaces — a failure demotes
-// it a full DEMOTION down into the losing band (in place while scanning; re-inserted at its
-// sorted rank once sorted) and the next candidate surfaces instead. At the typical node the
-// TT move (or the first capture) cuts immediately and no other capture is ever verified.
+// SEE is lazy: captures are scored into the winning band unverified, and see_ge runs only
+// when a capture actually surfaces — a failure demotes it into the losing band (in place
+// while scanning, re-inserted at its sorted rank after) and the next candidate surfaces.
 namespace search {
 
   class MovePicker {
   public:
-    // Band bases. A capture's history/MVV term is bounded by |32*900 + 16384 + 900| < 47000,
-    // a quiet's by 3*16384 — every band below is separated by far more than either, so bands
-    // can never overlap and the +-500'000 window tests in next()/yielded_see() are safe.
+    // Band bases. A capture's MVV/history term stays within +-47000 and a quiet's within
+    // +-49152, far below the band spacing, so the +-500'000 window tests below are safe.
     static constexpr int SCORE_TT      = 4'000'000;
-    static constexpr int SCORE_CAPTURE = 2'000'000; // unverified/winning captures
+    static constexpr int SCORE_CAPTURE = 2'000'000;
     static constexpr int SCORE_KILLER  = 1'000'000;
-    static constexpr int DEMOTION      = 4'000'000; // capture band -> losing band (-2'000'000)
-    // Yields served by max-scan before the tail is sorted. Covers the overwhelmingly common
-    // beta-cutoff-in-a-few-moves case; only likely ALL-nodes ever pay for the sort.
-    static constexpr int SORT_AFTER = 4;
+    static constexpr int DEMOTION      = 4'000'000; // capture band -> losing band
+    static constexpr int SORT_AFTER    = 4; // max-scan picks before the tail gets sorted
 
     // What next() proved about the move it just yielded (valid until the next call).
     enum SeeBand : int8_t {
       SEE_UNKNOWN, // TT move or a non-capture: never verified here
       SEE_WINNING, // capture verified see_ge(m, 0)
-      SEE_LOSING, // capture that failed see_ge(m, 0) and was yielded from the losing band
+      SEE_LOSING, // capture that failed see_ge(m, 0)
     };
 
-    // ch1/ch2: continuation-history slices of the previous and the move before it (nullable).
-    // Constructed at every node (main search) or pruning probe (QS/ProbCut) — hot, but not
-    // `pure`: it writes the picker's own move/score arrays, a real (if purely local) effect.
+    // ch1/ch2: continuation-history slices of the previous two plies (nullable).
     [[gnu::hot]] MovePicker(Position &pos, const Histories &hist, Move ttm, const Move *killers,
                             const ContTable *ch1, const ContTable *ch2, bool quiescence)
         : pos(&pos), cur(0) {
-      // Quiescence outside check generates captures + quiet queen promotions ONLY (the
-      // CAPTURES_ONLY movegen) instead of generating everything and discarding the quiets —
-      // same move set, in the same generation order, without emitting what QS never scores.
-      // In check the full generator runs: QS searches every evasion there.
       const bool in_check  = pos.turn() == WHITE ? pos.in_check<WHITE>() : pos.in_check<BLACK>();
-      const bool caps_only = quiescence && !in_check;
+      const bool caps_only = quiescence && !in_check; // in check QS searches every evasion
       Move      *end = pos.turn() == WHITE
                                ? (caps_only ? pos.generate_legals<WHITE, true>(moves) : pos.generate_legals<WHITE>(moves))
                                : (caps_only ? pos.generate_legals<BLACK, true>(moves) : pos.generate_legals<BLACK>(moves));
@@ -70,7 +55,7 @@ namespace search {
 
         int score;
         if (ttm.to_from() != 0 && m.to_from() == ttm.to_from())
-          score = SCORE_TT; // the TT move goes first, always
+          score = SCORE_TT;
         else if (m.is_capture()) {
           const PieceType captured =
                   m.flags() == EN_PASSANT ? PAWN : type_of(pos.at(m.to()));
@@ -91,21 +76,17 @@ namespace search {
       }
     }
 
-    // Yields the next-best move, or a null move (to_from() == 0) when exhausted. Called in a
-    // tight loop at every node; discarding the result would silently skip a move. Requires the
-    // Position to be at the node this picker was built for (every caller makes/unmakes between
-    // calls, so it always is).
+    // Yields the next-best move, or a null move (to_from() == 0) when exhausted. Requires the
+    // Position to be at the node this picker was built for (callers make/unmake between calls).
     [[gnu::hot, nodiscard]] Move next() {
       if (!sorted) {
         if (yields < SORT_AFTER) {
-          // Cheap phase: one linear max-scan per pick over the unsorted remainder.
           while (cur < n) {
             size_t best = cur;
             for (size_t i = cur + 1; i < n; ++i)
               if (scores[i] > scores[best])
                 best = i;
-            // Lazy SEE, scan flavour: verify before the yield swap; a failure demotes the
-            // capture IN PLACE and the scan re-runs — no yield happened.
+            // Lazy SEE: verify before the yield swap; a failure demotes in place, no yield.
             if (scores[best] > SCORE_CAPTURE - 500'000 && scores[best] < SCORE_CAPTURE + 500'000) {
               if (!see_ge(*pos, moves[best], 0)) {
                 scores[best] -= DEMOTION;
@@ -121,9 +102,7 @@ namespace search {
           }
           return Move();
         }
-        // Still picking after SORT_AFTER yields: likely an ALL-node. Sort the remaining tail
-        // once (stable insertion sort, score-descending; ties keep their generation order)
-        // and fall through to the sequential walk below.
+        // Likely an ALL-node: sort the tail once, then walk it.
         for (size_t i = cur + 1; i < n; ++i) {
           const Move m = moves[i];
           const int  s = scores[i];
@@ -140,9 +119,7 @@ namespace search {
 
       while (cur < n) {
         const int s = scores[cur];
-        // Lazy SEE, sorted flavour: a failure re-inserts the capture at its demoted rank in
-        // the (sorted) losing tail — shift the block above it left one slot — and the next
-        // candidate is already sitting at cur.
+        // Lazy SEE, sorted flavour: a failure re-inserts the capture at its demoted rank.
         if (s > SCORE_CAPTURE - 500'000 && s < SCORE_CAPTURE + 500'000) {
           if (!see_ge(*pos, moves[cur], 0)) {
             const Move m  = moves[cur];
@@ -166,8 +143,7 @@ namespace search {
       return Move();
     }
 
-    // The SEE verdict of the move the last next() call yielded — lets the search reuse the
-    // picker's own verification instead of re-running see_ge on the same move.
+    // SEE verdict of the last yielded move, so the search doesn't re-run see_ge on it.
     [[nodiscard]] SeeBand yielded_see() const { return band; }
 
     [[nodiscard]] size_t total() const { return n; }

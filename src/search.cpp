@@ -35,25 +35,15 @@ namespace {
   Histories          g_hist;
   ThreadData         g_main;
   std::atomic<bool>  g_stop{false};
-  // Raised by think() once ITS search is done, so the lazy-SMP helpers (each running an
-  // open-ended iterative deepening of their own) wind down before think() returns. A separate
-  // flag from g_stop on purpose: g_stop belongs to the caller (see clear_stop()'s contract) —
-  // think() may never touch it, but it fully owns the helpers' lifetime.
+  // Winds the lazy-SMP helpers down at the end of think(). Separate from g_stop, which
+  // belongs to the caller (see clear_stop()'s contract) and think() must never touch.
   std::atomic<bool>  g_helper_stop{false};
   int64_t            g_hard_ms = 0;
   Clock::time_point  g_t0;
   int                g_contempt   = 0; // the "Contempt" UCI option, in centipawns
   Color              g_root_color = WHITE; // side to move at the root of the current think()
 
-  // Node-based time management instrumentation (ThreadData::root_m1_nodes/root_m1_move): how
-  // many of the just-completed iteration's nodes went into the root's first-searched move
-  // (the TT/PV move from move ordering — the one we already believe is best). Reset at the
-  // start of every root call so a widened aspiration re-try only keeps the LAST attempt's
-  // count; think() reads the MAIN thread's copy back once the iteration returns (per-thread
-  // fields so helper roots can't clobber it). It usually IS the eventual best move — think()
-  // checks that and skips the adjustment on the rarer iterations where it wasn't.
-
-  // LMR reduction table, ln(depth)*ln(moves) scaled (the "most principled" log formula).
+  // LMR reduction table, ln(depth)*ln(moves) scaled.
   int  g_lmr[64][64];
   bool g_lmr_init = false;
   void init_lmr() {
@@ -62,31 +52,18 @@ namespace {
         g_lmr[d][m] = int(0.8 + std::log(d) * std::log(m) / 2.3);
     g_lmr_init = true;
   }
-  // Reads a global filled once (init_lmr, before any search starts) and never written again —
-  // safe as `pure` (no side effects; the memory it reads is effectively frozen for the caller).
   [[gnu::pure, gnu::always_inline]] inline int lmr_base(int depth, int movecount) {
     return g_lmr[std::min(depth, 63)][std::min(movecount, 63)];
   }
 
-  // --- small helpers ----------------------------------------------------------------------------
-  // Tiny, extremely hot leaf functions (called at every node/move): `always_inline` matches the
-  // existing idiom in simd.h/tables.h for functions this small and this frequently called.
-  // `const`/`pure` follow GNU semantics precisely: `const` only for functions with zero memory
-  // reads (pure arithmetic on by-value arguments); `pure` for functions that read memory
-  // (Position, history tables) but have no side effects of their own.
-
-  // tt_key (the castling/en-passant mix over the incremental Zobrist hash) lives in smp.h
-  // with the other shared make/unmake helpers.
-
-  // Correction-history keys. Each is a cheap position-derived hash into a CORR_SIZE table —
-  // collisions just blend unrelated positions' corrections, no correctness impact.
+  // Correction-history keys: cheap position-derived hashes into CORR_SIZE tables. Collisions
+  // just blend unrelated positions' corrections.
   [[gnu::pure, gnu::always_inline]] inline size_t pawn_corr_index(const Position &p) {
     const uint64_t w = p.bitboard_of(WHITE_PAWN) * 0x9E3779B97F4A7C15ull;
     const uint64_t b = p.bitboard_of(BLACK_PAWN) * 0xC2B2AE3D27D4EB4Full;
     return (w ^ (b + 0x165667B19E3779F9ull + (w << 6) + (w >> 2))) & (Histories::CORR_SIZE - 1);
   }
-  // Non-pawn material imbalance: piece-TYPE COUNTS (not placement), so it fires on trades and
-  // promotions rather than on where the pieces happen to stand.
+  // Piece-type counts, not placement: fires on trades/promotions.
   [[gnu::pure, gnu::always_inline]] inline size_t material_corr_index(const Position &p) {
     uint64_t key = 0;
     for (int pt = KNIGHT; pt <= QUEEN; ++pt) {
@@ -106,8 +83,7 @@ namespace {
     return (majors * 0xC2B2AE3D27D4EB4Full) & (Histories::CORR_SIZE - 1);
   }
 
-  // Mate scores are stored ply-relative in the TT ("mate in N from HERE"). Pure arithmetic on
-  // scalar arguments only, no memory touched at all — `const` (stronger than `pure`) applies.
+  // Mate scores are stored ply-relative in the TT ("mate in N from HERE").
   [[gnu::const, gnu::always_inline]] inline int to_tt(int v, int ply) {
     return v >= MATE_IN_MAX ? v + ply : v <= -MATE_IN_MAX ? v - ply : v;
   }
@@ -115,38 +91,17 @@ namespace {
     return v >= MATE_IN_MAX ? v - ply : v <= -MATE_IN_MAX ? v + ply : v;
   }
 
-  // Draw value, from the current node's side-to-move perspective (as every search function
-  // must return). g_contempt is a fixed cost the ROOT side pays for any draw, however deep and
-  // whoever's move it's detected on: negamax flips sign once per ply on the way back up, so
-  // returning -contempt when it's the root color's own turn here and +contempt when it's the
-  // opponent's turn here both collapse to "root is down `contempt` cp" once propagated to the
-  // root. g_contempt == 0 (default) makes this identical to the old bare `return 0`.
+  // Draw value from the side to move's perspective. Signed so that, propagated to the root,
+  // every draw costs the ROOT side g_contempt centipawns regardless of detection depth.
   [[gnu::pure, gnu::always_inline]] inline int draw_score(const Position &pos) {
     return pos.turn() == g_root_color ? -g_contempt : g_contempt;
   }
 
-  // Static eval + the learned corrections, clamped out of the mate range. NOT pure: t.ev's
-  // lazy accumulator walk-back writes into t's (real, cross-call-persistent) accumulator cache
-  // as a side effect — not just a local computation — so `pure` would be incorrect here even
-  // though the observable result is deterministic. Called at nearly every node; discarding the
-  // result would always be a bug.
-  //
-  // Correction sum: pawn skeleton, non-pawn material, minor- and major-piece placement, and
-  // the continuation table keyed by the previous move (piece, to) — skipped at the root and
-  // right after a null move, where there is none. Divided by a larger constant than a single
-  // table would need (256 vs. 64) so five tables agreeing doesn't blow the correction past
-  // what one confident table used to give. The four structural tables are 64 KB each and hit
-  // at effectively random indices — near-guaranteed cache misses — so their keys are computed
-  // FIRST and the line fills issued before the (long) accumulator walk-back + output dot,
-  // which then runs with the misses in flight; the sum reads warm lines afterwards.
-  //
-  // Fifty-move damping: the raw net output is scaled toward zero as the halfmove clock climbs
-  // (full at clock 0, about half at 99), so an advantage the search cannot convert decays
-  // instead of the engine shuffling forever at "+0.3" — and, symmetrically, a defender sees
-  // the incoming fifty-move draw as increasingly survivable. The min() guards hand-written
-  // FENs with a clock past 100; in play the search returns a draw at 100 before evaluating.
-  // The damped value is what lands in the TT eval field, carrying the storing node's clock —
-  // same-hash nodes at a different clock get a slightly stale eval, an accepted imprecision.
+  // Static eval: NNUE output, fifty-move damped, plus the correction-history sum (/256 so
+  // five tables agreeing can't overshoot one confident table). The correction tables are hit
+  // at random indices — the keys are computed first and prefetched so the line fills overlap
+  // the accumulator walk-back + output dot. The damped value is what lands in the TT eval
+  // field, carrying the storing node's halfmove clock (accepted imprecision).
   [[gnu::hot, nodiscard]] int evaluate(ThreadData &t, const Position &pos, const Stack *ss) {
     const Color  c     = pos.turn();
     const size_t i_paw = pawn_corr_index(pos), i_mat = material_corr_index(pos);
@@ -171,9 +126,7 @@ namespace {
     return g_stop.load(std::memory_order_relaxed) || g_helper_stop.load(std::memory_order_relaxed);
   }
 
-  // A stop/abort poll for the tree: stopped() plus the hard clock. NOT pure — it can flip
-  // g_stop on timeout, a real side effect every other node in this file relies on. Helpers
-  // poll the hard clock too, so they never outlive the time budget on their own.
+  // Stop poll for the tree: stopped() plus the hard clock (helpers poll it too).
   [[gnu::hot]] bool time_up(ThreadData &t) {
     if (stopped())
       return true;
@@ -253,7 +206,7 @@ namespace {
       return 0;
     if (pos.is_draw())
       return draw_score(pos);
-    if (ply >= MAX_PLY) [[unlikely]] // needs a 120-ply-deep line; essentially never happens
+    if (ply >= MAX_PLY) [[unlikely]]
       return evaluate(t, pos, ss);
 
     const bool     in_check = stm_in_check(pos);
@@ -291,10 +244,8 @@ namespace {
     Move best_move{};
     for (Move m; (m = picker.next()).to_from() != 0;) {
       if (!in_check) {
-        // QS SEE pruning: don't even try losing captures. The lazy-SEE picker already proved
-        // its capture bands (winning kept, losing demoted) — only a move it never verified
-        // (the TT move, or a quiet queen push onto a defended promotion square) needs the
-        // see_ge call here.
+        // QS SEE pruning: skip losing captures. The picker already verified the capture
+        // bands; only the TT move / a quiet queen push still needs see_ge here.
         const auto band = picker.yielded_see();
         if (band == MovePicker::SEE_LOSING || (band == MovePicker::SEE_UNKNOWN && !see_ge(pos, m, 0)))
           continue;
@@ -311,8 +262,6 @@ namespace {
       const int v = -qsearch<PV>(t, pos, ss + 1, -beta, -alpha, ply + 1);
       undo_move(pos, m);
       t.ev.pop();
-      // Checked on every move at every node; true at most once per thread for the whole
-      // search (time out / wind-down) — about as skewed a branch as exists in this file.
       if (stopped()) [[unlikely]]
         return 0;
 
@@ -360,10 +309,9 @@ namespace {
     if (!root) {
       if (pos.is_draw())
         return draw_score(pos);
-      if (ply >= MAX_PLY) [[unlikely]] // needs a 120-ply-deep line; essentially never happens
+      if (ply >= MAX_PLY) [[unlikely]]
         return evaluate(t, pos, ss);
-      // Mate distance pruning: only bites once a shorter mate is already known on another
-      // line, so alpha/beta collapsing here is rare outside forced-mate endgames.
+      // Mate distance pruning.
       alpha = std::max(alpha, -MATE + ply);
       beta  = std::min(beta, MATE - ply - 1);
       if (alpha >= beta) [[unlikely]]
@@ -376,9 +324,7 @@ namespace {
     (ss + 1)->excluded  = Move();
     ss->double_ext      = root ? 0 : (ss - 1)->double_ext;
 
-    // --- TT probe (skipped entirely under a singular-exclusion search) ---
-    // The Probe defaults (no slot, no hit, VALUE_NONE fields) cover the excluded case: every
-    // consumer below already guards on hit/!excluded, and no store happens without a slot.
+    // --- TT probe (skipped under a singular-exclusion search; Probe defaults cover it) ---
     const uint64_t key = tt_key(pos);
     tt::Probe      tp;
     if (!excluded) {
@@ -442,7 +388,7 @@ namespace {
         const int v = -negamax<false>(t, pos, ss + 1, -beta, -beta + 1, depth - R, ply + 1, !cutnode);
         pos.undo_null();
         t.ev.pop();
-        if (stopped()) [[unlikely]] // see the qsearch move loop
+        if (stopped()) [[unlikely]]
           return 0;
         if (v >= beta)
           return v >= MATE_IN_MAX ? beta : v; // don't return unproven mates
@@ -469,7 +415,7 @@ namespace {
             v = -negamax<false>(t, pos, ss + 1, -pc_beta, -pc_beta + 1, depth - 4, ply + 1, !cutnode);
           undo_move(pos, m);
           t.ev.pop();
-          if (stopped()) [[unlikely]] // see the qsearch move loop
+          if (stopped()) [[unlikely]]
             return 0;
           if (v >= pc_beta) {
             tt::store(tp.slot, key, m, to_tt(v, ply), raw_eval, depth - 3, tt::LOWER, false);
@@ -517,9 +463,8 @@ namespace {
           if (depth <= 4 && quiet_hist(ss, pos, m) < -2048 * depth)
             continue;
         }
-        // PVS SEE pruning, depth-scaled thresholds (captures and quiets). A winning-band
-        // capture from the lazy-SEE picker already passed see_ge(m, 0), which implies any
-        // negative threshold (see_ge is monotone in the threshold) — skip the call for those.
+        // SEE pruning, depth-scaled thresholds. A winning-band capture already passed
+        // see_ge(m, 0), which implies any negative threshold — skip the call.
         if (depth <= 8 && picker.yielded_see() != MovePicker::SEE_WINNING &&
             !see_ge(pos, m, quiet ? -50 * depth : -90 * depth))
           continue;
@@ -575,11 +520,8 @@ namespace {
 
         v = -negamax<false>(t, pos, ss + 1, -alpha - 1, -alpha, new_depth - r, ply + 1, true);
         if (v > alpha && r > 0) {
-          // The reduced search beat alpha: pick a confirmation depth from how convincingly it
-          // did so against the best move found so far, then re-search at that depth. Well past
-          // best -> the move looks genuinely strong, so look one ply deeper than normal to
-          // confirm it properly; only just past alpha -> treat the reduced score as noise from
-          // the cheap search and confirm one ply shallower instead of the full new_depth.
+          // Reduced search beat alpha: re-search at a depth picked by how convincingly it did
+          // (well past best -> one deeper to confirm; barely past alpha -> one shallower).
           const int confirm_depth =
                   std::clamp(new_depth + int(v > best + 40) - int(v < best + 15), 1, new_depth + 1);
           v = -negamax<false>(t, pos, ss + 1, -alpha - 1, -alpha, confirm_depth, ply + 1, !cutnode);
@@ -596,7 +538,7 @@ namespace {
         t.root_m1_nodes = t.nodes - nodes_before;
         t.root_m1_move  = m;
       }
-      if (time_up(t)) [[unlikely]] // see the qsearch move loop
+      if (time_up(t)) [[unlikely]]
         return 0;
 
       if (quiet) {
@@ -639,10 +581,8 @@ namespace {
     if (!excluded) {
       tt::store(tp.slot, key, best_move, to_tt(best, ply), raw_eval, depth, bound, PV);
 
-      // Static-eval correction history: when the search result disagrees with the static eval
-      // in a bound-consistent way, learn the offset — in EVERY table at once (pawn skeleton,
-      // material, minor/major placement, and the previous-move continuation), each moving
-      // toward the same target independently at its own key.
+      // Correction history: when the result disagrees with the static eval in a
+      // bound-consistent way, learn the offset in every table at once.
       if (!in_check && (best_move.to_from() == 0 || is_quiet(best_move)) &&
           !(bound == tt::LOWER && best <= ss->static_eval) &&
           !(bound == tt::UPPER && best >= ss->static_eval) && std::abs(best) < MATE_IN_MAX) {
@@ -686,12 +626,8 @@ namespace {
 
 } // namespace
 
-// One lazy-SMP helper's whole search (called from ThreadPool::worker in smp.cpp): a private
-// iterative-deepening loop over the helper's own copy of the root, stopping when the main
-// thread raises g_helper_stop (or the caller's g_stop / the hard clock fires — time_up polls
-// all of them). Odd-indexed helpers start one ply deeper so the pool doesn't move in
-// lockstep; everything a helper learns reaches the main thread through the shared TT and
-// history tables, its Result is never read.
+// One lazy-SMP helper's whole search: a private iterative-deepening loop over its own copy
+// of the root, until a stop flag or the hard clock. Odd-indexed helpers start one ply deeper.
 void search::smp_worker_iterate(ThreadData &t, Position &pos, int max_depth, int idx) {
   std::memset(t.stack, 0, sizeof(t.stack));
   t.ev.reset(pos);
@@ -703,8 +639,6 @@ void search::smp_worker_iterate(ThreadData &t, Position &pos, int max_depth, int
       break;
     prev = v;
   }
-  // A helper that exhausts max_depth (fixed-depth searches) simply idles out: searching past
-  // the requested depth could only produce results the main thread never looks at.
 }
 
 void search::request_stop() { g_stop.store(true, std::memory_order_relaxed); }
@@ -717,10 +651,8 @@ void search::set_threads(int n) { pool().set_size(std::max(0, n - 1)); }
 
 void search::set_contempt(int cp) { g_contempt = cp; }
 
-// The caller must have already called search::clear_stop() SYNCHRONOUSLY on whatever thread
-// might race a subsequent request_stop() (see search.h) before invoking this — think() itself
-// does not reset g_stop, precisely so a stop requested before this function starts running (on
-// a freshly-spawned search thread, for instance) is never silently discarded.
+// The caller must call search::clear_stop() synchronously before this (see search.h) —
+// think() never resets g_stop itself, so an early stop request can't be silently discarded.
 search::Result search::think(Position &pos, int max_depth, const InfoFn &info, int64_t soft_ms, int64_t hard_ms) {
   if (!g_lmr_init)
     init_lmr();
@@ -735,9 +667,7 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
 
   max_depth = std::clamp(max_depth, 1, MAX_PLY - 1);
 
-  // Kick the lazy-SMP helpers into their own iterative-deepening loops. Safe to reset the
-  // wind-down flag here: wait_idle() at the end of the previous think() guaranteed every
-  // helper is asleep again, so nothing can still be reading it.
+  // Safe to reset here: wait_idle() at the end of the previous think() left all helpers asleep.
   g_helper_stop.store(false, std::memory_order_relaxed);
   pool().start_search(pos, max_depth);
 
@@ -780,25 +710,18 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
     int64_t effective_soft = soft_ms;
     if (soft_ms > 0 && d >= 5 && res.nodes >= 1000 && !res.pv.empty()) {
       double scale = 1.0;
-      // Node concentration: how much of this iteration's effort went into the move we
-      // already believe is best (see ThreadData::root_m1_nodes — the MAIN thread's own
-      // counters, measured against its own nodes, not the pool total). Heavily focused
-      // (frac -> 1) => confident, cut toward half; spread thin (frac -> 0) => unclear, allow
-      // up to 1.5x. Only meaningful when root_m1_move actually IS the reported best move —
-      // the rarer case where a later move overtook it gets no concentration scaling.
+      // Node concentration: effort focused on the already-best root move => confident, cut
+      // toward 0.5x; spread thin => allow up to 1.5x. Main thread's own counters only, and
+      // only when the first-searched move IS the reported best.
       if (g_main.root_m1_move.to_from() == res.pv[0].to_from() && g_main.nodes > 0) {
         const double frac = double(g_main.root_m1_nodes) / double(g_main.nodes);
         scale *= std::clamp(1.5 - frac, 0.5, 1.5);
       }
-      // Best-move stability: a move that keeps being re-confirmed needs less and less
-      // verification (each confirmation shaves 5%, floor 0.85x after 8); a move that JUST
-      // changed is suspect — spend up to 1.25x resolving it.
+      // Stability: each re-confirmation of the best move shaves 5% (floor 0.85x); a move
+      // that just changed spends up to 1.25x.
       scale *= 1.25 - 0.05 * double(std::min(stability, 8));
-      // Falling eval: the score dropping since the last iteration means the position is
-      // turning out worse than believed — stretch the budget (~1.25x at a 50cp drop, capped
-      // 1.4x); a rising score shrinks it mildly, floored at 0.85x.
+      // Falling eval stretches the budget (cap 1.4x), a rising one mildly shrinks it.
       scale *= std::clamp(1.0 + double(prev_score - v) * 0.005, 0.85, 1.4);
-      // Keep the product inside sane bounds: never below 0.4x nor past 2x the base budget.
       scale          = std::clamp(scale, 0.4, 2.0);
       effective_soft = int64_t(double(soft_ms) * scale);
       if (hard_ms > 0)
@@ -808,9 +731,8 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
       break;
   }
 
-  // Wind the helpers down and wait them out BEFORE returning: the caller prints bestmove the
-  // moment this returns, and a UCI engine must not keep burning CPU past that. Also makes the
-  // final node total below exact rather than a live racing read.
+  // Wind the helpers down BEFORE returning: bestmove prints the moment this returns, and
+  // the final node total must be exact, not a live racing read.
   g_helper_stop.store(true, std::memory_order_relaxed);
   pool().wait_idle();
 

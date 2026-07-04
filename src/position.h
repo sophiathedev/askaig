@@ -156,21 +156,15 @@ public:
   // lost a castling right when its OO/OOO mask intersects this (used by eval's trapped-rook term).
   [[nodiscard]] inline Bitboard castle_entry() const { return history[game_ply].entry; }
 
-  // True if the current position is a draw by repetition, the fifty-move rule, or dead
-  // material. The repetition scan steps back two plies at a time (same side to move) and is
-  // bounded by the halfmove clock: positions before the last irreversible move (pawn move /
-  // capture / castle / promotion) had a different pawn structure or material and cannot recur.
-  // A single earlier occurrence is enough — in a search line either side can force the
-  // threefold, so it is treated as a draw immediately.
+  // Draw by repetition (a single earlier occurrence counts — either side could force the
+  // threefold), the fifty-move rule, or dead material. The repetition scan is bounded by the
+  // halfmove clock: nothing before the last irreversible move can recur.
   [[gnu::hot, nodiscard]] inline bool is_draw() const {
     const int f = history[game_ply].fifty;
     if (f >= 100) [[unlikely]]
       return true; // fifty-move rule (100 halfmoves)
-    // Dead material: bare kings plus at most one minor anywhere (KvK, KNvK, KBvK) cannot
-    // mate by any play — without this the engine can hold an NNUE "+0.3" forever, or (with
-    // Contempt) actively dodge a simplification into a position it could never lose OR win.
-    // Gated on "no pawns" so the common case pays one OR and a taken branch. KNNvK stays
-    // out: mates exist there (unforceable, but a position with legal mates is not dead).
+    // Dead material: KvK, KNvK, KBvK cannot mate by any play. KNNvK stays out (legal mates
+    // exist). Gated on "no pawns" so the common case pays one OR and a taken branch.
     if (!(piece_bb[WHITE_PAWN] | piece_bb[BLACK_PAWN])) [[unlikely]] {
       const Bitboard majors =
               piece_bb[WHITE_ROOK] | piece_bb[BLACK_ROOK] | piece_bb[WHITE_QUEEN] | piece_bb[BLACK_QUEEN];
@@ -221,11 +215,9 @@ public:
     --game_ply;
   }
 
-  // CAPTURES_ONLY skips every quiet emission (king/piece quiets, pushes, castling, and all
-  // quiet underpromotions — quiet QUEEN promotions are kept: they are quiescence moves) while
-  // leaving the legality machinery identical, for the quiescence move picker. Callers must
-  // not rely on it while in check: quiet evasions (blocks, king retreats) are skipped too, so
-  // the in-check quiescence path generates fully instead.
+  // CAPTURES_ONLY skips every quiet emission except quiet QUEEN promotions (quiescence
+  // moves), leaving the legality machinery identical. Not for use in check: quiet evasions
+  // are skipped too — the in-check quiescence path generates fully instead.
   template<Color Us, bool CAPTURES_ONLY = false>
   Move *generate_legals(Move *list);
 };
