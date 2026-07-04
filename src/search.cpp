@@ -517,6 +517,7 @@ namespace {
         r += cutnode;
         r += !improving;
         r -= PV;
+        r -= tp.pv; // node sat on the PV of an earlier search (TT pv bit): reduce less
         if (quiet)
           r -= std::clamp(quiet_hist(ss, pos, m) / 8192, -2, 2);
         else
