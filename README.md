@@ -3,16 +3,16 @@
 **Askaig** is a **UCI chess engine** written in modern **C++26**. It uses a **bitboard** board
 representation with **magic bitboards** (hyperbola quintessence) for sliding pieces, an **NNUE**
 (efficiently-updatable neural network) evaluation, and a heavily-pruned alpha-beta search
-parallelised with **YBWC** (Young Brothers Wait Concept).
+parallelised with **lazy SMP**.
 
 The move generator is **ported from [nkarve/surge](https://github.com/nkarve/surge)** (MIT) — a fast,
 correct, magic-bitboard legal move generator — and the engine (NNUE inference, search,
 transposition table, UCI front-end, SIMD primitives) is built on top of it.
 
 > The search and evaluation were rebuilt from scratch (the project previously shipped a
-> hand-crafted evaluation and a Lazy-SMP search; both were removed and redesigned — HCE, PSQT,
-> the gradient tuner, WDL model and KPK bitbase are gone). `go perft` still uses its own
-> independent, Lazy-SMP-style worker pool, since perft has no shared search state to race on.
+> hand-crafted evaluation; HCE, PSQT, the gradient tuner, WDL model and KPK bitbase are gone).
+> `go perft` still uses its own independent worker pool, since perft has no shared search
+> state to race on.
 
 ---
 
@@ -23,7 +23,7 @@ transposition table, UCI front-end, SIMD primitives) is built on top of it.
 - **Magic bitboards**, a 16-bit move representation, make/unmake with an undo stack, and **Zobrist hashing** (with a side-to-move term).
 - **SIMD** with three back-ends — **AVX2**, **ARM NEON**, and a portable `<bit>`/scalar fallback — auto-selected by architecture, covering both the bitboard primitives and the NNUE inference kernels (accumulator refresh/update, SCReLU output dot).
 - **NNUE evaluation**, quantized int16/int32, with an incremental per-perspective accumulator.
-- **YBWC parallel search** sharing a lockless transposition table.
+- **Lazy SMP parallel search** sharing a lockless transposition table.
 
 ## Evaluation (NNUE)
 
@@ -64,7 +64,7 @@ A **quantized NNUE** network:
 ## Search
 
 A **fail-soft negamax** (alpha-beta) search with **iterative deepening**, parallelised by
-**YBWC** rather than Lazy SMP:
+**lazy SMP**:
 
 - **Move ordering** — TT move → winning/equal captures by MVV-LVA refined with a **capture
   history** → killer moves → quiets ordered by **butterfly history** + **continuation history**
@@ -108,17 +108,18 @@ A **fail-soft negamax** (alpha-beta) search with **iterative deepening**, parall
   A separate, unconditional floor never plans to leave less than 200 ms on the clock, closing
   over both a `go` that already starts low on time and a search that runs unexpectedly long.
 
-### Parallel search: YBWC, not Lazy SMP
+### Parallel search: lazy SMP
 
-At a node whose depth is at least the **`Split`** option (spin, default **6**), the first
-("eldest") move is always searched sequentially; only if it fails to raise alpha to a cutoff are
-the *remaining* sibling moves handed to a pool of helper threads (`Threads − 1` helpers, plus the
-master itself) via a `SplitPoint`. Helpers attach to a frozen snapshot of the position and the
-surrounding search-stack context, share `alpha`/`best` atomically, and a beta cutoff raises an
-abort flag that chains through nested splits so outer cutoffs immediately moot inner work.
-History tables are shared across threads with plain (benign-race) updates, same as the
-transposition table. `go perft` is unaffected — it keeps its own simple, independent worker
-pool, since node-counting has no shared alpha/beta state to protect.
+Every helper thread (`Threads − 1` of them) runs its **own full iterative-deepening search** of
+the root position on a private copy — no split points, no work distribution, no cross-thread
+alpha/beta. The only shared state is the **transposition table** and the **history tables**
+(plain benign-race updates on both); whatever a helper learns reaches the main thread through
+them. Odd-indexed helpers start one ply deeper so the pool doesn't move in lockstep. The main
+thread alone reports `info` lines, manages time and produces the bestmove — reported `nodes`/
+`nps` are the live **sum across all threads**. When the main thread's search ends, it raises a
+wind-down flag and waits for every helper to go idle before printing `bestmove`. `go perft` is
+unaffected — it keeps its own simple, independent worker pool, since node-counting has no
+shared alpha/beta state to protect.
 
 With `Threads 1` the search is single-threaded and fully deterministic; with `Threads N` some
 non-determinism in node counts/depth timing is expected, as with any parallel search.
@@ -160,7 +161,6 @@ Supported commands: `uci`, `isready`, `ucinewgame`,
 `go wtime <ms> btime <ms> [winc <ms>] [binc <ms>] [movestogo <n>]` (clock-based time management),
 `go infinite` (search until `stop`), `go perft <depth> [noncache]`,
 `setoption name Hash value <MB>`, `setoption name Threads value <n>`,
-`setoption name Split value <depth>` (YBWC split-point depth threshold),
 `setoption name Contempt value <cp>` (centipawn cost of a draw to the side to move; negative
 seeks draws instead),
 `setoption name EvalFile value <path>` (load a `.nnue` file, or fall back to the embedded net),

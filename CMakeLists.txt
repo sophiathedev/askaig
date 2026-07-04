@@ -25,7 +25,7 @@ add_executable(askaig
     src/nnue.cpp
     src/tt.cpp
     src/see.cpp
-    src/ybwc.cpp
+    src/smp.cpp
     src/search.cpp
     src/uci.cpp
     src/main.cpp
