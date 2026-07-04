@@ -251,23 +251,22 @@ namespace {
     const bool     in_check = stm_in_check(pos);
     const uint64_t key      = tt_key(pos);
 
-    bool       tthit = false;
-    tt::Entry *tte   = tt::probe(key, tthit);
-    const int  ttsc  = tthit && tte->score != tt::VALUE_NONE_TT ? from_tt(tte->score, ply) : tt::VALUE_NONE_TT;
-    if (!PV && tthit && ttsc != tt::VALUE_NONE_TT) {
-      const auto b = tt::Bound(tte->genbound & 0x3);
-      if (b == tt::EXACT || (b == tt::LOWER && ttsc >= beta) || (b == tt::UPPER && ttsc <= alpha))
+    const tt::Probe tp   = tt::probe(key);
+    const int       ttsc = tp.hit && tp.score != tt::VALUE_NONE_TT ? from_tt(tp.score, ply) : tt::VALUE_NONE_TT;
+    if (!PV && tp.hit && ttsc != tt::VALUE_NONE_TT) {
+      if (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && ttsc >= beta) ||
+          (tp.bound == tt::UPPER && ttsc <= alpha))
         return ttsc;
     }
 
     int best = -INF, raw_eval = tt::VALUE_NONE_TT;
     if (!in_check) {
-      raw_eval = tthit && tte->eval != tt::VALUE_NONE_TT ? tte->eval : evaluate(t, pos, ss);
+      raw_eval = tp.hit && tp.eval != tt::VALUE_NONE_TT ? tp.eval : evaluate(t, pos, ss);
       best     = raw_eval;
       // The TT score is a tighter bound on this position than the static eval — use it.
-      if (tthit && ttsc != tt::VALUE_NONE_TT) {
-        const auto b = tt::Bound(tte->genbound & 0x3);
-        if (b == tt::EXACT || (b == tt::LOWER && ttsc > best) || (b == tt::UPPER && ttsc < best))
+      if (tp.hit && ttsc != tt::VALUE_NONE_TT) {
+        if (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && ttsc > best) ||
+            (tp.bound == tt::UPPER && ttsc < best))
           best = ttsc;
       }
       if (best >= beta)
@@ -276,7 +275,7 @@ namespace {
     }
     const int futility_base = best + 120;
 
-    const Move ttm = tthit ? Move(tte->move) : Move();
+    const Move ttm = tp.move;
     MovePicker picker(pos, g_hist, ttm, nullptr, nullptr, nullptr, /*quiescence=*/true);
     if (in_check && picker.total() == 0)
       return -MATE + ply;
@@ -328,7 +327,7 @@ namespace {
       }
     }
 
-    tt::store(tte, key, best_move, to_tt(best, ply), raw_eval, /*depth=*/0,
+    tt::store(tp.slot, key, best_move, to_tt(best, ply), raw_eval, /*depth=*/0,
               best >= beta ? tt::LOWER : tt::UPPER, PV);
     return best;
   }
@@ -370,39 +369,31 @@ namespace {
     ss->double_ext      = root ? 0 : (ss - 1)->double_ext;
 
     // --- TT probe (skipped entirely under a singular-exclusion search) ---
-    const uint64_t key   = tt_key(pos);
-    bool           tthit = false;
-    tt::Entry     *tte   = nullptr;
-    Move           ttm{};
-    int            ttsc    = tt::VALUE_NONE_TT;
-    int            ttdepth = -tt::DEPTH_OFFSET;
-    tt::Bound      ttbound = tt::NONE;
-    int            tteval  = tt::VALUE_NONE_TT;
+    // The Probe defaults (no slot, no hit, VALUE_NONE fields) cover the excluded case: every
+    // consumer below already guards on hit/!excluded, and no store happens without a slot.
+    const uint64_t key = tt_key(pos);
+    tt::Probe      tp;
     if (!excluded) {
-      tte = tt::probe(key, tthit);
-      if (tthit) {
-        ttm     = Move(tte->move);
-        ttsc    = tte->score != tt::VALUE_NONE_TT ? from_tt(tte->score, ply) : tt::VALUE_NONE_TT;
-        ttdepth = int(tte->depth) - tt::DEPTH_OFFSET;
-        ttbound = tt::Bound(tte->genbound & 0x3);
-        tteval  = tte->eval;
-      }
-      if (!PV && tthit && ttdepth >= depth && ttsc != tt::VALUE_NONE_TT &&
-          (ttbound == tt::EXACT || (ttbound == tt::LOWER && ttsc >= beta) || (ttbound == tt::UPPER && ttsc <= alpha)))
-        return ttsc;
+      tp = tt::probe(key);
+      const int sc = tp.hit && tp.score != tt::VALUE_NONE_TT ? from_tt(tp.score, ply) : tt::VALUE_NONE_TT;
+      if (!PV && tp.hit && tp.depth >= depth && sc != tt::VALUE_NONE_TT &&
+          (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && sc >= beta) || (tp.bound == tt::UPPER && sc <= alpha)))
+        return sc;
     }
+    const Move ttm  = tp.move;
+    const int  ttsc = tp.hit && tp.score != tt::VALUE_NONE_TT ? from_tt(tp.score, ply) : tt::VALUE_NONE_TT;
 
     // --- static eval + improving ---
     int raw_eval = tt::VALUE_NONE_TT;
     if (in_check)
       ss->static_eval = tt::VALUE_NONE_TT;
     else {
-      raw_eval        = tteval != tt::VALUE_NONE_TT ? tteval : evaluate(t, pos, ss);
+      raw_eval        = tp.eval != tt::VALUE_NONE_TT ? tp.eval : evaluate(t, pos, ss);
       ss->static_eval = raw_eval;
       // Sharpen with the TT score when it bounds in the right direction.
-      if (tthit && ttsc != tt::VALUE_NONE_TT &&
-          (ttbound == tt::EXACT || (ttbound == tt::LOWER && ttsc > raw_eval) ||
-           (ttbound == tt::UPPER && ttsc < raw_eval)))
+      if (tp.hit && ttsc != tt::VALUE_NONE_TT &&
+          (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && ttsc > raw_eval) ||
+           (tp.bound == tt::UPPER && ttsc < raw_eval)))
         ss->static_eval = ttsc;
     }
     const bool improving = !in_check && ply >= 2 && (ss - 2)->static_eval != tt::VALUE_NONE_TT &&
@@ -453,7 +444,7 @@ namespace {
       // produces a full-depth beta cutoff too. Skipped when the TT already says otherwise.
       const int pc_beta = beta + 180 - 60 * improving;
       if (depth >= 5 && std::abs(beta) < MATE_IN_MAX &&
-          !(tthit && ttdepth >= depth - 3 && ttsc != tt::VALUE_NONE_TT && ttsc < pc_beta)) {
+          !(tp.hit && tp.depth >= depth - 3 && ttsc != tt::VALUE_NONE_TT && ttsc < pc_beta)) {
         MovePicker pcpick(pos, g_hist, ttm.is_capture() ? ttm : Move(), nullptr, nullptr, nullptr,
                           /*quiescence=*/true);
         for (Move m; (m = pcpick.next()).to_from() != 0;) {
@@ -473,7 +464,7 @@ namespace {
           if (stopped()) [[unlikely]] // see the qsearch move loop
             return 0;
           if (v >= pc_beta) {
-            tt::store(tte, key, m, to_tt(v, ply), raw_eval, depth - 3, tt::LOWER, false);
+            tt::store(tp.slot, key, m, to_tt(v, ply), raw_eval, depth - 3, tt::LOWER, false);
             return v;
           }
         }
@@ -528,8 +519,8 @@ namespace {
 
       // --- singular extension / multicut on the TT move ---
       int extension = 0;
-      if (!root && !excluded && depth >= 8 && m.to_from() == ttm.to_from() && ttdepth >= depth - 3 &&
-          (ttbound & tt::LOWER) && std::abs(ttsc) < MATE_IN_MAX && ply < 2 * t.root_depth) {
+      if (!root && !excluded && depth >= 8 && m.to_from() == ttm.to_from() && tp.depth >= depth - 3 &&
+          (tp.bound & tt::LOWER) && std::abs(ttsc) < MATE_IN_MAX && ply < 2 * t.root_depth) {
         const int s_beta = ttsc - 2 * depth;
         ss->excluded     = m;
         const int v      = negamax<false>(t, pos, ss, s_beta - 1, s_beta, (depth - 1) / 2, ply, cutnode);
@@ -638,7 +629,7 @@ namespace {
       best = alpha;
 
     if (!excluded) {
-      tt::store(tte, key, best_move, to_tt(best, ply), raw_eval, depth, bound, PV);
+      tt::store(tp.slot, key, best_move, to_tt(best, ply), raw_eval, depth, bound, PV);
 
       // Static-eval correction history: when the search result disagrees with the static eval
       // in a bound-consistent way, learn the offset — in EVERY table at once (pawn skeleton,

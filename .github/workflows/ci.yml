@@ -167,11 +167,12 @@ jobs:
             -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
           cmake --build build -j
-      # selftest_search (Threads 1/2/4) is the one component with real concurrency (the YBWC
-      # split pool) -- run it a few times since a data race isn't guaranteed to show up every
-      # run. The Histories tables and ThreadData::nodes are intentionally unsynchronized
-      # statistics (see history.h/ybwc.h ASKAIG_TSAN_IGNORE) and must NOT reappear here; any
-      # other race TSan reports is real and should fail this job.
+      # selftest_search (Threads 1/2/4) is the one component with real concurrency (the lazy
+      # SMP pool) -- run it a few times since a data race isn't guaranteed to show up every
+      # run. The Histories tables, ThreadData::nodes and the lockless TT are intentionally
+      # unsynchronized (see history.h ASKAIG_TSAN_IGNORE and tt.h ASKAIG_TT_NOSAN — all TT
+      # entry access is funneled through tt.cpp's uninstrumented accessors) and must NOT
+      # reappear here; any other race TSan reports is real and should fail this job.
       - name: selftest search under TSan (x5)
         run: |
           for i in 1 2 3 4 5; do

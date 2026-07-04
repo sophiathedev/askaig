@@ -50,17 +50,26 @@ void tt::clear() {
 void tt::new_search() { g_gen += 8; }
 
 // Called at every negamax/qsearch node. NOT pure — a hit refreshes the entry's age in place,
-// a real side effect the replacement scheme depends on. The returned pointer is always meant
-// to be read or stored through by the caller; discarding it would be a bug.
-[[gnu::hot, nodiscard]] tt::Entry *tt::probe(uint64_t key, bool &found) {
+// a real side effect the replacement scheme depends on. Returns a decoded COPY of the entry
+// (see tt.h): the one place a live Entry is ever read, so the intentional lockless races stay
+// contained inside this (TSan-uninstrumented, noinline-under-TSan) function.
+ASKAIG_TT_NOSAN [[gnu::hot, nodiscard]] tt::Probe tt::probe(uint64_t key) {
   Cluster       &c   = g_table[key & (g_clusters - 1)];
   const uint16_t k16 = uint16_t(key >> 48);
+  Probe          r;
 
   for (Entry &e: c.e)
     if (e.key16 == k16 && (e.genbound & 0x3)) { // bound != NONE -> a real entry
       e.genbound = uint8_t(g_gen | (e.genbound & 0x7)); // refresh the age on a hit
-      found      = true;
-      return &e;
+      r.slot     = &e;
+      r.hit      = true;
+      r.move     = Move(e.move);
+      r.score    = e.score;
+      r.eval     = e.eval;
+      r.depth    = int(e.depth) - DEPTH_OFFSET;
+      r.bound    = Bound(e.genbound & 0x3);
+      r.pv       = (e.genbound & 0x4) != 0;
+      return r;
     }
 
   // Replacement: the shallowest entry after an age penalty (old entries die first).
@@ -68,8 +77,8 @@ void tt::new_search() { g_gen += 8; }
   for (Entry &e: c.e)
     if (int(e.depth) - age_of(e.genbound) < int(victim->depth) - age_of(victim->genbound))
       victim = &e;
-  found = false;
-  return victim;
+  r.slot = victim;
+  return r;
 }
 
 // Called at every make in the search (see tt.h). A cluster is 32 bytes and 64-byte aligned,
@@ -78,8 +87,10 @@ void tt::new_search() { g_gen += 8; }
 [[gnu::hot]] void tt::prefetch(uint64_t key) { __builtin_prefetch(&g_table[key & (g_clusters - 1)]); }
 
 // Called at (almost) every negamax/qsearch node on the way back up — hot, and inherently
-// side-effecting (writes the slot), so no purity attributes apply.
-[[gnu::hot]] void tt::store(Entry *e, uint64_t key, Move m, int score, int eval, int depth, Bound b, bool pv) {
+// side-effecting (writes the slot), so no purity attributes apply. Uninstrumented under TSan
+// like probe: these are the write side of the same intentional lockless races.
+ASKAIG_TT_NOSAN [[gnu::hot]] void tt::store(Entry *e, uint64_t key, Move m, int score, int eval, int depth, Bound b,
+                                            bool pv) {
   const uint16_t k16 = uint16_t(key >> 48);
   // Keep the old move when the new search found none; don't overwrite a same-key entry that is
   // deeper unless the new bound is EXACT (standard preserve-depth policy).
@@ -96,7 +107,8 @@ void tt::new_search() { g_gen += 8; }
 
 size_t tt::size_mb() { return g_mb; }
 
-int tt::hashfull() {
+// Sampled from the UCI info path while search threads may be storing — same intentional race.
+ASKAIG_TT_NOSAN int tt::hashfull() {
   if (!g_table)
     return 0;
   int n = 0;
