@@ -47,6 +47,7 @@ namespace search {
     int16_t butterfly[NCOLORS][NSQUARES][NSQUARES]; // quiet moves, [stm][from][to]
     int16_t capture[NPIECES][NSQUARES][NPIECE_TYPES]; // [moving piece][to][captured type]
     ContTable cont[NPIECES][NSQUARES]; // [prev piece][prev to] -> current move (~3.7 MB)
+    Move counter[NPIECES][NSQUARES]; // [prev piece][prev to] -> the quiet move that refuted it
 
     // Static-eval correction history: per-(stm, structural key) offsets between the static
     // eval and what the search actually found there, learned online. Summed and updated

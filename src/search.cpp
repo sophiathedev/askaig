@@ -170,6 +170,8 @@ namespace {
       ss->killers[1] = ss->killers[0];
       ss->killers[0] = best;
     }
+    if ((ss - 1)->move.to_from() != 0)
+      g_hist.counter[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()] = best;
   }
 
   [[gnu::hot]] void update_capture_hists(const Position &pos, Move best, const Move *tried, int n_tried, int depth) {
@@ -237,7 +239,7 @@ namespace {
     const int futility_base = best + 120;
 
     const Move ttm = tp.move;
-    MovePicker picker(pos, g_hist, ttm, nullptr, nullptr, nullptr, /*quiescence=*/true);
+    MovePicker picker(pos, g_hist, ttm, nullptr, Move(), nullptr, nullptr, /*quiescence=*/true);
     if (in_check && picker.total() == 0)
       return -MATE + ply;
 
@@ -399,7 +401,7 @@ namespace {
       const int pc_beta = beta + 180 - 60 * improving;
       if (depth >= 5 && std::abs(beta) < MATE_IN_MAX &&
           !(tp.hit && tp.depth >= depth - 3 && ttsc != tt::VALUE_NONE_TT && ttsc < pc_beta)) {
-        MovePicker pcpick(pos, g_hist, ttm.is_capture() ? ttm : Move(), nullptr, nullptr, nullptr,
+        MovePicker pcpick(pos, g_hist, ttm.is_capture() ? ttm : Move(), nullptr, Move(), nullptr, nullptr,
                           /*quiescence=*/true);
         for (Move m; (m = pcpick.next()).to_from() != 0;) {
           if (!m.is_capture() || !see_ge(pos, m, pc_beta - ss->static_eval))
@@ -426,7 +428,10 @@ namespace {
     }
 
     // --- move loop ---
-    MovePicker picker(pos, g_hist, ttm, ss->killers, (ss - 1)->ch, (ss - 2)->ch, /*quiescence=*/false);
+    const Move counter = (ss - 1)->move.to_from() != 0
+                                 ? g_hist.counter[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()]
+                                 : Move();
+    MovePicker picker(pos, g_hist, ttm, ss->killers, counter, (ss - 1)->ch, (ss - 2)->ch, /*quiescence=*/false);
     if (picker.total() == 0) {
       if (excluded) // all-moves-excluded can't happen (1 move excluded), but be safe
         return alpha;

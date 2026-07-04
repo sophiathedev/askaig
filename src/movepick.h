@@ -29,6 +29,7 @@ namespace search {
     static constexpr int SCORE_TT      = 4'000'000;
     static constexpr int SCORE_CAPTURE = 2'000'000;
     static constexpr int SCORE_KILLER  = 1'000'000;
+    static constexpr int SCORE_COUNTER = 800'000; // countermove: just below the killers
     static constexpr int DEMOTION      = 4'000'000; // capture band -> losing band
     static constexpr int SORT_AFTER    = 4; // max-scan picks before the tail gets sorted
 
@@ -40,7 +41,7 @@ namespace search {
     };
 
     // ch1/ch2: continuation-history slices of the previous two plies (nullable).
-    [[gnu::hot]] MovePicker(Position &pos, const Histories &hist, Move ttm, const Move *killers,
+    [[gnu::hot]] MovePicker(Position &pos, const Histories &hist, Move ttm, const Move *killers, Move counter,
                             const ContTable *ch1, const ContTable *ch2, bool quiescence)
         : pos(&pos), cur(0) {
       const bool in_check  = pos.turn() == WHITE ? pos.in_check<WHITE>() : pos.in_check<BLACK>();
@@ -64,6 +65,8 @@ namespace search {
                   (m.flags() == PC_QUEEN ? PIECE_VAL[QUEEN] : 0);
         } else if (killers && (m.to_from() == killers[0].to_from() || m.to_from() == killers[1].to_from()))
           score = SCORE_KILLER;
+        else if (counter.to_from() != 0 && m.to_from() == counter.to_from())
+          score = SCORE_COUNTER;
         else {
           const Piece pc = pos.at(m.from());
           score          = hist.butterfly[pos.turn()][m.from()][m.to()];
