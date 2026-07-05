@@ -1,5 +1,8 @@
 # Askaig
 
+> [!CAUTION]
+> This product was created by Claude Fable 5. This repo will no longer be updated and will be moved to another repo that is written manually.
+
 **Askaig** is a **UCI chess engine** written in modern **C++26**. It uses a **bitboard** board
 representation with **magic bitboards** (hyperbola quintessence) for sliding pieces, an **NNUE**
 (efficiently-updatable neural network) evaluation, and a heavily-pruned alpha-beta search
@@ -213,3 +216,4 @@ collisions. The table is per-thread (never shared, never stale).
 - NNUE training data derived from the [Lichess evaluation database](https://database.lichess.org/#evals)
   (Stockfish analysis contributed by the Lichess community).
 - Many search/evaluation techniques follow the [Chess Programming Wiki](https://www.chessprogramming.org/).
+
