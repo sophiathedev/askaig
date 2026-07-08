@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "datagen.h"
 #include "nnue.h"
 #include "position.h"
 #include "search.h"
@@ -1234,6 +1235,21 @@ void uci::loop() {
         const int d = what.empty() ? 0 : std::atoi(what.c_str());
         bench_cmd(d > 0 ? d : BENCH_DEPTH);
       }
+    } else if (cmd == "datagen") {
+      // Hidden: datagen <count> <out.bf> [nodes=5000] [seed=1] — in-engine self-play data
+      // generation (src/datagen.h). Blocks this thread until done; Ctrl-C safe (flushed per game).
+      stop_search();
+      uint64_t    count = 0, nodes = 5000, seed = 1, tmp = 0;
+      std::string out;
+      is >> count >> out;
+      if (is >> tmp)
+        nodes = tmp;
+      if (is >> tmp)
+        seed = tmp;
+      if (count == 0 || out.empty())
+        std::cout << "usage: datagen <count> <out.bf> [nodes] [seed]\n";
+      else
+        datagen::run(count, out, nodes, seed);
     } else if (cmd == "selftest") {
       // Hidden test commands (not advertised): "selftest {nnue [games] [maxply] | perft | see |
       // draw | search | contempt | stop | all}". selftest_search drives the shared TT/history/

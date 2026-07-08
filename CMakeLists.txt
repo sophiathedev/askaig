@@ -26,6 +26,7 @@ add_executable(askaig
     src/tt.cpp
     src/see.cpp
     src/smp.cpp
+    src/datagen.cpp
     src/search.cpp
     src/uci.cpp
     src/main.cpp
