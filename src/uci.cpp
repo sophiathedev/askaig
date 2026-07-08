@@ -884,6 +884,7 @@ namespace {
     // still be true from an earlier "go" + "stop" — think() no longer resets it itself (see
     // search::clear_stop()'s comment), so every non-backgrounded caller must.
     search::clear_stop();
+    search::set_node_limit(0); // a prior "go nodes" must not cap the signature runs
     const size_t prev_mb = tt::size_mb(); // restore the user's Hash afterwards
     tt::resize(16); // fixed size: the signature must not depend on the Hash setting
     uint64_t   total_nodes = 0;
@@ -1025,6 +1026,7 @@ namespace {
 
     int         depth    = 0;
     int64_t     movetime = 0, wtime = 0, btime = 0, winc = 0, binc = 0;
+    int64_t     nodes     = 0;
     int         movestogo = 0;
     bool        infinite  = false;
     std::string token;
@@ -1053,14 +1055,21 @@ namespace {
         is >> binc;
       else if (token == "movestogo")
         is >> movestogo;
+      else if (token == "nodes")
+        is >> nodes;
       else if (token == "infinite")
         infinite = true;
     }
+
+    // Soft node cap: set (or cleared) for EVERY go, so a previous "go nodes" can't leak.
+    search::set_node_limit(nodes > 0 ? uint64_t(nodes) : 0);
 
     // Resolve the limits into (max_depth, soft_ms, hard_ms). Time limits drive the search to
     // the ply ceiling and let the clock stop it; a bare depth caps the depth instead.
     int     max_depth = DEFAULT_DEPTH;
     int64_t soft_ms = 0, hard_ms = 0;
+    if (nodes > 0)
+      max_depth = search::MAX_PLY; // node-capped search: run until the cap stops it
     if (movetime > 0) {
       max_depth = search::MAX_PLY;
       hard_ms   = std::max<int64_t>(movetime - MOVE_OVERHEAD_MS, 1);

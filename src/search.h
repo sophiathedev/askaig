@@ -49,4 +49,8 @@ namespace search {
   // negative seeks draws instead). 0 (default) reproduces the old unconditional draw==0 exactly.
   void set_contempt(int cp);
 
+  // Soft node cap for the next searches (0 = off). Polled on the same 2048-node throttle as
+  // the hard clock; not reset automatically — go_cmd/bench/datagen each set what they need.
+  void set_node_limit(uint64_t n);
+
 } // namespace search

@@ -39,6 +39,7 @@ namespace {
   // belongs to the caller (see clear_stop()'s contract) and think() must never touch.
   std::atomic<bool>  g_helper_stop{false};
   int64_t            g_hard_ms = 0;
+  uint64_t           g_node_limit = 0; // soft node cap (0 = off): go nodes / datagen
   Clock::time_point  g_t0;
   int                g_contempt   = 0; // the "Contempt" UCI option, in centipawns
   Color              g_root_color = WHITE; // side to move at the root of the current think()
@@ -134,15 +135,22 @@ namespace {
     return g_stop.load(std::memory_order_relaxed) || g_helper_stop.load(std::memory_order_relaxed);
   }
 
-  // Stop poll for the tree: stopped() plus the hard clock (helpers poll it too).
+  // Stop poll for the tree: stopped() plus the hard clock and the soft node cap, both only
+  // checked on the existing 2048-node throttle (helpers poll them too).
   [[gnu::hot]] bool time_up(ThreadData &t) {
     if (stopped())
       return true;
-    if (g_hard_ms > 0 && (t.nodes & 2047) == 0) {
-      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - g_t0).count();
-      if (ms >= g_hard_ms) {
+    if ((t.nodes & 2047) == 0) {
+      if (g_node_limit && g_main.nodes + pool().total_nodes() >= g_node_limit) {
         g_stop.store(true, std::memory_order_relaxed);
         return true;
+      }
+      if (g_hard_ms > 0) {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - g_t0).count();
+        if (ms >= g_hard_ms) {
+          g_stop.store(true, std::memory_order_relaxed);
+          return true;
+        }
       }
     }
     return false;
@@ -674,6 +682,8 @@ void search::new_game() { g_hist.clear(); }
 void search::set_threads(int n) { pool().set_size(std::max(0, n - 1)); }
 
 void search::set_contempt(int cp) { g_contempt = cp; }
+
+void search::set_node_limit(uint64_t n) { g_node_limit = n; }
 
 // The caller must call search::clear_stop() synchronously before this (see search.h) —
 // think() never resets g_stop itself, so an early stop request can't be silently discarded.
