@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 #include "position.h"
 #include "search.h"
@@ -84,6 +85,22 @@ namespace {
     if (best)
       *best = r.best;
     return r.score;
+  }
+
+  // Compact duration for progress lines: "1h05m" / "12m30s" / "45s".
+  std::string fmt_hms(double s) {
+    if (!(s >= 0) || s > 3.15e9)
+      return "?";
+    const uint64_t t = uint64_t(s);
+    char           buf[32];
+    if (t >= 3600)
+      std::snprintf(buf, sizeof buf, "%lluh%02llum", (unsigned long long) (t / 3600),
+                    (unsigned long long) ((t % 3600) / 60));
+    else if (t >= 60)
+      std::snprintf(buf, sizeof buf, "%llum%02llus", (unsigned long long) (t / 60), (unsigned long long) (t % 60));
+    else
+      std::snprintf(buf, sizeof buf, "%llus", (unsigned long long) t);
+    return buf;
   }
 
 } // namespace
@@ -177,9 +194,13 @@ void datagen::run(uint64_t count, const std::string &out, uint64_t nodes, uint64
       rec.result = uint8_t(p.black ? 2 - wr : wr);
       std::fwrite(&rec, sizeof(rec), 1, f);
       if (++written % 10000 == 0) {
-        const double el = std::chrono::duration<double>(Clock::now() - t0).count();
-        std::printf("datagen: %llu positions, %llu games, %.0f pos/s\n", (unsigned long long) written,
-                    (unsigned long long) games, double(written) / el);
+        const double el   = std::chrono::duration<double>(Clock::now() - t0).count();
+        const double rate = el > 0 ? double(written) / el : 0;
+        const double eta  = rate > 0 ? double(count - written) / rate : -1;
+        std::printf("datagen: %llu/%llu (%.1f%%) | %llu games, %.1f rec/game | %.0f pos/s | %lluMB | ETA %s\n",
+                    (unsigned long long) written, (unsigned long long) count, 100.0 * double(written) / double(count),
+                    (unsigned long long) games, games ? double(written) / double(games) : 0.0, rate,
+                    (unsigned long long) (written * sizeof(Record) / (1024 * 1024)), fmt_hms(eta).c_str());
         std::fflush(stdout);
       }
       if (written >= count)
@@ -189,8 +210,10 @@ void datagen::run(uint64_t count, const std::string &out, uint64_t nodes, uint64
   }
 
   const double el = std::chrono::duration<double>(Clock::now() - t0).count();
-  std::printf("datagen done: %llu positions from %llu games in %.0fs (%.0f pos/s) -> %s\n",
-              (unsigned long long) written, (unsigned long long) games, el, double(written) / el, out.c_str());
+  std::printf("datagen done: %llu positions, %llu games (%.1f rec/game) in %s (%.0f pos/s) | %lluMB -> %s\n",
+              (unsigned long long) written, (unsigned long long) games, games ? double(written) / double(games) : 0.0,
+              fmt_hms(el).c_str(), el > 0 ? double(written) / el : 0.0,
+              (unsigned long long) (written * sizeof(Record) / (1024 * 1024)), out.c_str());
   std::fflush(stdout);
   std::fclose(f);
   search::set_node_limit(0);
