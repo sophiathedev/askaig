@@ -19,13 +19,12 @@ class PRNG {
 public:
   PRNG(uint64_t seed) : s(seed) {}
 
-  // Generate psuedorandom number
   template<typename T>
   T rand() {
     return T(rand64());
   }
 
-  // Generate psuedorandom number with only a few set bits
+  // Generate pseudorandom number with only a few set bits
   template<typename T>
   T sparse_rand() {
     return T(rand64() & rand64() & rand64());
@@ -106,8 +105,6 @@ public:
 
 
   Position() : piece_bb{0}, side_to_play(WHITE), game_ply(0), board{}, hash(0), pinned(0), checkers(0) {
-
-    // Sets all squares on the board as empty
     for (auto &i: board)
       i = NO_PIECE;
     history[0] = UndoInfo();
@@ -266,33 +263,6 @@ inline Bitboard Position::attackers_from(Square s, Bitboard occ) const {
 }
 
 
-/*template<Color C>
-Bitboard Position::pinned(Square s, Bitboard us, Bitboard occ) const {
-  Bitboard pinned = 0;
-
-  Bitboard pinners = get_xray_rook_attacks(s, occ, us) & orthogonal_sliders<~C>();
-  while (pinners) pinned |= SQUARES_BETWEEN_BB[s][pop_lsb(&pinners)] & us;
-
-  pinners = get_xray_bishop_attacks(s, occ, us) & diagonal_sliders<~C>();
-  while (pinners) pinned |= SQUARES_BETWEEN_BB[s][pop_lsb(&pinners)] & us;
-
-  return pinned;
-}
-
-template<Color C>
-Bitboard Position::blockers_to(Square s, Bitboard occ) const {
-  Bitboard blockers = 0;
-  Bitboard candidates = get_rook_attacks(s, occ) & occ;
-  Bitboard attackers = get_rook_attacks(s, occ ^ candidates) & orthogonal_sliders<~C>();
-
-  candidates = get_bishop_attacks(s, occ) & occ;
-  attackers |= get_bishop_attacks(s, occ ^ candidates) & diagonal_sliders<~C>();
-
-  while (attackers) blockers |= SQUARES_BETWEEN_BB[s][pop_lsb(&attackers)];
-  return blockers;
-}*/
-
-// Plays a move in the position
 template<Color C>
 [[gnu::hot]] void Position::play(const Move m) {
   side_to_play = ~side_to_play;
@@ -395,7 +365,6 @@ template<Color C>
   history[game_ply].fifty = (type != QUIET || type_of(board[m.to()]) == PAWN) ? 0 : history[game_ply - 1].fifty + 1;
 }
 
-// Undos a move in the current position, rolling it back to the previous position
 template<Color C>
 [[gnu::hot]] void Position::undo(const Move m) {
   MoveFlags type = m.flags();

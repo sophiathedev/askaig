@@ -1,6 +1,5 @@
 #include "tables.h"
 #include <cstring>
-#include <iostream>
 #include "types.h"
 
 // All piece tables are generated from a program written in Java
@@ -457,7 +456,7 @@ void initialise_bishop_attacks() {
 }
 
 // Returns the 'x-ray attacks' for a bishop at a given square. X-ray attacks cover squares that are not immediately
-// accessible by the rook, but become available when the immediate blockers are removed from the board
+// accessible by the bishop, but become available when the immediate blockers are removed from the board
 Bitboard get_xray_bishop_attacks(Square square, Bitboard occ, Bitboard blockers) {
   Bitboard attacks = get_bishop_attacks(square, occ);
   blockers &= attacks;
@@ -502,13 +501,13 @@ void initialise_line() {
 Bitboard PAWN_ATTACKS[NCOLORS][NSQUARES];
 Bitboard PSEUDO_LEGAL_ATTACKS[NPIECE_TYPES][NSQUARES];
 
-// Initializes the table containg pseudolegal attacks of each piece for each square. This does not include blockers
+// Initializes the table containing pseudolegal attacks of each piece for each square. This does not include blockers
 // for sliding pieces
 void initialise_pseudo_legal() {
-  memcpy(PAWN_ATTACKS[WHITE], WHITE_PAWN_ATTACKS, sizeof(WHITE_PAWN_ATTACKS));
-  memcpy(PAWN_ATTACKS[BLACK], BLACK_PAWN_ATTACKS, sizeof(BLACK_PAWN_ATTACKS));
-  memcpy(PSEUDO_LEGAL_ATTACKS[KNIGHT], KNIGHT_ATTACKS, sizeof(KNIGHT_ATTACKS));
-  memcpy(PSEUDO_LEGAL_ATTACKS[KING], KING_ATTACKS, sizeof(KING_ATTACKS));
+  std::memcpy(PAWN_ATTACKS[WHITE], WHITE_PAWN_ATTACKS, sizeof(WHITE_PAWN_ATTACKS));
+  std::memcpy(PAWN_ATTACKS[BLACK], BLACK_PAWN_ATTACKS, sizeof(BLACK_PAWN_ATTACKS));
+  std::memcpy(PSEUDO_LEGAL_ATTACKS[KNIGHT], KNIGHT_ATTACKS, sizeof(KNIGHT_ATTACKS));
+  std::memcpy(PSEUDO_LEGAL_ATTACKS[KING], KING_ATTACKS, sizeof(KING_ATTACKS));
   for (Square s = a1; s <= h8; ++s) {
     PSEUDO_LEGAL_ATTACKS[ROOK][s]   = get_rook_attacks_for_init(s, 0);
     PSEUDO_LEGAL_ATTACKS[BISHOP][s] = get_bishop_attacks_for_init(s, 0);

@@ -11,7 +11,6 @@ int main() {
   nnue::load_embedded(); // the build-time default net; EvalFile can override it later
   tt::resize(tt::DEFAULT_HASH_MB);
 
-  // Start the engine straight into the UCI command loop.
   uci::loop();
 
   return 0;

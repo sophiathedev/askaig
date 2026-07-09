@@ -59,7 +59,7 @@ namespace search {
     int16_t                 corr_major[NCOLORS][CORR_SIZE]; // rook+queen placement
     int16_t                 corr_cont[NPIECES][NSQUARES]; // keyed by the previous move
 
-    void clear() { std::memset(this, 0, sizeof(*this)); }
+    void clear() { std::memset(static_cast<void *>(this), 0, sizeof(*this)); }
   };
 
 } // namespace search

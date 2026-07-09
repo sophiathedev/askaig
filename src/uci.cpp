@@ -1,5 +1,6 @@
 #include "uci.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -68,7 +69,7 @@ namespace {
     s += SQSTR[to];
 
     if ((f >= PR_KNIGHT && f <= PR_QUEEN) || (f >= PC_KNIGHT && f <= PC_QUEEN)) {
-      constexpr char promo[] = {'n', 'b', 'r', 'q'};
+      constexpr std::array<char, 4> promo = {'n', 'b', 'r', 'q'};
       s += promo[f & 0b11];
     }
     return s;
@@ -807,7 +808,7 @@ namespace {
 
     // A 4-ply reversible cycle (knights out and back): the position returns to startpos, so the
     // loop can run forever without growing the stack beyond 4 plies.
-    const Move cyc[4] = {Move(g1, f3, QUIET), Move(g8, f6, QUIET), Move(f3, g1, QUIET), Move(f6, g8, QUIET)};
+    const std::array<Move, 4> cyc = {Move(g1, f3, QUIET), Move(g8, f6, QUIET), Move(f3, g1, QUIET), Move(f6, g8, QUIET)};
 
     // volatile: LTO can prove the eval functions pure and hoist them out of the loops otherwise
     // (observed with the refresh loop) — a forced store per eval is noise at these sizes.

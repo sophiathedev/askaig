@@ -7,13 +7,13 @@
 #include <string>
 #include <vector>
 
-const size_t NCOLORS = 2;
+constexpr size_t NCOLORS = 2;
 enum Color : int { WHITE, BLACK };
 
 // Inverts the color (WHITE -> BLACK) and (BLACK -> WHITE)
 constexpr Color operator~(Color c) { return Color(c ^ BLACK); }
 
-const size_t NDIRS = 8;
+constexpr size_t NDIRS = 8;
 enum Direction : int {
   NORTH       = 8,
   NORTH_EAST  = 9,
@@ -27,7 +27,7 @@ enum Direction : int {
   SOUTH_SOUTH = -16
 };
 
-const size_t NPIECE_TYPES = 6;
+constexpr size_t NPIECE_TYPES = 6;
 enum PieceType : int { PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING };
 
 // PIECE_STR[piece] is the algebraic chess representation of that piece
@@ -40,7 +40,7 @@ const std::string DEFAULT_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w K
 const std::string KIWIPETE = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -";
 
 
-const size_t NPIECES = 15;
+constexpr size_t NPIECES = 15;
 enum Piece : int {
   WHITE_PAWN,
   WHITE_KNIGHT,
@@ -66,7 +66,7 @@ constexpr Color color_of(Piece pc) { return Color((pc & 0b1000) >> 3); }
 
 using Bitboard = uint64_t;
 
-const size_t NSQUARES = 64;
+constexpr size_t NSQUARES = 64;
 enum Square : int {
   a1,
   b1,
@@ -290,26 +290,26 @@ inline Move *make<PROMOTION_CAPTURES>(Square from, Bitboard to, Move *list) {
 extern std::ostream &operator<<(std::ostream &os, const Move &m);
 
 // The white king and kingside rook
-const Bitboard WHITE_OO_MASK = 0x90;
+constexpr Bitboard WHITE_OO_MASK = 0x90;
 // The white king and queenside rook
-const Bitboard WHITE_OOO_MASK = 0x11;
+constexpr Bitboard WHITE_OOO_MASK = 0x11;
 
 // Squares between the white king and kingside rook
-const Bitboard WHITE_OO_BLOCKERS_AND_ATTACKERS_MASK = 0x60;
+constexpr Bitboard WHITE_OO_BLOCKERS_AND_ATTACKERS_MASK = 0x60;
 // Squares between the white king and queenside rook
-const Bitboard WHITE_OOO_BLOCKERS_AND_ATTACKERS_MASK = 0xe;
+constexpr Bitboard WHITE_OOO_BLOCKERS_AND_ATTACKERS_MASK = 0xe;
 
 // The black king and kingside rook
-const Bitboard BLACK_OO_MASK = 0x9000000000000000;
+constexpr Bitboard BLACK_OO_MASK = 0x9000000000000000;
 // The black king and queenside rook
-const Bitboard BLACK_OOO_MASK = 0x1100000000000000;
+constexpr Bitboard BLACK_OOO_MASK = 0x1100000000000000;
 // Squares between the black king and kingside rook
-const Bitboard BLACK_OO_BLOCKERS_AND_ATTACKERS_MASK = 0x6000000000000000;
+constexpr Bitboard BLACK_OO_BLOCKERS_AND_ATTACKERS_MASK = 0x6000000000000000;
 // Squares between the black king and queenside rook
-const Bitboard BLACK_OOO_BLOCKERS_AND_ATTACKERS_MASK = 0xE00000000000000;
+constexpr Bitboard BLACK_OOO_BLOCKERS_AND_ATTACKERS_MASK = 0xE00000000000000;
 
 // The white king, white rooks, black king and black rooks
-const Bitboard ALL_CASTLING_MASK = 0x9100000000000091;
+constexpr Bitboard ALL_CASTLING_MASK = 0x9100000000000091;
 
 template<Color C>
 constexpr Bitboard oo_mask() {
