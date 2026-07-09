@@ -278,10 +278,10 @@ const Bitboard BLACK_PAWN_ATTACKS[64] = {
 // Reverses a bitboard (used only during table initialisation by sliding_attacks)
 Bitboard reverse(Bitboard b) {
 #if defined(SIMD) && defined(ARCH_ARM_NEON)
-  // vrbit reverses the bits within each byte, vrev64 reverses the byte order ->
-  // a full 64-bit bit reversal in two NEON instructions.
-  uint8x8_t v = vrev64_u8(vrbit_u8(vcreate_u8(b)));
-  return vget_lane_u64(vreinterpret_u64_u8(v), 0);
+  // AArch64 has a SCALAR full-width bit reverse: the builtin lowers to one `rbit x,x`
+  // (1 cycle, stays in GPRs). The previous NEON vrbit+vrev64 route paid two fmov
+  // domain crossings (~5cy each) per call — three calls per sliding_attacks.
+  return __builtin_bitreverse64(b);
 #elif defined(SIMD) && defined(ARCH_AVX2)
   // Reverse the bits within every byte via two pshufb nibble lookups, then reverse the
   // byte order with bswap.
@@ -317,8 +317,8 @@ Bitboard get_rook_attacks_for_init(Square square, Bitboard occ) {
          sliding_attacks(square, occ, MASK_RANK[rank_of(square)]);
 }
 
-Bitboard ROOK_ATTACK_MASKS[64];
-int      ROOK_ATTACK_SHIFTS[64];
+// Per-square packed descriptors (mask/magic/ptr/shift in one 32-byte struct — see tables.h).
+Magic ROOK_MAGIC[64];
 
 // "Fancy magic" flat attack table: instead of a [64][4096] grid (2 MiB, ~60% of it wasted padding
 // for squares that need fewer than 12 index bits), every square's 2^bits slice is packed back to
@@ -327,9 +327,8 @@ int      ROOK_ATTACK_SHIFTS[64];
 // is exactly the dense layout PEXT indexing needs (see rook_index). Filled by initialise_rook_attacks.
 constexpr int ROOK_TABLE_SIZE = 102400; // = sum over squares of 2^(rook relevant bits) (0x19000)
 Bitboard      ROOK_ATTACK_TABLE[ROOK_TABLE_SIZE];
-Bitboard     *ROOK_ATTACK_PTR[64]; // per-square base into ROOK_ATTACK_TABLE
 
-const Bitboard ROOK_MAGICS[64] = {
+static const Bitboard ROOK_MAGICS[64] = {
         0x0080001020400080, 0x0040001000200040, 0x0080081000200080, 0x0080040800100080, 0x0080020400080080,
         0x0080010200040080, 0x0080008001000200, 0x0080002040800100, 0x0000800020400080, 0x0000400020005000,
         0x0000801000200080, 0x0000800800100080, 0x0000800400080080, 0x0000800200040080, 0x0000800100020080,
@@ -344,42 +343,28 @@ const Bitboard ROOK_MAGICS[64] = {
         0x0000800041000080, 0x00FFFCDDFCED714A, 0x007FFCDDFCED714A, 0x003FFFCDFFD88096, 0x0000040810002101,
         0x0001000204080011, 0x0001000204000801, 0x0001000082000401, 0x0001FFFAABFAD1A2};
 
-// Slice index for a rook on `sq` with occupancy `occ`. On x86 with BMI2 (PEXT) this extracts the
-// relevant occupancy bits directly — one instruction, no multiply; everywhere else (incl. ARM NEON)
-// it is the classic magic multiply-shift. Both yield an index in [0, 2^bits), and BOTH the table
-// init and the lookup go through this function, so the flat table is always filled at the slots the
-// lookup will read — switching indexing methods can never desynchronise them.
-[[gnu::always_inline, gnu::hot]] static inline unsigned rook_index(Square sq, Bitboard occ) noexcept {
-#if defined(ARCH_AVX2) && defined(__BMI2__)
-  return static_cast<unsigned>(_pext_u64(occ, ROOK_ATTACK_MASKS[sq]));
-#else
-  return static_cast<unsigned>(((occ & ROOK_ATTACK_MASKS[sq]) * ROOK_MAGICS[sq]) >> ROOK_ATTACK_SHIFTS[sq]);
-#endif
-}
-
-// Initializes the flat ("fancy magic") rook attack table.
+// Initializes the flat ("fancy magic") rook attack table. The get_rook_attacks lookup in
+// tables.h indexes through the same Magic descriptor filled here, so init and lookup can
+// never desynchronise.
 void initialise_rook_attacks() {
   Bitboard *base = ROOK_ATTACK_TABLE;
   for (Square sq = a1; sq <= h8; ++sq) {
-    const Bitboard edges   = ((MASK_RANK[AFILE] | MASK_RANK[HFILE]) & ~MASK_RANK[rank_of(sq)]) |
-                             ((MASK_FILE[AFILE] | MASK_FILE[HFILE]) & ~MASK_FILE[file_of(sq)]);
-    ROOK_ATTACK_MASKS[sq]  = (MASK_RANK[rank_of(sq)] ^ MASK_FILE[file_of(sq)]) & ~edges;
-    ROOK_ATTACK_SHIFTS[sq] = 64 - pop_count(ROOK_ATTACK_MASKS[sq]);
-    ROOK_ATTACK_PTR[sq]    = base; // this square's 2^bits slice starts here
+    const Bitboard edges = ((MASK_RANK[AFILE] | MASK_RANK[HFILE]) & ~MASK_RANK[rank_of(sq)]) |
+                           ((MASK_FILE[AFILE] | MASK_FILE[HFILE]) & ~MASK_FILE[file_of(sq)]);
+    Magic &m             = ROOK_MAGIC[sq];
+    m.mask               = (MASK_RANK[rank_of(sq)] ^ MASK_FILE[file_of(sq)]) & ~edges;
+    m.magic              = ROOK_MAGICS[sq];
+    m.shift              = 64 - pop_count(m.mask);
+    m.ptr                = base; // this square's 2^bits slice starts here
 
     Bitboard subset = 0;
     do {
-      ROOK_ATTACK_PTR[sq][rook_index(sq, subset)] = get_rook_attacks_for_init(sq, subset);
-      subset                                      = (subset - ROOK_ATTACK_MASKS[sq]) & ROOK_ATTACK_MASKS[sq];
+      base[magic_index(m, subset)] = get_rook_attacks_for_init(sq, subset);
+      subset                       = (subset - m.mask) & m.mask;
     } while (subset);
 
-    base += 1ULL << pop_count(ROOK_ATTACK_MASKS[sq]); // advance past this square's slice
+    base += 1ULL << pop_count(m.mask); // advance past this square's slice
   }
-}
-
-// Returns the attacks bitboard for a rook at a given square, using the flat magic/PEXT lookup table.
-[[gnu::pure, gnu::hot]] Bitboard get_rook_attacks(Square square, Bitboard occ) {
-  return ROOK_ATTACK_PTR[square][rook_index(square, occ)];
 }
 
 // Returns the 'x-ray attacks' for a rook at a given square. X-ray attacks cover squares that are not immediately
@@ -397,16 +382,15 @@ Bitboard get_bishop_attacks_for_init(Square square, Bitboard occ) {
          sliding_attacks(square, occ, MASK_ANTI_DIAGONAL[anti_diagonal_of(square)]);
 }
 
-Bitboard BISHOP_ATTACK_MASKS[64];
-int      BISHOP_ATTACK_SHIFTS[64];
+// Per-square packed descriptors (mask/magic/ptr/shift in one 32-byte struct — see tables.h).
+Magic BISHOP_MAGIC[64];
 
 // Flat "fancy magic" bishop attack table (see the rook table above): 5248 entries (~41 KiB) instead
 // of [64][512] (256 KiB, ~84% wasted), reached through a per-square base pointer.
 constexpr int BISHOP_TABLE_SIZE = 5248; // = sum over squares of 2^(bishop relevant bits) (0x1480)
 Bitboard      BISHOP_ATTACK_TABLE[BISHOP_TABLE_SIZE];
-Bitboard     *BISHOP_ATTACK_PTR[64];
 
-const Bitboard BISHOP_MAGICS[64] = {
+static const Bitboard BISHOP_MAGICS[64] = {
         0x0002020202020200, 0x0002020202020000, 0x0004010202000000, 0x0004040080000000, 0x0001104000000000,
         0x0000821040000000, 0x0000410410400000, 0x0000104104104000, 0x0000040404040400, 0x0000020202020200,
         0x0000040102020000, 0x0000040400800000, 0x0000011040000000, 0x0000008210400000, 0x0000004104104000,
@@ -421,38 +405,27 @@ const Bitboard BISHOP_MAGICS[64] = {
         0x0002020202020000, 0x0000104104104000, 0x0000002082082000, 0x0000000020841000, 0x0000000000208800,
         0x0000000010020200, 0x0000000404080200, 0x0000040404040400, 0x0002020202020200};
 
-// Slice index for a bishop on `sq` (PEXT on BMI2, else magic multiply-shift) — see rook_index.
-[[gnu::always_inline, gnu::hot]] static inline unsigned bishop_index(Square sq, Bitboard occ) noexcept {
-#if defined(ARCH_AVX2) && defined(__BMI2__)
-  return static_cast<unsigned>(_pext_u64(occ, BISHOP_ATTACK_MASKS[sq]));
-#else
-  return static_cast<unsigned>(((occ & BISHOP_ATTACK_MASKS[sq]) * BISHOP_MAGICS[sq]) >> BISHOP_ATTACK_SHIFTS[sq]);
-#endif
-}
-
-// Initializes the flat ("fancy magic") bishop attack table.
+// Initializes the flat ("fancy magic") bishop attack table (indexes via the shared
+// magic_index, same as the get_bishop_attacks lookup in tables.h).
 void initialise_bishop_attacks() {
   Bitboard *base = BISHOP_ATTACK_TABLE;
   for (Square sq = a1; sq <= h8; ++sq) {
-    const Bitboard edges     = ((MASK_RANK[AFILE] | MASK_RANK[HFILE]) & ~MASK_RANK[rank_of(sq)]) |
-                               ((MASK_FILE[AFILE] | MASK_FILE[HFILE]) & ~MASK_FILE[file_of(sq)]);
-    BISHOP_ATTACK_MASKS[sq]  = (MASK_DIAGONAL[diagonal_of(sq)] ^ MASK_ANTI_DIAGONAL[anti_diagonal_of(sq)]) & ~edges;
-    BISHOP_ATTACK_SHIFTS[sq] = 64 - pop_count(BISHOP_ATTACK_MASKS[sq]);
-    BISHOP_ATTACK_PTR[sq]    = base;
+    const Bitboard edges = ((MASK_RANK[AFILE] | MASK_RANK[HFILE]) & ~MASK_RANK[rank_of(sq)]) |
+                           ((MASK_FILE[AFILE] | MASK_FILE[HFILE]) & ~MASK_FILE[file_of(sq)]);
+    Magic &m             = BISHOP_MAGIC[sq];
+    m.mask               = (MASK_DIAGONAL[diagonal_of(sq)] ^ MASK_ANTI_DIAGONAL[anti_diagonal_of(sq)]) & ~edges;
+    m.magic              = BISHOP_MAGICS[sq];
+    m.shift              = 64 - pop_count(m.mask);
+    m.ptr                = base;
 
     Bitboard subset = 0;
     do {
-      BISHOP_ATTACK_PTR[sq][bishop_index(sq, subset)] = get_bishop_attacks_for_init(sq, subset);
-      subset                                          = (subset - BISHOP_ATTACK_MASKS[sq]) & BISHOP_ATTACK_MASKS[sq];
+      base[magic_index(m, subset)] = get_bishop_attacks_for_init(sq, subset);
+      subset                       = (subset - m.mask) & m.mask;
     } while (subset);
 
-    base += 1ULL << pop_count(BISHOP_ATTACK_MASKS[sq]);
+    base += 1ULL << pop_count(m.mask);
   }
-}
-
-// Returns the attacks bitboard for a bishop at a given square, using the flat magic/PEXT lookup table.
-[[gnu::pure, gnu::hot]] Bitboard get_bishop_attacks(Square square, Bitboard occ) {
-  return BISHOP_ATTACK_PTR[square][bishop_index(square, occ)];
 }
 
 // Returns the 'x-ray attacks' for a bishop at a given square. X-ray attacks cover squares that are not immediately

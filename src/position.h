@@ -114,7 +114,7 @@ public:
   // already occupied is an error
   inline void put_piece(Piece pc, Square s) {
     board[s] = pc;
-    piece_bb[pc] |= SQUARE_BB[s];
+    piece_bb[pc] |= sq_bb(s);
     hash ^= zobrist::zobrist_table[pc][s];
   }
 
@@ -122,7 +122,7 @@ public:
   inline void remove_piece(Square s) {
     const Piece pc = board[s];
     hash ^= zobrist::zobrist_table[pc][s];
-    piece_bb[pc] &= ~SQUARE_BB[s];
+    piece_bb[pc] &= ~sq_bb(s);
     board[s] = NO_PIECE;
   }
 
@@ -268,16 +268,22 @@ template<Color C>
   side_to_play = ~side_to_play;
   hash ^= zobrist::zobrist_side;
   ++game_ply;
-  history[game_ply] = UndoInfo(history[game_ply - 1]);
 
+  // Written out field-by-field instead of `history[game_ply] = UndoInfo(prev)`: the
+  // copy-constructor form also stored hash=0 and prev.fifty, both dead — they are
+  // unconditionally overwritten at the end of this function.
   MoveFlags type = m.flags();
-  history[game_ply].entry |= SQUARE_BB[m.to()] | SQUARE_BB[m.from()];
+  UndoInfo &st   = history[game_ply];
+  st.entry       = history[game_ply - 1].entry | sq_bb(m.to()) | sq_bb(m.from());
+  st.captured    = NO_PIECE;
+  st.epsq        = NO_SQUARE;
 
-  switch (type) {
-    case QUIET:
-      // The to square is guaranteed to be empty here
-      move_piece_quiet(m.from(), m.to());
-      break;
+  // Quiet moves dominate every game tree; peeling them off as one predictable branch keeps
+  // the common path free of the switch's indirect jump (a frequent branch-predictor miss).
+  if (type == QUIET) [[likely]] {
+    // The to square is guaranteed to be empty here
+    move_piece_quiet(m.from(), m.to());
+  } else switch (type) {
     case DOUBLE_PUSH:
       // The to square is guaranteed to be empty here
       move_piece_quiet(m.from(), m.to());
@@ -368,11 +374,11 @@ template<Color C>
 template<Color C>
 [[gnu::hot]] void Position::undo(const Move m) {
   MoveFlags type = m.flags();
-  switch (type) {
-    case QUIET:
-    case DOUBLE_PUSH:
-      move_piece_quiet(m.to(), m.from());
-      break;
+  // Same common-path peel as play(): QUIET (0) and DOUBLE_PUSH (1) both just move the piece
+  // back, and together they dominate — one predictable branch instead of the indirect jump.
+  if (type <= DOUBLE_PUSH) [[likely]] {
+    move_piece_quiet(m.to(), m.from());
+  } else switch (type) {
     case OO:
       if (C == WHITE) {
         move_piece_quiet(g1, e1);
@@ -452,17 +458,17 @@ template<Color Us, bool CAPTURES_ONLY>
   while (b1)
     danger |= attacks<KNIGHT>(pop_lsb(&b1), all);
 
+  // all ^ sq_bb(our_king) prevents the king from moving to squares which are 'x-rayed'
+  // by enemy sliders (the king does not block the ray it is standing on)
+  const Bitboard all_no_king = all ^ sq_bb(our_king);
+
   b1 = their_diag_sliders;
-  // all ^ SQUARE_BB[our_king] is written to prevent the king from moving to squares which are 'x-rayed'
-  // by enemy bishops and queens
   while (b1)
-    danger |= attacks<BISHOP>(pop_lsb(&b1), all ^ SQUARE_BB[our_king]);
+    danger |= attacks<BISHOP>(pop_lsb(&b1), all_no_king);
 
   b1 = their_orth_sliders;
-  // all ^ SQUARE_BB[our_king] is written to prevent the king from moving to squares which are 'x-rayed'
-  // by enemy rooks and queens
   while (b1)
-    danger |= attacks<ROOK>(pop_lsb(&b1), all ^ SQUARE_BB[our_king]);
+    danger |= attacks<ROOK>(pop_lsb(&b1), all_no_king);
 
   // The king can move to all of its surrounding squares, except ones that are attacked, and
   // ones that have our own pieces on them
@@ -501,20 +507,25 @@ template<Color Us, bool CAPTURES_ONLY>
     // Do the squares in between the enemy slider and our king contain any of our pieces?
     // If not, add the slider to the checker bitboard
     if (b1 == 0)
-      checkers ^= SQUARE_BB[s];
-    // If there is only one of our pieces between them, add our piece to the pinned bitboard
-    else if (std::has_single_bit(b1))
+      checkers ^= sq_bb(s);
+    // If there is only one of our pieces between them, add our piece to the pinned bitboard.
+    // b1 is non-zero here, so clearing its lowest bit leaving nothing means exactly one bit —
+    // a two-op GPR test instead of a popcount (which detours through the vector unit on ARM).
+    else if (!(b1 & (b1 - 1)))
       pinned ^= b1;
   }
 
   // This makes it easier to mask pieces
   const Bitboard not_pinned = ~pinned;
 
-  switch (sparse_pop_count(checkers)) {
-    case 2:
+  // Dispatch on the number of checkers without a popcount: `checkers & (checkers - 1)` is
+  // non-zero iff at least two pieces give check (saves the vector round-trip of a popcount
+  // on this always-taken path; checkers can never hold more than two bits).
+  if (checkers) {
+    if (checkers & (checkers - 1))
       // If there is a double check, the only legal moves are king moves out of check
       return list;
-    case 1: {
+    {
       // It's a single check!
 
       Square checker_square = bsf(checkers);
@@ -559,11 +570,10 @@ template<Color Us, bool CAPTURES_ONLY>
           quiet_mask = SQUARES_BETWEEN_BB[our_king][checker_square];
           break;
       }
-
-      break;
     }
-
-    default:
+  } else {
+    // Not in check:
+    {
       // We can capture any enemy piece
       capture_mask = them_bb;
 
@@ -595,7 +605,7 @@ template<Color Us, bool CAPTURES_ONLY>
           */
 
           if ((sliding_attacks(our_king,
-                               all ^ SQUARE_BB[s] ^ shift<relative_dir<Us>(SOUTH)>(SQUARE_BB[history[game_ply].epsq]),
+                               all ^ sq_bb(s) ^ shift<relative_dir<Us>(SOUTH)>(SQUARE_BB[history[game_ply].epsq]),
                                MASK_RANK[rank_of(our_king)]) &
                their_orth_sliders) == 0)
             *list++ = Move(s, history[game_ply].epsq, EN_PASSANT);
@@ -650,7 +660,7 @@ template<Color Us, bool CAPTURES_ONLY>
 
           if constexpr (!CAPTURES_ONLY) {
             // Single pawn pushes
-            b2 = shift<relative_dir<Us>(NORTH)>(SQUARE_BB[s]) & ~all & LINE[our_king][s];
+            b2 = shift<relative_dir<Us>(NORTH)>(sq_bb(s)) & ~all & LINE[our_king][s];
             // Double pawn pushes (only pawns on rank 3/6 are eligible)
             b3   = shift<relative_dir<Us>(NORTH)>(b2 & MASK_RANK[relative_rank<Us>(RANK3)]) & ~all & LINE[our_king][s];
             list = make<QUIET>(s, b2, list);
@@ -660,8 +670,7 @@ template<Color Us, bool CAPTURES_ONLY>
       }
 
       // Pinned knights cannot move anywhere, so we're done with pinned pieces!
-
-      break;
+    }
   }
 
   // Non-pinned knight moves

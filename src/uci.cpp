@@ -157,7 +157,8 @@ namespace {
   template<Color Us>
   uint64_t perft(Position &p, int depth, bool use_cache) {
     // Bulk counting (always on): at the last ply return the legal-move count directly, skipping a
-    // make/unmake of every leaf (the bulk of the tree) — far faster, identical total.
+    // make/unmake of every leaf (the bulk of the tree) — far faster, identical total. The leaf still
+    // materialises its move list (same work the search pays), so perft speed tracks real movegen speed.
     if (depth <= 1) {
       MoveList<Us> list(p);
       return static_cast<uint64_t>(list.size());

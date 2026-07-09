@@ -1,6 +1,7 @@
 #pragma once
 #pragma warning(disable : 26812)
 
+#include <array>
 #include <cstdint>
 #include <iostream>
 #include <ostream>
@@ -147,11 +148,42 @@ enum Rank : int { RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8 };
 
 extern const char *SQSTR[65];
 
-extern const Bitboard MASK_FILE[8];
-extern const Bitboard MASK_RANK[8];
-extern const Bitboard MASK_DIAGONAL[15];
-extern const Bitboard MASK_ANTI_DIAGONAL[15];
-extern const Bitboard SQUARE_BB[65];
+// Formulaic constant tables, constexpr in the header so the compiler SEES the values:
+// constant-index accesses fold to immediates (castling squares, shift<>'s file masks become
+// AND-with-immediate), instead of the opaque ldr that an extern table forces on every access.
+inline constexpr Bitboard MASK_FILE[8] = {
+        0x101010101010101,  0x202020202020202,  0x404040404040404,  0x808080808080808,
+        0x1010101010101010, 0x2020202020202020, 0x4040404040404040, 0x8080808080808080,
+};
+
+inline constexpr Bitboard MASK_RANK[8] = {0xff,         0xff00,         0xff0000,         0xff000000,
+                                          0xff00000000, 0xff0000000000, 0xff000000000000, 0xff00000000000000};
+
+inline constexpr Bitboard MASK_DIAGONAL[15] = {
+        0x80,           0x8040,           0x804020,           0x80402010,        0x8040201008,
+        0x804020100804, 0x80402010080402, 0x8040201008040201, 0x4020100804020100, 0x2010080402010000,
+        0x1008040201000000, 0x804020100000000, 0x402010000000000, 0x201000000000000, 0x100000000000000,
+};
+
+inline constexpr Bitboard MASK_ANTI_DIAGONAL[15] = {
+        0x1,           0x102,           0x10204,           0x1020408,          0x102040810,
+        0x10204081020, 0x1020408102040, 0x102040810204080, 0x204081020408000,  0x408102040800000,
+        0x810204080000000, 0x1020408000000000, 0x2040800000000000, 0x4080000000000000, 0x8000000000000000,
+};
+
+// SQUARE_BB[NO_SQUARE] == 0 is load-bearing: en-passant code indexes with a possibly-NO_SQUARE
+// square and relies on getting an empty bitboard back. For indices that are PROVABLY a real
+// square, prefer sq_bb() below (two ALU ops, no table access at all).
+inline constexpr auto SQUARE_BB = [] {
+  std::array<Bitboard, 65> t{};
+  for (int i = 0; i < 64; ++i)
+    t[i] = Bitboard(1) << i;
+  t[64] = 0; // NO_SQUARE
+  return t;
+}();
+
+// 1-bit bitboard of a real square (s < 64 REQUIRED — no NO_SQUARE sentinel handling).
+constexpr Bitboard sq_bb(Square s) { return Bitboard(1) << s; }
 
 extern void print_bitboard(Bitboard b);
 

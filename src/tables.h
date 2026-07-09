@@ -10,25 +10,51 @@ extern const Bitboard BLACK_PAWN_ATTACKS[NSQUARES];
 extern Bitboard reverse(Bitboard b);
 extern Bitboard sliding_attacks(Square square, Bitboard occ, Bitboard mask);
 
-extern Bitboard       get_rook_attacks_for_init(Square square, Bitboard occ);
-extern const Bitboard ROOK_MAGICS[NSQUARES];
-extern Bitboard       ROOK_ATTACK_MASKS[NSQUARES];
-extern int            ROOK_ATTACK_SHIFTS[NSQUARES];
-extern void           initialise_rook_attacks();
+// Per-square "fancy magic" descriptor, packed so one slider lookup touches a single
+// 32-byte struct (one cache line holds two squares) instead of four separate arrays
+// (mask/magic/shift/base-pointer on four different lines). `shift` doubles as padding.
+struct alignas(32) Magic {
+  Bitboard  mask; // relevant-occupancy mask
+  Bitboard  magic; // magic multiplier (unused on the PEXT path)
+  Bitboard *ptr; // base of this square's slice in the flat attack table
+  uint64_t  shift; // 64 - popcount(mask) (unused on the PEXT path)
+};
 
+extern Magic ROOK_MAGIC[NSQUARES];
+extern Magic BISHOP_MAGIC[NSQUARES];
 
-[[gnu::pure, gnu::hot]] Bitboard get_rook_attacks(Square square, Bitboard occ);
-extern Bitboard                  get_xray_rook_attacks(Square square, Bitboard occ, Bitboard blockers);
+extern Bitboard get_rook_attacks_for_init(Square square, Bitboard occ);
+extern void     initialise_rook_attacks();
 
-extern Bitboard       get_bishop_attacks_for_init(Square square, Bitboard occ);
-extern const Bitboard BISHOP_MAGICS[NSQUARES];
-extern Bitboard       BISHOP_ATTACK_MASKS[NSQUARES];
-extern int            BISHOP_ATTACK_SHIFTS[NSQUARES];
-extern void           initialise_bishop_attacks();
+extern Bitboard get_bishop_attacks_for_init(Square square, Bitboard occ);
+extern void     initialise_bishop_attacks();
 
+// Slice index for a slider with occupancy `occ`. On x86 with BMI2 (PEXT) this extracts the
+// relevant occupancy bits directly — one instruction, no multiply; everywhere else (incl. ARM
+// NEON) it is the classic magic multiply-shift. Both yield an index in [0, 2^bits), and BOTH
+// the table init and the lookups go through this function, so the flat table is always filled
+// at the slots the lookup will read — switching indexing methods can never desynchronise them.
+[[gnu::const, gnu::always_inline]] inline uint64_t magic_index(const Magic &m, Bitboard occ) noexcept {
+#if defined(ARCH_AVX2) && defined(__BMI2__)
+  return _pext_u64(occ, m.mask);
+#else
+  return ((occ & m.mask) * m.magic) >> m.shift;
+#endif
+}
 
-[[gnu::pure, gnu::hot]] Bitboard get_bishop_attacks(Square square, Bitboard occ);
-extern Bitboard                  get_xray_bishop_attacks(Square square, Bitboard occ, Bitboard blockers);
+// Flat attack-table lookups, inline so they fold into the movegen loops.
+[[gnu::pure, gnu::always_inline]] inline Bitboard get_rook_attacks(Square square, Bitboard occ) {
+  const Magic &m = ROOK_MAGIC[square];
+  return m.ptr[magic_index(m, occ)];
+}
+
+[[gnu::pure, gnu::always_inline]] inline Bitboard get_bishop_attacks(Square square, Bitboard occ) {
+  const Magic &m = BISHOP_MAGIC[square];
+  return m.ptr[magic_index(m, occ)];
+}
+
+extern Bitboard get_xray_rook_attacks(Square square, Bitboard occ, Bitboard blockers);
+extern Bitboard get_xray_bishop_attacks(Square square, Bitboard occ, Bitboard blockers);
 
 extern Bitboard SQUARES_BETWEEN_BB[NSQUARES][NSQUARES];
 extern Bitboard LINE[NSQUARES][NSQUARES];
