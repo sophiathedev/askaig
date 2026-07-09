@@ -39,6 +39,17 @@ namespace search {
     h = static_cast<int16_t>(h + bonus - int(h) * std::abs(bonus) / HIST_MAX);
   }
 
+  // The countermove table holds Moves (uint16), not int16 scores, so its accesses bypass
+  // hist_update — but the sharing contract is the same benign race (a torn/stale Move is just
+  // a briefly-worse ordering hint, and movepick validates it for legality anyway). Both the
+  // store and the load get the same uninstrumented treatment so the TSan job stays a real
+  // gate for every OTHER race.
+  ASKAIG_HIST_UPDATE_ATTRS
+  inline void counter_store(Move &slot, Move m) { slot = m; }
+
+  ASKAIG_HIST_UPDATE_ATTRS
+  inline Move counter_load(const Move &slot) { return slot; }
+
   // One continuation-history slice: indexed by the CURRENT move's [piece][to], selected by the
   // PREVIOUS move's (piece, to) — countermove history at 1 ply, follow-up history at 2 plies.
   using ContTable = int16_t[NPIECES][NSQUARES];

@@ -191,7 +191,7 @@ namespace {
       ss->killers[0] = best;
     }
     if ((ss - 1)->move.to_from() != 0)
-      g_hist.counter[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()] = best;
+      counter_store(g_hist.counter[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()], best);
   }
 
   [[gnu::hot]] void update_capture_hists(const Position &pos, Move best, const Move *tried, int n_tried, int depth) {
@@ -459,7 +459,7 @@ namespace {
 
     // --- move loop ---
     const Move counter = (ss - 1)->move.to_from() != 0
-                                 ? g_hist.counter[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()]
+                                 ? counter_load(g_hist.counter[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()])
                                  : Move();
     MovePicker picker(pos, g_hist, ttm, ss->killers, counter, (ss - 1)->ch, (ss - 2)->ch, /*quiescence=*/false);
     if (picker.total() == 0) {
