@@ -46,7 +46,7 @@ namespace {
     r.score          = int16_t(score);
 
     int idx = 0;
-    for (int sq = 0; sq < NSQUARES; ++sq) {
+    for (int sq = 0; sq < int(NSQUARES); ++sq) {
       const Square orig = Square(black ? sq ^ 56 : sq);
       const Piece  pc   = pos.at(orig);
       if (pc == NO_PIECE)
@@ -79,7 +79,7 @@ namespace {
     return n == 0 ? Move() : buf[rng.rand<uint64_t>() % n];
   }
 
-  int search_once(Position &pos, uint64_t nodes, Move *best) {
+  int search_once(Position &pos, Move *best) {
     search::clear_stop(); // the node cap left g_stop raised after the previous search
     const search::Result r = search::think(pos, search::MAX_PLY - 1, nullptr, 0, 0);
     if (best)
@@ -147,7 +147,7 @@ void datagen::run(uint64_t count, const std::string &out, uint64_t nodes, uint64
     ++games;
     if (!ok || count_legals(pos) == 0)
       continue;
-    if (std::abs(search_once(pos, nodes, nullptr)) > OPENING_GATE_CP)
+    if (std::abs(search_once(pos, nullptr)) > OPENING_GATE_CP)
       continue; // lopsided opening: labels would echo the imbalance, not the play
 
     // Play the game out.
@@ -164,7 +164,7 @@ void datagen::run(uint64_t count, const std::string &out, uint64_t nodes, uint64
       }
 
       Move      best;
-      const int score = search_once(pos, nodes, &best);
+      const int score = search_once(pos, &best);
       if (best.to_from() == 0)
         break; // aborted search: discard the game tail
 

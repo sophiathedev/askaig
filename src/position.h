@@ -63,6 +63,10 @@ struct UndoInfo {
 
   // This preserves the entry bitboard and halfmove clock across moves (play() overrides hash/fifty).
   UndoInfo(const UndoInfo &prev) : entry(prev.entry), captured(NO_PIECE), epsq(NO_SQUARE), hash(0), fifty(prev.fifty) {}
+
+  // Plain memberwise copy (used by play_null(), copying an already-adjusted UndoInfo). Declared
+  // explicitly alongside the custom copy constructor above to satisfy the rule of three.
+  UndoInfo &operator=(const UndoInfo &) = default;
 };
 
 class Position {
@@ -104,7 +108,7 @@ public:
   Bitboard pinned;
 
 
-  Position() : piece_bb{0}, side_to_play(WHITE), game_ply(0), board{}, hash(0), pinned(0), checkers(0) {
+  Position() : piece_bb{0}, board{}, side_to_play(WHITE), game_ply(0), hash(0), checkers(0), pinned(0) {
     for (auto &i: board)
       i = NO_PIECE;
     history[0] = UndoInfo();
@@ -139,6 +143,15 @@ public:
   static bool               set(const std::string &fen, Position &p);
   [[nodiscard]] std::string fen() const;
 
+  // Assignment is deleted (accidental `posA = posB;` would go through UndoInfo's copy
+  // constructor per history[] entry and reset captured/epsq/hash for all of them). The copy
+  // constructor is left implicit (elementwise, same UndoInfo-ctor caveat) rather than also
+  // deleted: uci.cpp's clone_position() byte-memcpy's a Position and returns it by value, which
+  // needs a callable copy constructor to exist even though the return is always elided (NRVO) in
+  // every build config this project uses — verified empirically the elision is NOT optional in
+  // practice here (identical under -O0 and -O2+LTO; only `-fno-elide-constructors`, which no
+  // build of this project passes, forces the real copy and its would-be corruption).
+  Position(const Position &) = default;
   Position   &operator=(const Position &) = delete;
   inline bool operator==(const Position &other) const { return hash == other.hash; }
 
@@ -362,6 +375,8 @@ template<Color C>
       move_piece(m.from(), m.to());
 
       break;
+    default: // QUIET: excluded by the if/else above, never reaches here
+      __builtin_unreachable();
   }
 
   // Record this position's hash for repetition detection, and advance the halfmove clock — reset to
@@ -420,6 +435,8 @@ template<Color C>
       move_piece_quiet(m.to(), m.from());
       put_piece(history[game_ply].captured, m.to());
       break;
+    default: // QUIET/DOUBLE_PUSH: excluded by the if/else above, never reaches here
+      __builtin_unreachable();
   }
 
   side_to_play = ~side_to_play;
@@ -491,13 +508,13 @@ template<Color Us, bool CAPTURES_ONLY>
   // Checkers of each piece type are identified by:
   // 1. Projecting attacks FROM the king square
   // 2. Intersecting this bitboard with the enemy bitboard of that piece type
-  checkers = attacks<KNIGHT>(our_king, all) & bitboard_of(Them, KNIGHT) |
-             pawn_attacks<Us>(our_king) & bitboard_of(Them, PAWN);
+  checkers = (attacks<KNIGHT>(our_king, all) & bitboard_of(Them, KNIGHT)) |
+             (pawn_attacks<Us>(our_king) & bitboard_of(Them, PAWN));
 
   // Here, we identify slider checkers and pinners simultaneously, and candidates for such pinners
   // and checkers are represented by the bitboard <candidates>
-  Bitboard candidates = attacks<ROOK>(our_king, them_bb) & their_orth_sliders |
-                        attacks<BISHOP>(our_king, them_bb) & their_diag_sliders;
+  Bitboard candidates = (attacks<ROOK>(our_king, them_bb) & their_orth_sliders) |
+                        (attacks<BISHOP>(our_king, them_bb) & their_diag_sliders);
 
   pinned = 0;
   while (candidates) {

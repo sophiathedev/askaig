@@ -462,11 +462,11 @@ void initialise_line() {
   for (Square sq1 = a1; sq1 <= h8; ++sq1)
     for (Square sq2 = a1; sq2 <= h8; ++sq2) {
       if (file_of(sq1) == file_of(sq2) || rank_of(sq1) == rank_of(sq2))
-        LINE[sq1][sq2] =
-                get_rook_attacks_for_init(sq1, 0) & get_rook_attacks_for_init(sq2, 0) | SQUARE_BB[sq1] | SQUARE_BB[sq2];
-      else if (diagonal_of(sq1) == diagonal_of(sq2) || anti_diagonal_of(sq1) == anti_diagonal_of(sq2))
-        LINE[sq1][sq2] = get_bishop_attacks_for_init(sq1, 0) & get_bishop_attacks_for_init(sq2, 0) | SQUARE_BB[sq1] |
+        LINE[sq1][sq2] = (get_rook_attacks_for_init(sq1, 0) & get_rook_attacks_for_init(sq2, 0)) | SQUARE_BB[sq1] |
                          SQUARE_BB[sq2];
+      else if (diagonal_of(sq1) == diagonal_of(sq2) || anti_diagonal_of(sq1) == anti_diagonal_of(sq2))
+        LINE[sq1][sq2] = (get_bishop_attacks_for_init(sq1, 0) & get_bishop_attacks_for_init(sq2, 0)) |
+                         SQUARE_BB[sq1] | SQUARE_BB[sq2];
     }
 }
 

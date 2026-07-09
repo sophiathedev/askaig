@@ -1,5 +1,7 @@
 #pragma once
-#pragma warning(disable : 26812)
+#ifdef _MSC_VER
+  #pragma warning(disable : 26812) // unscoped enum (MoveFlags, PieceType, ...): intentional, matches Stockfish/Surge style
+#endif
 
 #include <array>
 #include <cstdint>
@@ -275,10 +277,9 @@ public:
 
   [[nodiscard]] inline bool is_capture() const { return ((move >> 12) & CAPTURE) != 0; }
 
-  Move &operator=(Move m) {
-    move = m.move;
-    return *this;
-  }
+  // No user-declared copy assignment: it did nothing but the implicit memberwise copy already
+  // does (move is a single uint16_t), and dropping it lets the implicit copy ctor/assignment
+  // stay implicit instead of triggering the rule-of-three deprecation.
   bool operator==(Move a) const { return to_from() == a.to_from(); }
   bool operator!=(Move a) const { return to_from() != a.to_from(); }
 };

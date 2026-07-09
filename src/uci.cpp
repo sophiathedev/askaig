@@ -131,7 +131,7 @@ namespace {
   // Packs the full move-generation state of `p` into a PerftEntry fingerprint (count/depth unset).
   PerftEntry perft_fingerprint(const Position &p) {
     PerftEntry e{{0, 0, 0, 0}, 0, 0, NO_SQUARE, 0, -1};
-    for (int s = 0; s < NSQUARES; ++s)
+    for (int s = 0; s < int(NSQUARES); ++s)
       e.board[s >> 4] |= static_cast<uint64_t>(p.at(Square(s)) & 0xF) << ((s & 15) * 4);
     e.castle = p.history[p.ply()].entry;
     e.epsq   = static_cast<int16_t>(p.history[p.ply()].epsq);
