@@ -21,6 +21,8 @@ per position, typically depth 18-40+), distilled via sigmoid(cp/400).
 | `train.py`       | MPS/CPU training loop (Adam, cosine LR, sigmoid-MSE loss, λ WDL blend) |
 | `export.py`      | checkpoint → quantized `.nnue` (QA=255 / QB=64 / SCALE=400) with overflow hard-asserts; `--random` emits a plumbing-test net |
 | `parity.py`      | engine == exact-int-simulation (must be 0-diff) + float-vs-quantized error report |
+| `bullet/`        | **Rust trainer on [bullet](https://github.com/jw1912/bullet)** — Metal on Apple Silicon, the fast path (replaces `train.py`) |
+| `bullet_to_nnue.py` | bullet checkpoint `raw.bin` → quantized `.nnue` via `export.write_net` (no permutation; same QA/QB overflow asserts) |
 
 ## Recipe
 
@@ -48,6 +50,37 @@ python3 parity.py ../../build/askaig ../work/net.nnue ../work/lichess.book --n 1
 # 6. ship it
 cp ../work/net.nnue ../../networks/default.nnue   # CMake re-embeds on the next build
 ```
+
+## Faster training: bullet (Rust + Metal)
+
+`train.py` on MPS is slow — Metal handles the sparse feature transformer poorly. `bullet/` is a
+Rust trainer on [bullet](https://github.com/jw1912/bullet) running the **same** architecture on the
+Apple GPU via bullet's `metal` backend (much faster, identical net). It reproduces `src/nnue.h`
+exactly: `ChessBucketsMirrored` + `MaterialCount::<8>` match the engine's feature index and output
+bucket bit-for-bit, so no permutation is needed and the data prep is unchanged.
+
+```sh
+# 0. one-time: Xcode Command-Line Tools + rustc >= 1.87 (the metal feature needs no CUDA/HIP toolkit)
+
+# 1-3. same convert -> shuffle -> check as above, into ../work/data-shuf.bf
+
+# 4. train on the Metal GPU (config via env; ASKAIG_DATA is the only required one)
+cd bullet
+ASKAIG_DATA=../../work/data-shuf.bf ASKAIG_SB=160 ASKAIG_LAMBDA=0.0 cargo run --release
+# -> checkpoints/askaig-<sb>/{raw.bin,quantised.bin}, saved every save_rate superbatches (+ the last)
+
+# 5. convert the newest checkpoint -> quantized .nnue, then verify (0-diff required)
+python3 ../bullet_to_nnue.py checkpoints/askaig-160 ../../work/net.nnue
+python3 ../parity.py ../../../build/askaig ../../work/net.nnue ../../work/lichess.book --n 1000
+
+# 6. ship it (from repo root, as above)
+cp ../../work/net.nnue ../../../networks/default.nnue
+```
+
+Env knobs: `ASKAIG_DATA` (comma-separated `.bf`), `ASKAIG_SB` (superbatches, default 160),
+`ASKAIG_BPS` (batches/superbatch, default 6104 ≈ 100M pos), `ASKAIG_BATCH` (16384), `ASKAIG_LAMBDA`
+(WDL blend, 0 for teacher-eval data, 0.2–0.4 with real results), `ASKAIG_LR` (0.001),
+`ASKAIG_THREADS` (loader decode, 4). The bullet rev is pinned in `bullet/Cargo.toml`.
 
 Engine-side gates (run after any net or kernel change):
 

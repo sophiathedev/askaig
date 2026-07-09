@@ -1,0 +1,14 @@
+[package]
+name = "askaig-trainer"
+version = "0.1.0"
+edition = "2021"
+
+# bullet's `main` API drifts — pin the rev this trainer was written against. The metal feature
+# is pure-Rust objc2 Metal/MPS bindings (no CUDA/HIP toolkit, no env vars); needs an Apple
+# Silicon Mac, Xcode Command-Line Tools, and rustc >= 1.87.
+[dependencies]
+bullet_lib = { git = "https://github.com/jw1912/bullet", rev = "cebc78a093d92cbc87e56cfef049184c225270b0", features = ["metal"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
