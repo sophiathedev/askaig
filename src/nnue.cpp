@@ -180,99 +180,135 @@ namespace {
 
 #elif defined(SIMD) && defined(ARCH_ARM_NEON)
 
-  // The add/sub update kernels process a 4-vector (32 int16) tile per iteration — four
-  // independent dependency chains for the four SIMD pipes, and 1/4 the loop-branch overhead.
+  // The add/sub update kernels process an 8-vector (64 int16) tile per iteration — eight
+  // independent dependency chains keep the four SIMD pipes filled across the multi-cycle
+  // load latencies, and 1/8 the loop-branch overhead.
   [[gnu::hot]] void add1_sub1(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0) {
-    for (int i = 0; i < HL; i += 32) {
+    for (int i = 0; i < HL; i += 64) {
       int16x8_t v0 = vsubq_s16(vaddq_s16(vld1q_s16(src + i), vld1q_s16(a0 + i)), vld1q_s16(s0 + i));
       int16x8_t v1 = vsubq_s16(vaddq_s16(vld1q_s16(src + i + 8), vld1q_s16(a0 + i + 8)), vld1q_s16(s0 + i + 8));
       int16x8_t v2 = vsubq_s16(vaddq_s16(vld1q_s16(src + i + 16), vld1q_s16(a0 + i + 16)), vld1q_s16(s0 + i + 16));
       int16x8_t v3 = vsubq_s16(vaddq_s16(vld1q_s16(src + i + 24), vld1q_s16(a0 + i + 24)), vld1q_s16(s0 + i + 24));
+      int16x8_t v4 = vsubq_s16(vaddq_s16(vld1q_s16(src + i + 32), vld1q_s16(a0 + i + 32)), vld1q_s16(s0 + i + 32));
+      int16x8_t v5 = vsubq_s16(vaddq_s16(vld1q_s16(src + i + 40), vld1q_s16(a0 + i + 40)), vld1q_s16(s0 + i + 40));
+      int16x8_t v6 = vsubq_s16(vaddq_s16(vld1q_s16(src + i + 48), vld1q_s16(a0 + i + 48)), vld1q_s16(s0 + i + 48));
+      int16x8_t v7 = vsubq_s16(vaddq_s16(vld1q_s16(src + i + 56), vld1q_s16(a0 + i + 56)), vld1q_s16(s0 + i + 56));
       vst1q_s16(dst + i, v0);
       vst1q_s16(dst + i + 8, v1);
       vst1q_s16(dst + i + 16, v2);
       vst1q_s16(dst + i + 24, v3);
+      vst1q_s16(dst + i + 32, v4);
+      vst1q_s16(dst + i + 40, v5);
+      vst1q_s16(dst + i + 48, v6);
+      vst1q_s16(dst + i + 56, v7);
     }
   }
   [[gnu::hot]] void add1_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0, const int16_t *s1) {
-    for (int i = 0; i < HL; i += 32) {
-      int16x8_t v0 = vsubq_s16(vsubq_s16(vaddq_s16(vld1q_s16(src + i), vld1q_s16(a0 + i)), vld1q_s16(s0 + i)),
-                               vld1q_s16(s1 + i));
-      int16x8_t v1 = vsubq_s16(
-              vsubq_s16(vaddq_s16(vld1q_s16(src + i + 8), vld1q_s16(a0 + i + 8)), vld1q_s16(s0 + i + 8)),
-              vld1q_s16(s1 + i + 8));
-      int16x8_t v2 = vsubq_s16(
-              vsubq_s16(vaddq_s16(vld1q_s16(src + i + 16), vld1q_s16(a0 + i + 16)), vld1q_s16(s0 + i + 16)),
-              vld1q_s16(s1 + i + 16));
-      int16x8_t v3 = vsubq_s16(
-              vsubq_s16(vaddq_s16(vld1q_s16(src + i + 24), vld1q_s16(a0 + i + 24)), vld1q_s16(s0 + i + 24)),
-              vld1q_s16(s1 + i + 24));
+    for (int i = 0; i < HL; i += 64) {
+#define AS12(off) \
+  vsubq_s16(vsubq_s16(vaddq_s16(vld1q_s16(src + i + (off)), vld1q_s16(a0 + i + (off))), vld1q_s16(s0 + i + (off))), \
+            vld1q_s16(s1 + i + (off)))
+      int16x8_t v0 = AS12(0);
+      int16x8_t v1 = AS12(8);
+      int16x8_t v2 = AS12(16);
+      int16x8_t v3 = AS12(24);
+      int16x8_t v4 = AS12(32);
+      int16x8_t v5 = AS12(40);
+      int16x8_t v6 = AS12(48);
+      int16x8_t v7 = AS12(56);
+#undef AS12
       vst1q_s16(dst + i, v0);
       vst1q_s16(dst + i + 8, v1);
       vst1q_s16(dst + i + 16, v2);
       vst1q_s16(dst + i + 24, v3);
+      vst1q_s16(dst + i + 32, v4);
+      vst1q_s16(dst + i + 40, v5);
+      vst1q_s16(dst + i + 48, v6);
+      vst1q_s16(dst + i + 56, v7);
     }
   }
   [[gnu::hot]] void add2_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *a1, const int16_t *s0,
                  const int16_t *s1) {
-    for (int i = 0; i < HL; i += 32) {
-      int16x8_t v0 = vsubq_s16(vsubq_s16(vaddq_s16(vaddq_s16(vld1q_s16(src + i), vld1q_s16(a0 + i)),
-                                                   vld1q_s16(a1 + i)),
-                                         vld1q_s16(s0 + i)),
-                               vld1q_s16(s1 + i));
-      int16x8_t v1 = vsubq_s16(vsubq_s16(vaddq_s16(vaddq_s16(vld1q_s16(src + i + 8), vld1q_s16(a0 + i + 8)),
-                                                   vld1q_s16(a1 + i + 8)),
-                                         vld1q_s16(s0 + i + 8)),
-                               vld1q_s16(s1 + i + 8));
-      int16x8_t v2 = vsubq_s16(vsubq_s16(vaddq_s16(vaddq_s16(vld1q_s16(src + i + 16), vld1q_s16(a0 + i + 16)),
-                                                   vld1q_s16(a1 + i + 16)),
-                                         vld1q_s16(s0 + i + 16)),
-                               vld1q_s16(s1 + i + 16));
-      int16x8_t v3 = vsubq_s16(vsubq_s16(vaddq_s16(vaddq_s16(vld1q_s16(src + i + 24), vld1q_s16(a0 + i + 24)),
-                                                   vld1q_s16(a1 + i + 24)),
-                                         vld1q_s16(s0 + i + 24)),
-                               vld1q_s16(s1 + i + 24));
+    for (int i = 0; i < HL; i += 64) {
+#define AS22(off) \
+  vsubq_s16(vsubq_s16(vaddq_s16(vaddq_s16(vld1q_s16(src + i + (off)), vld1q_s16(a0 + i + (off))), \
+                                vld1q_s16(a1 + i + (off))), \
+                      vld1q_s16(s0 + i + (off))), \
+            vld1q_s16(s1 + i + (off)))
+      int16x8_t v0 = AS22(0);
+      int16x8_t v1 = AS22(8);
+      int16x8_t v2 = AS22(16);
+      int16x8_t v3 = AS22(24);
+      int16x8_t v4 = AS22(32);
+      int16x8_t v5 = AS22(40);
+      int16x8_t v6 = AS22(48);
+      int16x8_t v7 = AS22(56);
+#undef AS22
       vst1q_s16(dst + i, v0);
       vst1q_s16(dst + i + 8, v1);
       vst1q_s16(dst + i + 16, v2);
       vst1q_s16(dst + i + 24, v3);
+      vst1q_s16(dst + i + 32, v4);
+      vst1q_s16(dst + i + 40, v5);
+      vst1q_s16(dst + i + 48, v6);
+      vst1q_s16(dst + i + 56, v7);
     }
   }
 
   [[gnu::hot]] void refresh_kernel(int16_t *dst, const int16_t *const *rows, int n) {
-    for (int i = 0; i < HL; i += 32) { // 4 x 8-lane vectors per tile
+    for (int i = 0; i < HL; i += 64) { // 8 x 8-lane vectors per tile
       int16x8_t v0 = vld1q_s16(g_net.ft_b + i);
       int16x8_t v1 = vld1q_s16(g_net.ft_b + i + 8);
       int16x8_t v2 = vld1q_s16(g_net.ft_b + i + 16);
       int16x8_t v3 = vld1q_s16(g_net.ft_b + i + 24);
+      int16x8_t v4 = vld1q_s16(g_net.ft_b + i + 32);
+      int16x8_t v5 = vld1q_s16(g_net.ft_b + i + 40);
+      int16x8_t v6 = vld1q_s16(g_net.ft_b + i + 48);
+      int16x8_t v7 = vld1q_s16(g_net.ft_b + i + 56);
       for (int k = 0; k < n; ++k) {
         const int16_t *r = rows[k] + i;
         v0               = vaddq_s16(v0, vld1q_s16(r));
         v1               = vaddq_s16(v1, vld1q_s16(r + 8));
         v2               = vaddq_s16(v2, vld1q_s16(r + 16));
         v3               = vaddq_s16(v3, vld1q_s16(r + 24));
+        v4               = vaddq_s16(v4, vld1q_s16(r + 32));
+        v5               = vaddq_s16(v5, vld1q_s16(r + 40));
+        v6               = vaddq_s16(v6, vld1q_s16(r + 48));
+        v7               = vaddq_s16(v7, vld1q_s16(r + 56));
       }
       vst1q_s16(dst + i, v0);
       vst1q_s16(dst + i + 8, v1);
       vst1q_s16(dst + i + 16, v2);
       vst1q_s16(dst + i + 24, v3);
+      vst1q_s16(dst + i + 32, v4);
+      vst1q_s16(dst + i + 40, v5);
+      vst1q_s16(dst + i + 48, v6);
+      vst1q_s16(dst + i + 56, v7);
     }
   }
 
   // In-place diff apply for the refresh cache — see the AVX2 twin above.
   [[gnu::hot]] void apply_rows_kernel(int16_t *acc, const int16_t *const *add, int na, const int16_t *const *sub,
                                       int ns) {
-    for (int i = 0; i < HL; i += 32) { // 4 x 8-lane vectors per tile
+    for (int i = 0; i < HL; i += 64) { // 8 x 8-lane vectors per tile
       int16x8_t v0 = vld1q_s16(acc + i);
       int16x8_t v1 = vld1q_s16(acc + i + 8);
       int16x8_t v2 = vld1q_s16(acc + i + 16);
       int16x8_t v3 = vld1q_s16(acc + i + 24);
+      int16x8_t v4 = vld1q_s16(acc + i + 32);
+      int16x8_t v5 = vld1q_s16(acc + i + 40);
+      int16x8_t v6 = vld1q_s16(acc + i + 48);
+      int16x8_t v7 = vld1q_s16(acc + i + 56);
       for (int k = 0; k < na; ++k) {
         const int16_t *r = add[k] + i;
         v0               = vaddq_s16(v0, vld1q_s16(r));
         v1               = vaddq_s16(v1, vld1q_s16(r + 8));
         v2               = vaddq_s16(v2, vld1q_s16(r + 16));
         v3               = vaddq_s16(v3, vld1q_s16(r + 24));
+        v4               = vaddq_s16(v4, vld1q_s16(r + 32));
+        v5               = vaddq_s16(v5, vld1q_s16(r + 40));
+        v6               = vaddq_s16(v6, vld1q_s16(r + 48));
+        v7               = vaddq_s16(v7, vld1q_s16(r + 56));
       }
       for (int k = 0; k < ns; ++k) {
         const int16_t *r = sub[k] + i;
@@ -280,38 +316,57 @@ namespace {
         v1               = vsubq_s16(v1, vld1q_s16(r + 8));
         v2               = vsubq_s16(v2, vld1q_s16(r + 16));
         v3               = vsubq_s16(v3, vld1q_s16(r + 24));
+        v4               = vsubq_s16(v4, vld1q_s16(r + 32));
+        v5               = vsubq_s16(v5, vld1q_s16(r + 40));
+        v6               = vsubq_s16(v6, vld1q_s16(r + 48));
+        v7               = vsubq_s16(v7, vld1q_s16(r + 56));
       }
       vst1q_s16(acc + i, v0);
       vst1q_s16(acc + i + 8, v1);
       vst1q_s16(acc + i + 16, v2);
       vst1q_s16(acc + i + 24, v3);
+      vst1q_s16(acc + i + 32, v4);
+      vst1q_s16(acc + i + 40, v5);
+      vst1q_s16(acc + i + 48, v6);
+      vst1q_s16(acc + i + 56, v7);
     }
-  }
-
-  [[gnu::pure, gnu::hot]] int32x4_t dot_half(const int16_t *a, const int16_t *w) {
-    const int16x8_t zero = vdupq_n_s16(0);
-    const int16x8_t qa   = vdupq_n_s16(QA);
-    // Four independent accumulators — one per vmlal — so no accumulator takes two chained
-    // multiply-accumulates per iteration (vmlal latency is several cycles; Apple cores have
-    // four SIMD pipes to spread them over). int32 wraparound addition is commutative and
-    // associative, so regrouping the sums is bit-identical.
-    int32x4_t s0 = vdupq_n_s32(0), s1 = vdupq_n_s32(0), s2 = vdupq_n_s32(0), s3 = vdupq_n_s32(0);
-    for (int i = 0; i < HL; i += 16) {
-      int16x8_t v0 = vminq_s16(vmaxq_s16(vld1q_s16(a + i), zero), qa);
-      int16x8_t v1 = vminq_s16(vmaxq_s16(vld1q_s16(a + i + 8), zero), qa);
-      // v*w fits int16 exactly (|w_q| <= 127) — the NEON equivalent of AVX2's mullo+madd.
-      const int16x8_t p0 = vmulq_s16(v0, vld1q_s16(w + i));
-      const int16x8_t p1 = vmulq_s16(v1, vld1q_s16(w + i + 8));
-      s0                 = vmlal_s16(s0, vget_low_s16(v0), vget_low_s16(p0));
-      s1                 = vmlal_high_s16(s1, v0, p0);
-      s2                 = vmlal_s16(s2, vget_low_s16(v1), vget_low_s16(p1));
-      s3                 = vmlal_high_s16(s3, v1, p1);
-    }
-    return vaddq_s32(vaddq_s32(s0, s1), vaddq_s32(s2, s3));
   }
 
   [[gnu::pure, gnu::hot]] int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a, const int16_t *w) {
-    return vaddvq_s32(vaddq_s32(dot_half(stm_a, w), dot_half(opp_a, w + HL)));
+    const int16x8_t zero = vdupq_n_s16(0);
+    const int16x8_t qa   = vdupq_n_s16(QA);
+    const int16_t  *wo   = w + HL; // opponent half of the bucket's weights
+    // Both perspective halves in ONE loop with EIGHT independent accumulators. vmlal has
+    // multi-cycle latency and Apple cores run four SIMD pipes: four chains per half (the old
+    // dot_half) leaves the pipes under-filled between dependent iterations — interleaving the
+    // two halves doubles the independent work in flight and halves loop overhead. Each
+    // accumulator sees exactly the same additions in the same order as before, and the final
+    // reduction keeps the old (s0+s1)+(s2+s3), stm-half + opp-half structure: int32 wraparound
+    // addition makes the whole thing bit-identical to the two-call version.
+    int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0), a2 = vdupq_n_s32(0), a3 = vdupq_n_s32(0);
+    int32x4_t b0 = vdupq_n_s32(0), b1 = vdupq_n_s32(0), b2 = vdupq_n_s32(0), b3 = vdupq_n_s32(0);
+    for (int i = 0; i < HL; i += 16) {
+      int16x8_t v0 = vminq_s16(vmaxq_s16(vld1q_s16(stm_a + i), zero), qa);
+      int16x8_t v1 = vminq_s16(vmaxq_s16(vld1q_s16(stm_a + i + 8), zero), qa);
+      int16x8_t u0 = vminq_s16(vmaxq_s16(vld1q_s16(opp_a + i), zero), qa);
+      int16x8_t u1 = vminq_s16(vmaxq_s16(vld1q_s16(opp_a + i + 8), zero), qa);
+      // v*w fits int16 exactly (|w_q| <= 127) — the NEON equivalent of AVX2's mullo+madd.
+      const int16x8_t p0 = vmulq_s16(v0, vld1q_s16(w + i));
+      const int16x8_t p1 = vmulq_s16(v1, vld1q_s16(w + i + 8));
+      const int16x8_t q0 = vmulq_s16(u0, vld1q_s16(wo + i));
+      const int16x8_t q1 = vmulq_s16(u1, vld1q_s16(wo + i + 8));
+      a0                 = vmlal_s16(a0, vget_low_s16(v0), vget_low_s16(p0));
+      a1                 = vmlal_high_s16(a1, v0, p0);
+      a2                 = vmlal_s16(a2, vget_low_s16(v1), vget_low_s16(p1));
+      a3                 = vmlal_high_s16(a3, v1, p1);
+      b0                 = vmlal_s16(b0, vget_low_s16(u0), vget_low_s16(q0));
+      b1                 = vmlal_high_s16(b1, u0, q0);
+      b2                 = vmlal_s16(b2, vget_low_s16(u1), vget_low_s16(q1));
+      b3                 = vmlal_high_s16(b3, u1, q1);
+    }
+    const int32x4_t stm_sum = vaddq_s32(vaddq_s32(a0, a1), vaddq_s32(a2, a3));
+    const int32x4_t opp_sum = vaddq_s32(vaddq_s32(b0, b1), vaddq_s32(b2, b3));
+    return vaddvq_s32(vaddq_s32(stm_sum, opp_sum));
   }
 
 #else // scalar reference (SIMD off / unknown arch)
