@@ -180,32 +180,62 @@ namespace {
 
 #elif defined(SIMD) && defined(ARCH_ARM_NEON)
 
+  // The add/sub update kernels process a 4-vector (32 int16) tile per iteration — four
+  // independent dependency chains for the four SIMD pipes, and 1/4 the loop-branch overhead.
   [[gnu::hot]] void add1_sub1(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0) {
-    for (int i = 0; i < HL; i += 8) {
-      int16x8_t v = vld1q_s16(src + i);
-      v           = vaddq_s16(v, vld1q_s16(a0 + i));
-      v           = vsubq_s16(v, vld1q_s16(s0 + i));
-      vst1q_s16(dst + i, v);
+    for (int i = 0; i < HL; i += 32) {
+      int16x8_t v0 = vsubq_s16(vaddq_s16(vld1q_s16(src + i), vld1q_s16(a0 + i)), vld1q_s16(s0 + i));
+      int16x8_t v1 = vsubq_s16(vaddq_s16(vld1q_s16(src + i + 8), vld1q_s16(a0 + i + 8)), vld1q_s16(s0 + i + 8));
+      int16x8_t v2 = vsubq_s16(vaddq_s16(vld1q_s16(src + i + 16), vld1q_s16(a0 + i + 16)), vld1q_s16(s0 + i + 16));
+      int16x8_t v3 = vsubq_s16(vaddq_s16(vld1q_s16(src + i + 24), vld1q_s16(a0 + i + 24)), vld1q_s16(s0 + i + 24));
+      vst1q_s16(dst + i, v0);
+      vst1q_s16(dst + i + 8, v1);
+      vst1q_s16(dst + i + 16, v2);
+      vst1q_s16(dst + i + 24, v3);
     }
   }
   [[gnu::hot]] void add1_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0, const int16_t *s1) {
-    for (int i = 0; i < HL; i += 8) {
-      int16x8_t v = vld1q_s16(src + i);
-      v           = vaddq_s16(v, vld1q_s16(a0 + i));
-      v           = vsubq_s16(v, vld1q_s16(s0 + i));
-      v           = vsubq_s16(v, vld1q_s16(s1 + i));
-      vst1q_s16(dst + i, v);
+    for (int i = 0; i < HL; i += 32) {
+      int16x8_t v0 = vsubq_s16(vsubq_s16(vaddq_s16(vld1q_s16(src + i), vld1q_s16(a0 + i)), vld1q_s16(s0 + i)),
+                               vld1q_s16(s1 + i));
+      int16x8_t v1 = vsubq_s16(
+              vsubq_s16(vaddq_s16(vld1q_s16(src + i + 8), vld1q_s16(a0 + i + 8)), vld1q_s16(s0 + i + 8)),
+              vld1q_s16(s1 + i + 8));
+      int16x8_t v2 = vsubq_s16(
+              vsubq_s16(vaddq_s16(vld1q_s16(src + i + 16), vld1q_s16(a0 + i + 16)), vld1q_s16(s0 + i + 16)),
+              vld1q_s16(s1 + i + 16));
+      int16x8_t v3 = vsubq_s16(
+              vsubq_s16(vaddq_s16(vld1q_s16(src + i + 24), vld1q_s16(a0 + i + 24)), vld1q_s16(s0 + i + 24)),
+              vld1q_s16(s1 + i + 24));
+      vst1q_s16(dst + i, v0);
+      vst1q_s16(dst + i + 8, v1);
+      vst1q_s16(dst + i + 16, v2);
+      vst1q_s16(dst + i + 24, v3);
     }
   }
   [[gnu::hot]] void add2_sub2(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *a1, const int16_t *s0,
                  const int16_t *s1) {
-    for (int i = 0; i < HL; i += 8) {
-      int16x8_t v = vld1q_s16(src + i);
-      v           = vaddq_s16(v, vld1q_s16(a0 + i));
-      v           = vaddq_s16(v, vld1q_s16(a1 + i));
-      v           = vsubq_s16(v, vld1q_s16(s0 + i));
-      v           = vsubq_s16(v, vld1q_s16(s1 + i));
-      vst1q_s16(dst + i, v);
+    for (int i = 0; i < HL; i += 32) {
+      int16x8_t v0 = vsubq_s16(vsubq_s16(vaddq_s16(vaddq_s16(vld1q_s16(src + i), vld1q_s16(a0 + i)),
+                                                   vld1q_s16(a1 + i)),
+                                         vld1q_s16(s0 + i)),
+                               vld1q_s16(s1 + i));
+      int16x8_t v1 = vsubq_s16(vsubq_s16(vaddq_s16(vaddq_s16(vld1q_s16(src + i + 8), vld1q_s16(a0 + i + 8)),
+                                                   vld1q_s16(a1 + i + 8)),
+                                         vld1q_s16(s0 + i + 8)),
+                               vld1q_s16(s1 + i + 8));
+      int16x8_t v2 = vsubq_s16(vsubq_s16(vaddq_s16(vaddq_s16(vld1q_s16(src + i + 16), vld1q_s16(a0 + i + 16)),
+                                                   vld1q_s16(a1 + i + 16)),
+                                         vld1q_s16(s0 + i + 16)),
+                               vld1q_s16(s1 + i + 16));
+      int16x8_t v3 = vsubq_s16(vsubq_s16(vaddq_s16(vaddq_s16(vld1q_s16(src + i + 24), vld1q_s16(a0 + i + 24)),
+                                                   vld1q_s16(a1 + i + 24)),
+                                         vld1q_s16(s0 + i + 24)),
+                               vld1q_s16(s1 + i + 24));
+      vst1q_s16(dst + i, v0);
+      vst1q_s16(dst + i + 8, v1);
+      vst1q_s16(dst + i + 16, v2);
+      vst1q_s16(dst + i + 24, v3);
     }
   }
 
@@ -261,7 +291,11 @@ namespace {
   [[gnu::pure, gnu::hot]] int32x4_t dot_half(const int16_t *a, const int16_t *w) {
     const int16x8_t zero = vdupq_n_s16(0);
     const int16x8_t qa   = vdupq_n_s16(QA);
-    int32x4_t       s0 = vdupq_n_s32(0), s1 = vdupq_n_s32(0);
+    // Four independent accumulators — one per vmlal — so no accumulator takes two chained
+    // multiply-accumulates per iteration (vmlal latency is several cycles; Apple cores have
+    // four SIMD pipes to spread them over). int32 wraparound addition is commutative and
+    // associative, so regrouping the sums is bit-identical.
+    int32x4_t s0 = vdupq_n_s32(0), s1 = vdupq_n_s32(0), s2 = vdupq_n_s32(0), s3 = vdupq_n_s32(0);
     for (int i = 0; i < HL; i += 16) {
       int16x8_t v0 = vminq_s16(vmaxq_s16(vld1q_s16(a + i), zero), qa);
       int16x8_t v1 = vminq_s16(vmaxq_s16(vld1q_s16(a + i + 8), zero), qa);
@@ -269,11 +303,11 @@ namespace {
       const int16x8_t p0 = vmulq_s16(v0, vld1q_s16(w + i));
       const int16x8_t p1 = vmulq_s16(v1, vld1q_s16(w + i + 8));
       s0                 = vmlal_s16(s0, vget_low_s16(v0), vget_low_s16(p0));
-      s0                 = vmlal_high_s16(s0, v0, p0);
-      s1                 = vmlal_s16(s1, vget_low_s16(v1), vget_low_s16(p1));
-      s1                 = vmlal_high_s16(s1, v1, p1);
+      s1                 = vmlal_high_s16(s1, v0, p0);
+      s2                 = vmlal_s16(s2, vget_low_s16(v1), vget_low_s16(p1));
+      s3                 = vmlal_high_s16(s3, v1, p1);
     }
-    return vaddq_s32(s0, s1);
+    return vaddq_s32(vaddq_s32(s0, s1), vaddq_s32(s2, s3));
   }
 
   [[gnu::pure, gnu::hot]] int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a, const int16_t *w) {
