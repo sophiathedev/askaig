@@ -149,8 +149,30 @@ public:
     board[from] = NO_PIECE;
   }
 
-  void move_piece(Square from, Square to);
-  void move_piece_quiet(Square from, Square to);
+  // Both piece movers are defined here in the class body (not position.cpp) and force-inlined:
+  // LTO left move_piece() as an out-of-line call inside play<C>'s CAPTURE case (verified in the
+  // disassembly — with argument spills around the call), and captures are the second most common
+  // move type on every search path.
+  [[gnu::always_inline]] inline void move_piece(Square from, Square to) {
+    const Piece moving = board[from];
+    const Piece victim = board[to];
+    hash ^= zobrist::zobrist_table[moving][from] ^ zobrist::zobrist_table[moving][to] ^
+            zobrist::zobrist_table[victim][to];
+    const Bitboard mask = sq_bb(from) | sq_bb(to);
+    piece_bb[moving] ^= mask;
+    piece_bb[victim] &= ~mask;
+    board[to]   = moving;
+    board[from] = NO_PIECE;
+  }
+
+  // Moves a piece to an empty square. Note that it is an error if the <to> square contains a piece
+  [[gnu::always_inline]] inline void move_piece_quiet(Square from, Square to) {
+    const Piece moving = board[from];
+    hash ^= zobrist::zobrist_table[moving][from] ^ zobrist::zobrist_table[moving][to];
+    piece_bb[moving] ^= (sq_bb(from) | sq_bb(to));
+    board[to]   = moving;
+    board[from] = NO_PIECE;
+  }
 
   friend std::ostream &operator<<(std::ostream &os, const Position &p);
   // Parses `fen` into the freshly-constructed `p`. Returns false on a malformed board field
@@ -636,7 +658,9 @@ template<Color Us, bool CAPTURES_ONLY>
       //...and we can play a quiet move to any square which is not occupied
       quiet_mask = ~all;
 
-      if (history[game_ply].epsq != NO_SQUARE) {
+      // An en-passant square only exists right after a double push (~6% of nodes) — keep the
+      // whole block off the straight-line path.
+      if (history[game_ply].epsq != NO_SQUARE) [[unlikely]] {
         // b1 contains our pawns that can perform an e.p. capture
         b2 = pawn_attacks<Them>(history[game_ply].epsq) & bitboard_of(Us, PAWN);
         b1 = b2 & not_pinned;
@@ -807,7 +831,8 @@ template<Color Us, bool CAPTURES_ONLY>
 
   // b1 now contains non-pinned pawns which ARE on the last rank (about to promote)
   b1 = bitboard_of(Us, PAWN) & not_pinned & MASK_RANK[relative_rank<Us>(RANK7)];
-  if (b1) {
+  // Pawns on the 7th are rare in any phase — keep all four promotion emit loops cold.
+  if (b1) [[unlikely]] {
     // Quiet promotions. CAPTURES_ONLY keeps the queen promotion (a quiescence move, the same
     // one the QS picker used to keep from the full list) and drops the underpromotions.
     b2 = shift<relative_dir<Us>(NORTH)>(b1) & quiet_mask;
