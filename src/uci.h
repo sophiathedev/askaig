@@ -4,5 +4,7 @@
 // "quit". Search/evaluation is not implemented yet; the protocol and board-state commands
 // (uci, isready, ucinewgame, position, go perft, d, ...) are fully functional.
 namespace uci {
-  void loop();
+  // `tune` (the `askaig --debug` flag) additionally advertises and accepts the hidden
+  // search-tuning spin options (search::tunables) — used by tools/spsa.py, never in production.
+  void loop(bool tune = false);
 } // namespace uci

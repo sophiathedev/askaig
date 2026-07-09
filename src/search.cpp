@@ -44,13 +44,15 @@ namespace {
   int                g_contempt   = 0; // the "Contempt" UCI option, in centipawns
   Color              g_root_color = WHITE; // side to move at the root of the current think()
 
-  // LMR reduction table, ln(depth)*ln(moves) scaled.
+  // LMR reduction table, ln(depth)*ln(moves) scaled. The two formula constants live in
+  // search::prm x100 (defaults 80/230 = the committed 0.8 and 2.3: N/100.0 is correctly
+  // rounded, so the doubles — and the whole table — are bit-identical to the old literals).
   int  g_lmr[64][64];
   bool g_lmr_init = false;
   void init_lmr() {
     for (int d = 1; d < 64; ++d)
       for (int m = 1; m < 64; ++m)
-        g_lmr[d][m] = int(0.8 + std::log(d) * std::log(m) / 2.3);
+        g_lmr[d][m] = int(prm.LMR_BASE / 100.0 + std::log(d) * std::log(m) / (prm.LMR_DIV / 100.0));
     g_lmr_init = true;
   }
   [[gnu::pure, gnu::always_inline]] inline int lmr_base(int depth, int movecount) {
@@ -119,7 +121,7 @@ namespace {
                                   pos.bitboard_of(WHITE_BISHOP) | pos.bitboard_of(BLACK_BISHOP)) +
                     5 * pop_count(pos.bitboard_of(WHITE_ROOK) | pos.bitboard_of(BLACK_ROOK)) +
                     9 * pop_count(pos.bitboard_of(WHITE_QUEEN) | pos.bitboard_of(BLACK_QUEEN));
-    int raw = t.ev.evaluate(pos) * (736 + 5 * npm) / 1024;
+    int raw = t.ev.evaluate(pos) * (prm.MAT_BASE + prm.MAT_MULT * npm) / 1024;
     raw     = raw * (200 - std::min(pos.fifty(), 100)) / 200;
 
     int corr = g_hist.corr_pawn[c][i_paw] + g_hist.corr_material[c][i_mat] + g_hist.corr_minor[c][i_min] +
@@ -156,7 +158,9 @@ namespace {
     return false;
   }
 
-  [[gnu::const, gnu::always_inline]] inline int hist_bonus(int depth) { return std::min(160 * depth - 80, 2000); }
+  [[gnu::pure, gnu::always_inline]] inline int hist_bonus(int depth) {
+    return std::min(prm.HB_MULT * depth - prm.HB_SUB, prm.HB_MAX);
+  }
 
   [[gnu::pure, gnu::always_inline]] inline int quiet_hist(const Stack *ss, const Position &pos, Move m) {
     const Piece pc = pos.at(m.from());
@@ -252,7 +256,7 @@ namespace {
         return best;
       alpha = std::max(alpha, best);
     }
-    const int futility_base = best + 120;
+    const int futility_base = best + prm.QS_FUT;
 
     const Move ttm = tp.move;
     MovePicker picker(pos, g_hist, ttm, nullptr, Move(), nullptr, nullptr, /*quiescence=*/true);
@@ -372,22 +376,22 @@ namespace {
                            ss->static_eval > (ss - 2)->static_eval;
 
     // --- Internal Iterative Reduction: no TT move at a node that should have one ---
-    if ((PV || cutnode) && depth >= 4 && ttm.to_from() == 0)
+    if ((PV || cutnode) && depth >= prm.IIR_DEPTH && ttm.to_from() == 0)
       --depth;
 
     // --- whole-node pruning (never at PV nodes, in check, or under exclusion) ---
     if (!PV && !in_check && !excluded) {
       // Razoring: the eval is hopelessly below alpha at shallow depth — verify with a
       // quiescence search and trust its fail-low.
-      if (depth <= 4 && ss->static_eval + 300 * depth < alpha) {
+      if (depth <= prm.RAZOR_DEPTH && ss->static_eval + prm.RAZOR_MULT * depth < alpha) {
         const int v = qsearch<false>(t, pos, ss, alpha - 1, alpha, ply);
         if (v < alpha && std::abs(v) < MATE_IN_MAX)
           return v;
       }
 
       // Reverse futility pruning: eval is so far above beta a shallow search won't drop below.
-      if (depth <= 8 && std::abs(beta) < MATE_IN_MAX &&
-          ss->static_eval - 80 * (depth - improving) >= beta)
+      if (depth <= prm.RFP_DEPTH && std::abs(beta) < MATE_IN_MAX &&
+          ss->static_eval - prm.RFP_MULT * (depth - improving) >= beta)
         return ss->static_eval;
 
       // Null move pruning: hand the opponent a free move; a fail-high still above beta means
@@ -395,9 +399,9 @@ namespace {
       const Color    us       = pos.turn();
       const Bitboard non_pawn = pos.bitboard_of(us, KNIGHT) | pos.bitboard_of(us, BISHOP) |
                                 pos.bitboard_of(us, ROOK) | pos.bitboard_of(us, QUEEN);
-      if (depth >= 3 && ss->static_eval >= beta && non_pawn && (ss - 1)->move.to_from() != 0 &&
+      if (depth >= prm.NMP_DEPTH && ss->static_eval >= beta && non_pawn && (ss - 1)->move.to_from() != 0 &&
           beta > -MATE_IN_MAX) {
-        const int R = 3 + depth / 3 + std::min((ss->static_eval - beta) / 200, 3);
+        const int R = prm.NMP_BASE + depth / prm.NMP_DDIV + std::min((ss->static_eval - beta) / prm.NMP_EDIV, prm.NMP_ECAP);
         ss->move    = Move();
         ss->ch      = nullptr;
         t.ev.push_null();
@@ -411,7 +415,7 @@ namespace {
         if (v >= beta) {
           // High-depth fail-highs are verified with a reduced null-less search before being
           // trusted — the zugzwang guard above only covers the crudest cases.
-          if (depth >= 12 && std::abs(v) < MATE_IN_MAX) {
+          if (depth >= prm.NMP_VDEPTH && std::abs(v) < MATE_IN_MAX) {
             const int w = negamax<false>(t, pos, ss, beta - 1, beta, depth - R, ply, cutnode);
             if (stopped()) [[unlikely]]
               return 0;
@@ -424,8 +428,8 @@ namespace {
 
       // ProbCut: a good capture that beats beta by a margin at reduced depth almost certainly
       // produces a full-depth beta cutoff too. Skipped when the TT already says otherwise.
-      const int pc_beta = beta + 180 - 60 * improving;
-      if (depth >= 5 && std::abs(beta) < MATE_IN_MAX &&
+      const int pc_beta = beta + prm.PC_MARGIN - prm.PC_IMP * improving;
+      if (depth >= prm.PC_DEPTH && std::abs(beta) < MATE_IN_MAX &&
           !(tp.hit && tp.depth >= depth - 3 && ttsc != tt::VALUE_NONE_TT && ttsc < pc_beta)) {
         MovePicker pcpick(pos, g_hist, ttm.is_capture() ? ttm : Move(), nullptr, Move(), nullptr, nullptr,
                           /*quiescence=*/true);
@@ -464,7 +468,7 @@ namespace {
       return in_check ? -MATE + ply : 0; // checkmate / stalemate
     }
 
-    const int lmp_limit = (3 + depth * depth) / (2 - improving);
+    const int lmp_limit = (prm.LMP_BASE + depth * depth) / (2 - improving);
 
     Move best_move{};
     int  best       = -INF;
@@ -484,35 +488,36 @@ namespace {
       if (!root && best > -MATE_IN_MAX) {
         if (quiet && !in_check) {
           // Late move pruning: beyond this move count, quiets almost never rescue the node.
-          if (depth <= 8 && quiet_count >= lmp_limit)
+          if (depth <= prm.LMP_DEPTH && quiet_count >= lmp_limit)
             continue;
           // Futility pruning: eval + margin can't reach alpha -> skip quiets.
-          if (depth <= 6 && std::abs(alpha) < MATE_IN_MAX &&
-              ss->static_eval + 100 + 120 * depth <= alpha)
+          if (depth <= prm.FUT_DEPTH && std::abs(alpha) < MATE_IN_MAX &&
+              ss->static_eval + prm.FUT_BASE + prm.FUT_MULT * depth <= alpha)
             continue;
           // History pruning: consistently bad quiets die early at shallow depth.
-          if (depth <= 4 && quiet_hist(ss, pos, m) < -2048 * depth)
+          if (depth <= prm.HP_DEPTH && quiet_hist(ss, pos, m) < -prm.HP_MULT * depth)
             continue;
         }
         // SEE pruning, depth-scaled thresholds. A winning-band capture already passed
         // see_ge(m, 0), which implies any negative threshold — skip the call.
-        if (depth <= 8 && picker.yielded_see() != MovePicker::SEE_WINNING &&
-            !see_ge(pos, m, quiet ? -50 * depth : -90 * depth))
+        if (depth <= prm.SEEP_DEPTH && picker.yielded_see() != MovePicker::SEE_WINNING &&
+            !see_ge(pos, m, quiet ? -prm.SEEP_QUIET * depth : -prm.SEEP_CAPT * depth))
           continue;
       }
 
       // --- singular extension / multicut on the TT move ---
       int extension = 0;
-      if (!root && !excluded && depth >= 8 && m.to_from() == ttm.to_from() && tp.depth >= depth - 3 &&
-          (tp.bound & tt::LOWER) && std::abs(ttsc) < MATE_IN_MAX && ply < 2 * t.root_depth) {
-        const int s_beta = ttsc - 2 * depth;
+      if (!root && !excluded && depth >= prm.SE_DEPTH && m.to_from() == ttm.to_from() &&
+          tp.depth >= depth - prm.SE_TTSUB && (tp.bound & tt::LOWER) && std::abs(ttsc) < MATE_IN_MAX &&
+          ply < 2 * t.root_depth) {
+        const int s_beta = ttsc - prm.SE_BMULT * depth;
         ss->excluded     = m;
         const int v      = negamax<false>(t, pos, ss, s_beta - 1, s_beta, (depth - 1) / 2, ply, cutnode);
         ss->excluded     = Move();
         if (v < s_beta) {
           extension = 1; // the TT move is singular: nothing else comes close -> look deeper
-          if (!PV && v < s_beta - 25 && ss->double_ext < 6) {
-            extension = 2 + (quiet && v < s_beta - 100); // double (rarely triple) extension
+          if (!PV && v < s_beta - prm.SE_DBL && ss->double_ext < prm.SE_DBLMAX) {
+            extension = 2 + (quiet && v < s_beta - prm.SE_TRI); // double (rarely triple) extension
             ++ss->double_ext;
           }
         } else if (v >= beta && std::abs(v) < MATE_IN_MAX)
@@ -538,7 +543,7 @@ namespace {
       int       v         = -INF;
 
       // --- LMR + PVS ---
-      if (depth >= 3 && move_count > 1 + 2 * PV && (quiet || move_count > 6)) {
+      if (depth >= 3 && move_count > 1 + 2 * PV && (quiet || move_count > prm.LMR_TACT_MC)) {
         int r = lmr_base(depth, move_count);
         r += cutnode;
         r += !improving;
@@ -554,8 +559,9 @@ namespace {
         if (v > alpha && r > 0) {
           // Reduced search beat alpha: re-search at a depth picked by how convincingly it did
           // (well past best -> one deeper to confirm; barely past alpha -> one shallower).
-          const int confirm_depth =
-                  std::clamp(new_depth + int(v > best + 40) - int(v < best + 15), 1, new_depth + 1);
+          const int confirm_depth = std::clamp(new_depth + int(v > best + prm.LMR_CONF_HI) -
+                                                       int(v < best + prm.LMR_CONF_LO),
+                                               1, new_depth + 1);
           v = -negamax<false>(t, pos, ss + 1, -alpha - 1, -alpha, confirm_depth, ply + 1, !cutnode);
         }
       } else if (!PV || move_count > 1)
@@ -635,7 +641,7 @@ namespace {
   // `t` — the main thread from think(), or a helper from smp_worker_iterate.
   int aspiration(ThreadData &t, Position &pos, int depth, int prev) {
     Stack *ss    = t.stack + 4;
-    int    delta = 14;
+    int    delta = prm.ASP_DELTA;
     int    alpha = -INF, beta = INF;
     if (depth >= 4) {
       alpha = std::max(prev - delta, -INF);
@@ -672,6 +678,46 @@ void search::smp_worker_iterate(ThreadData &t, Position &pos, int max_depth, int
     prev = v;
   }
 }
+
+// The live parameter set (defaults = the committed constants; see search.h).
+search::Params search::prm;
+
+// Registration table for the UCI layer: one spin option per field, bounds wide enough for a
+// blind SPSA sweep but never degenerate (every divisor's floor stays >= 2... >= 80 where it
+// divides an eval difference). Order is stable — tools/apply_spsa.py output maps back by name.
+const std::vector<search::ParamInfo> &search::tunables() {
+  static const std::vector<ParamInfo> t = {
+          {"LMR_BASE", &prm.LMR_BASE, 80, 30, 150},    {"LMR_DIV", &prm.LMR_DIV, 230, 140, 360},
+          {"LMR_TACT_MC", &prm.LMR_TACT_MC, 6, 2, 12}, {"LMR_CONF_HI", &prm.LMR_CONF_HI, 40, 10, 90},
+          {"LMR_CONF_LO", &prm.LMR_CONF_LO, 15, 2, 45},
+          {"MAT_BASE", &prm.MAT_BASE, 736, 550, 950},  {"MAT_MULT", &prm.MAT_MULT, 5, 1, 10},
+          {"HB_MULT", &prm.HB_MULT, 160, 60, 320},     {"HB_SUB", &prm.HB_SUB, 80, 0, 250},
+          {"HB_MAX", &prm.HB_MAX, 2000, 800, 4000},
+          {"QS_FUT", &prm.QS_FUT, 120, 40, 260},
+          {"IIR_DEPTH", &prm.IIR_DEPTH, 4, 2, 8},
+          {"RAZOR_DEPTH", &prm.RAZOR_DEPTH, 4, 2, 7},  {"RAZOR_MULT", &prm.RAZOR_MULT, 300, 120, 560},
+          {"RFP_DEPTH", &prm.RFP_DEPTH, 8, 4, 12},     {"RFP_MULT", &prm.RFP_MULT, 80, 30, 160},
+          {"NMP_DEPTH", &prm.NMP_DEPTH, 3, 2, 6},      {"NMP_BASE", &prm.NMP_BASE, 3, 2, 6},
+          {"NMP_DDIV", &prm.NMP_DDIV, 3, 2, 8},        {"NMP_EDIV", &prm.NMP_EDIV, 200, 80, 400},
+          {"NMP_ECAP", &prm.NMP_ECAP, 3, 1, 7},        {"NMP_VDEPTH", &prm.NMP_VDEPTH, 12, 7, 18},
+          {"PC_MARGIN", &prm.PC_MARGIN, 180, 70, 350}, {"PC_IMP", &prm.PC_IMP, 60, 0, 140},
+          {"PC_DEPTH", &prm.PC_DEPTH, 5, 3, 8},
+          {"LMP_BASE", &prm.LMP_BASE, 3, 1, 8},        {"LMP_DEPTH", &prm.LMP_DEPTH, 8, 4, 12},
+          {"FUT_DEPTH", &prm.FUT_DEPTH, 6, 3, 10},     {"FUT_BASE", &prm.FUT_BASE, 100, 20, 250},
+          {"FUT_MULT", &prm.FUT_MULT, 120, 50, 240},
+          {"HP_DEPTH", &prm.HP_DEPTH, 4, 2, 8},        {"HP_MULT", &prm.HP_MULT, 2048, 700, 4500},
+          {"SEEP_DEPTH", &prm.SEEP_DEPTH, 8, 4, 12},   {"SEEP_QUIET", &prm.SEEP_QUIET, 50, 15, 110},
+          {"SEEP_CAPT", &prm.SEEP_CAPT, 90, 30, 180},
+          {"SE_DEPTH", &prm.SE_DEPTH, 8, 5, 12},       {"SE_TTSUB", &prm.SE_TTSUB, 3, 1, 6},
+          {"SE_BMULT", &prm.SE_BMULT, 2, 1, 5},        {"SE_DBL", &prm.SE_DBL, 25, 8, 70},
+          {"SE_TRI", &prm.SE_TRI, 100, 40, 220},       {"SE_DBLMAX", &prm.SE_DBLMAX, 6, 2, 12},
+          {"ASP_DELTA", &prm.ASP_DELTA, 14, 6, 35},
+  };
+  return t;
+}
+
+// A parameter write may invalidate the derived LMR grid; rebuild it lazily at the next think().
+void search::params_dirty() { g_lmr_init = false; }
 
 void search::request_stop() { g_stop.store(true, std::memory_order_relaxed); }
 

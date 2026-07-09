@@ -1138,7 +1138,7 @@ namespace {
 
 } // namespace
 
-void uci::loop() {
+void uci::loop(bool tune) {
   std::optional<Position> pos;
   pos.emplace();
   Position::set(DEFAULT_FEN, *pos);
@@ -1156,6 +1156,10 @@ void uci::loop() {
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
       std::cout << "option name Contempt type spin default 0 min -100 max 100\n"; // cp cost of a draw
       std::cout << "option name EvalFile type string default <embedded>\n";
+      if (tune) // hidden search-tuning knobs, only under --debug (tools/spsa.py discovers these)
+        for (const auto &p: search::tunables())
+          std::cout << "option name " << p.name << " type spin default " << p.def << " min " << p.lo << " max "
+                    << p.hi << "\n";
       std::cout << "uciok\n";
     } else if (cmd == "isready") {
       // Must answer even mid-search, so this never touches engine state.
@@ -1224,6 +1228,17 @@ void uci::loop() {
                     << "), keeping the current net\n";
         else
           std::cout << "info string EvalFile loaded: " << path << "\n";
+      } else if (tune) {
+        // Search-tuning knobs (only settable under --debug, matching their advertisement).
+        for (const auto &p: search::tunables())
+          if (name == p.name) {
+            int v = 0;
+            if (is >> v) {
+              *p.p = std::clamp(v, p.lo, p.hi);
+              search::params_dirty(); // the LMR grid may depend on what changed
+            }
+            break;
+          }
       }
       // (unknown options: silently ignored, per the UCI spec)
     } else if (cmd == "bench") {
