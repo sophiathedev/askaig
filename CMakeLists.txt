@@ -71,7 +71,9 @@ if(SIMD)
     message(STATUS "SIMD enabled, ARCH=${ARCH}")
 endif()
 
-target_compile_options(askaig PRIVATE -flto)
+# -funroll-loops: measured +0.5% perft nps on Apple M3 (A/B, 4/4 pairs) — the movegen emit
+# loops and NNUE walks benefit from the extra unrolling; behaviour-identical, bench-neutral.
+target_compile_options(askaig PRIVATE -flto -funroll-loops)
 target_link_options(askaig PRIVATE -flto)
 
 # Profile-guided optimization (two-stage; drive it with the pgo-generate / pgo-use presets, or

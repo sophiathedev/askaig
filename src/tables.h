@@ -98,6 +98,19 @@ constexpr Bitboard pawn_attacks(Bitboard p) {
   return C == WHITE ? shift<NORTH_WEST>(p) | shift<NORTH_EAST>(p) : shift<SOUTH_WEST>(p) | shift<SOUTH_EAST>(p);
 }
 
+// Attacks of ALL knights in `b` at once (the classic setwise knight fill, CPW): a pure
+// shift/mask ALU tree — no per-knight table load, no loop whose trip count (0..2 knights,
+// varying node to node) the branch predictor must guess.
+constexpr Bitboard knight_attacks(Bitboard b) {
+  const Bitboard l1 = (b >> 1) & 0x7f7f7f7f7f7f7f7f;
+  const Bitboard l2 = (b >> 2) & 0x3f3f3f3f3f3f3f3f;
+  const Bitboard r1 = (b << 1) & 0xfefefefefefefefe;
+  const Bitboard r2 = (b << 2) & 0xfcfcfcfcfcfcfcfc;
+  const Bitboard h1 = l1 | r1;
+  const Bitboard h2 = l2 | r2;
+  return (h1 << 16) | (h1 >> 16) | (h2 << 8) | (h2 >> 8);
+}
+
 // Returns a bitboard containing pawn attacks from the pawn on the given square
 template<Color C>
 constexpr Bitboard pawn_attacks(Square s) {

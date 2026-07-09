@@ -130,6 +130,25 @@ public:
     board[s] = NO_PIECE;
   }
 
+  // Hash-free piece movers, for undo() only: the pre-move hash is restored wholesale from
+  // history[] (play()/set() recorded it there), so re-XORing zobrist keys piece-by-piece while
+  // un-moving would be dead work — these skip the zobrist table entirely.
+  inline void put_piece_nohash(Piece pc, Square s) {
+    board[s] = pc;
+    piece_bb[pc] |= sq_bb(s);
+  }
+
+  inline void remove_piece_nohash(Square s) {
+    piece_bb[board[s]] &= ~sq_bb(s);
+    board[s] = NO_PIECE;
+  }
+
+  inline void move_piece_quiet_nohash(Square from, Square to) {
+    piece_bb[board[from]] ^= (sq_bb(from) | sq_bb(to));
+    board[to]   = board[from];
+    board[from] = NO_PIECE;
+  }
+
   void move_piece(Square from, Square to);
   void move_piece_quiet(Square from, Square to);
 
@@ -391,57 +410,61 @@ template<Color C>
   MoveFlags type = m.flags();
   // Same common-path peel as play(): QUIET (0) and DOUBLE_PUSH (1) both just move the piece
   // back, and together they dominate — one predictable branch instead of the indirect jump.
+  // All piece movers are the _nohash variants: the hash is restored in one load at the end.
   if (type <= DOUBLE_PUSH) [[likely]] {
-    move_piece_quiet(m.to(), m.from());
+    move_piece_quiet_nohash(m.to(), m.from());
   } else switch (type) {
     case OO:
       if (C == WHITE) {
-        move_piece_quiet(g1, e1);
-        move_piece_quiet(f1, h1);
+        move_piece_quiet_nohash(g1, e1);
+        move_piece_quiet_nohash(f1, h1);
       } else {
-        move_piece_quiet(g8, e8);
-        move_piece_quiet(f8, h8);
+        move_piece_quiet_nohash(g8, e8);
+        move_piece_quiet_nohash(f8, h8);
       }
       break;
     case OOO:
       if (C == WHITE) {
-        move_piece_quiet(c1, e1);
-        move_piece_quiet(d1, a1);
+        move_piece_quiet_nohash(c1, e1);
+        move_piece_quiet_nohash(d1, a1);
       } else {
-        move_piece_quiet(c8, e8);
-        move_piece_quiet(d8, a8);
+        move_piece_quiet_nohash(c8, e8);
+        move_piece_quiet_nohash(d8, a8);
       }
       break;
     case EN_PASSANT:
-      move_piece_quiet(m.to(), m.from());
-      put_piece(make_piece(~C, PAWN), m.to() + relative_dir<C>(SOUTH));
+      move_piece_quiet_nohash(m.to(), m.from());
+      put_piece_nohash(make_piece(~C, PAWN), m.to() + relative_dir<C>(SOUTH));
       break;
     case PR_KNIGHT:
     case PR_BISHOP:
     case PR_ROOK:
     case PR_QUEEN:
-      remove_piece(m.to());
-      put_piece(make_piece(C, PAWN), m.from());
+      remove_piece_nohash(m.to());
+      put_piece_nohash(make_piece(C, PAWN), m.from());
       break;
     case PC_KNIGHT:
     case PC_BISHOP:
     case PC_ROOK:
     case PC_QUEEN:
-      remove_piece(m.to());
-      put_piece(make_piece(C, PAWN), m.from());
-      put_piece(history[game_ply].captured, m.to());
+      remove_piece_nohash(m.to());
+      put_piece_nohash(make_piece(C, PAWN), m.from());
+      put_piece_nohash(history[game_ply].captured, m.to());
       break;
     case CAPTURE:
-      move_piece_quiet(m.to(), m.from());
-      put_piece(history[game_ply].captured, m.to());
+      move_piece_quiet_nohash(m.to(), m.from());
+      put_piece_nohash(history[game_ply].captured, m.to());
       break;
     default: // QUIET/DOUBLE_PUSH: excluded by the if/else above, never reaches here
       __builtin_unreachable();
   }
 
   side_to_play = ~side_to_play;
-  hash ^= zobrist::zobrist_side;
   --game_ply;
+  // The zobrist hash of the position being returned to, recorded when it was first reached
+  // (play/play_null/set all store it). One load replaces the per-piece zobrist XOR chain AND
+  // the side-to-move toggle.
+  hash = history[game_ply].hash;
 }
 
 
@@ -468,12 +491,10 @@ template<Color Us, bool CAPTURES_ONLY>
   // Squares that our king cannot move to
   Bitboard danger = 0;
 
-  // For each enemy piece, add all of its attacks to the danger bitboard
-  danger |= pawn_attacks<Them>(bitboard_of(Them, PAWN)) | attacks<KING>(their_king, all);
-
-  b1 = bitboard_of(Them, KNIGHT);
-  while (b1)
-    danger |= attacks<KNIGHT>(pop_lsb(&b1), all);
+  // For each enemy piece, add all of its attacks to the danger bitboard. Pawns and knights are
+  // added setwise (one shift/mask tree covers every piece at once) — no per-piece loop.
+  danger |= pawn_attacks<Them>(bitboard_of(Them, PAWN)) | attacks<KING>(their_king, all) |
+            knight_attacks(bitboard_of(Them, KNIGHT));
 
   // all ^ sq_bb(our_king) prevents the king from moving to squares which are 'x-rayed'
   // by enemy sliders (the king does not block the ray it is standing on)
@@ -505,31 +526,49 @@ template<Color Us, bool CAPTURES_ONLY>
   // A general purpose square for storing destinations, etc.
   Square s;
 
-  // Checkers of each piece type are identified by:
-  // 1. Projecting attacks FROM the king square
-  // 2. Intersecting this bitboard with the enemy bitboard of that piece type
-  checkers = (attacks<KNIGHT>(our_king, all) & bitboard_of(Them, KNIGHT)) |
-             (pawn_attacks<Us>(our_king) & bitboard_of(Them, PAWN));
-
-  // Here, we identify slider checkers and pinners simultaneously, and candidates for such pinners
-  // and checkers are represented by the bitboard <candidates>
+  // Candidate slider checkers/pinners: enemy sliders seen from the king with only ENEMY pieces
+  // as occupancy, so the ray continues through our own men (a candidate is then classified as a
+  // checker — no blocker — or a pinner — exactly one of ours between). Needed on both paths below.
   Bitboard candidates = (attacks<ROOK>(our_king, them_bb) & their_orth_sliders) |
                         (attacks<BISHOP>(our_king, them_bb) & their_diag_sliders);
 
   pinned = 0;
-  while (candidates) {
-    s  = pop_lsb(&candidates);
-    b1 = SQUARES_BETWEEN_BB[our_king][s] & us_bb;
+  // `danger` was built from EVERY enemy piece with the king removed from the occupancy, so
+  // "our king square is in danger" is EXACTLY "we are in check" — one AND against the bitboard
+  // already in hand. The common not-in-check path then skips the knight/pawn checker probes
+  // entirely, and its candidates loop drops the checker case (a candidate with no blocker would
+  // mean a slider attacks the king, contradicting not-in-check).
+  if (!(danger & sq_bb(our_king))) [[likely]] {
+    checkers = 0;
+    while (candidates) {
+      s  = pop_lsb(&candidates);
+      b1 = SQUARES_BETWEEN_BB[our_king][s] & us_bb; // non-empty here: no blocker would be a check
+      // Exactly one of our pieces between slider and king pins it. `b1 & (b1 - 1)` clears the
+      // lowest bit: nothing left means exactly one bit — a two-op GPR test instead of a popcount
+      // (which detours through the vector unit on ARM).
+      if (!(b1 & (b1 - 1)))
+        pinned ^= b1;
+    }
+  } else {
+    // In check. Checkers of each piece type are identified by:
+    // 1. Projecting attacks FROM the king square
+    // 2. Intersecting this bitboard with the enemy bitboard of that piece type
+    checkers = (attacks<KNIGHT>(our_king, all) & bitboard_of(Them, KNIGHT)) |
+               (pawn_attacks<Us>(our_king) & bitboard_of(Them, PAWN));
 
-    // Do the squares in between the enemy slider and our king contain any of our pieces?
-    // If not, add the slider to the checker bitboard
-    if (b1 == 0)
-      checkers ^= sq_bb(s);
-    // If there is only one of our pieces between them, add our piece to the pinned bitboard.
-    // b1 is non-zero here, so clearing its lowest bit leaving nothing means exactly one bit —
-    // a two-op GPR test instead of a popcount (which detours through the vector unit on ARM).
-    else if (!(b1 & (b1 - 1)))
-      pinned ^= b1;
+    while (candidates) {
+      s  = pop_lsb(&candidates);
+      b1 = SQUARES_BETWEEN_BB[our_king][s] & us_bb;
+
+      // Do the squares in between the enemy slider and our king contain any of our pieces?
+      // If not, add the slider to the checker bitboard
+      if (b1 == 0)
+        checkers ^= sq_bb(s);
+      // If there is only one of our pieces between them, add our piece to the pinned bitboard
+      // (same two-op exactly-one-bit test as above).
+      else if (!(b1 & (b1 - 1)))
+        pinned ^= b1;
+    }
   }
 
   // This makes it easier to mask pieces
@@ -639,16 +678,23 @@ template<Color Us, bool CAPTURES_ONLY>
       // 1. The king and the rook have both not moved
       // 2. No piece is attacking between the the rook and the king
       // 3. The king is not in check
+      // Emitted branchlessly: the move is a compile-time constant, so it is stored
+      // unconditionally and the pointer advances by the condition (0 or 1) — no data-dependent
+      // branch. The speculative store is always in-bounds: only king moves and en-passant
+      // (≤10 moves) precede it in the 218-slot list.
       if constexpr (!CAPTURES_ONLY) {
-        if (!((history[game_ply].entry & oo_mask<Us>()) | ((all | danger) & oo_blockers_mask<Us>())))
-          *list++ = Us == WHITE ? Move(e1, h1, OO) : Move(e8, h8, OO);
-        if (!((history[game_ply].entry & ooo_mask<Us>()) |
-              ((all | (danger & ~ignore_ooo_danger<Us>())) & ooo_blockers_mask<Us>())))
-          *list++ = Us == WHITE ? Move(e1, c1, OOO) : Move(e8, c8, OOO);
+        *list = Us == WHITE ? Move(e1, h1, OO) : Move(e8, h8, OO);
+        list += !((history[game_ply].entry & oo_mask<Us>()) | ((all | danger) & oo_blockers_mask<Us>()));
+        *list = Us == WHITE ? Move(e1, c1, OOO) : Move(e8, c8, OOO);
+        list += !((history[game_ply].entry & ooo_mask<Us>()) |
+                  ((all | (danger & ~ignore_ooo_danger<Us>())) & ooo_blockers_mask<Us>()));
       }
 
-      // For each pinned rook, bishop or queen...
-      b1 = ~(not_pinned | bitboard_of(Us, KNIGHT));
+      // For each pinned rook, bishop or queen... Pawns are excluded explicitly: they have their
+      // own pinned loop below, and iterating them here only worked by accident (the runtime
+      // attacks() falls through to PSEUDO_LEGAL_ATTACKS[PAWN], which is all-zeros) — each pinned
+      // pawn cost a wasted loop iteration emitting nothing.
+      b1 = pinned & ~(bitboard_of(Us, KNIGHT) | bitboard_of(Us, PAWN));
       while (b1) {
         s = pop_lsb(&b1);
 
