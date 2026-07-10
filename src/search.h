@@ -91,6 +91,9 @@ namespace search {
     int SE_DEPTH = 8, SE_TTSUB = 3, SE_BMULT = 2, SE_DBL = 25, SE_TRI = 100, SE_DBLMAX = 6;
     // aspiration window half-width
     int ASP_DELTA = 14;
+    // correction-dispersion pruning guards (weights on Stack::eval_unc, applied as W*unc/1024):
+    // razoring / reverse-futility / futility margins widen where the correction tables disagree
+    int RAZOR_UNC = 8, RFP_UNC = 8, FUT_UNC = 8;
   };
   extern Params prm;
 

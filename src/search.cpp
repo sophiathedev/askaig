@@ -107,7 +107,7 @@ namespace {
   // keys are computed first and prefetched so the line fills overlap the accumulator
   // walk-back + output dot. The damped value is what lands in the TT eval field, carrying
   // the storing node's halfmove clock (accepted imprecision).
-  [[gnu::hot, nodiscard]] int evaluate(ThreadData &t, const Position &pos, const Stack *ss) {
+  [[gnu::hot, nodiscard]] int evaluate(ThreadData &t, const Position &pos, Stack *ss) {
     const Color  c     = pos.turn();
     const size_t i_paw = pawn_corr_index(pos), i_mat = material_corr_index(pos);
     const size_t i_min = minor_corr_index(pos), i_maj = major_corr_index(pos);
@@ -124,10 +124,22 @@ namespace {
     int raw = t.ev.evaluate(pos) * (prm.MAT_BASE + prm.MAT_MULT * npm) / 1024;
     raw     = raw * (200 - std::min(pos.fifty(), 100)) / 200;
 
-    int corr = g_hist.corr_pawn[c][i_paw] + g_hist.corr_material[c][i_mat] + g_hist.corr_minor[c][i_min] +
-               g_hist.corr_major[c][i_maj];
-    if ((ss - 1)->move.to_from() != 0)
-      corr += g_hist.corr_cont[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()];
+    const int c1 = g_hist.corr_pawn[c][i_paw], c2 = g_hist.corr_material[c][i_mat];
+    const int c3 = g_hist.corr_minor[c][i_min], c4 = g_hist.corr_major[c][i_maj];
+    int corr = c1 + c2 + c3 + c4;
+    int mass = std::abs(c1) + std::abs(c2) + std::abs(c3) + std::abs(c4);
+    if ((ss - 1)->move.to_from() != 0) {
+      const int c5 = g_hist.corr_cont[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()];
+      corr += c5;
+      mass += std::abs(c5);
+    }
+    // Correction dispersion: the tables are independent estimators of the same eval error, so
+    // the SUM measures (and corrects) the bias while the CANCELLED mass — |c_i| that net out
+    // against each other — measures how much they disagree, i.e. the residual variance the
+    // correction cannot fix. The eval-trusting prunings widen their margins by this (raw
+    // scale; consumers divide), so positions whose class is genuinely ambiguous prune less
+    // while well-understood ones keep the tuned margins.
+    ss->eval_unc = mass - std::abs(corr);
     return std::clamp(raw + corr / 256, -MATE_IN_MAX + 1, MATE_IN_MAX - 1);
   }
 
@@ -361,6 +373,7 @@ namespace {
 
     // --- static eval + improving ---
     int raw_eval = tt::VALUE_NONE_TT;
+    ss->eval_unc = 0; // stays 0 when the eval comes from the TT (or in check): prunings behave as before
     if (in_check)
       ss->static_eval = tt::VALUE_NONE_TT;
     else {
@@ -382,16 +395,19 @@ namespace {
     // --- whole-node pruning (never at PV nodes, in check, or under exclusion) ---
     if (!PV && !in_check && !excluded) {
       // Razoring: the eval is hopelessly below alpha at shallow depth — verify with a
-      // quiescence search and trust its fail-low.
-      if (depth <= prm.RAZOR_DEPTH && ss->static_eval + prm.RAZOR_MULT * depth < alpha) {
+      // quiescence search and trust its fail-low. Correction dispersion widens the required
+      // deficit: an eval whose class the correction tables disagree on is not "hopeless" yet.
+      if (depth <= prm.RAZOR_DEPTH &&
+          ss->static_eval + prm.RAZOR_MULT * depth + prm.RAZOR_UNC * ss->eval_unc / 1024 < alpha) {
         const int v = qsearch<false>(t, pos, ss, alpha - 1, alpha, ply);
         if (v < alpha && std::abs(v) < MATE_IN_MAX)
           return v;
       }
 
       // Reverse futility pruning: eval is so far above beta a shallow search won't drop below.
+      // Same dispersion guard: an uncertain eval must clear beta by that much more.
       if (depth <= prm.RFP_DEPTH && std::abs(beta) < MATE_IN_MAX &&
-          ss->static_eval - prm.RFP_MULT * (depth - improving) >= beta)
+          ss->static_eval - prm.RFP_MULT * (depth - improving) - prm.RFP_UNC * ss->eval_unc / 1024 >= beta)
         return ss->static_eval;
 
       // Null move pruning: hand the opponent a free move; a fail-high still above beta means
@@ -490,9 +506,10 @@ namespace {
           // Late move pruning: beyond this move count, quiets almost never rescue the node.
           if (depth <= prm.LMP_DEPTH && quiet_count >= lmp_limit)
             continue;
-          // Futility pruning: eval + margin can't reach alpha -> skip quiets.
+          // Futility pruning: eval + margin can't reach alpha -> skip quiets. The correction
+          // dispersion joins the margin: uncertain evals must look worse before quiets die.
           if (depth <= prm.FUT_DEPTH && std::abs(alpha) < MATE_IN_MAX &&
-              ss->static_eval + prm.FUT_BASE + prm.FUT_MULT * depth <= alpha)
+              ss->static_eval + prm.FUT_BASE + prm.FUT_MULT * depth + prm.FUT_UNC * ss->eval_unc / 1024 <= alpha)
             continue;
           // History pruning: consistently bad quiets die early at shallow depth.
           if (depth <= prm.HP_DEPTH && quiet_hist(ss, pos, m) < -prm.HP_MULT * depth)
@@ -712,6 +729,8 @@ const std::vector<search::ParamInfo> &search::tunables() {
           {"SE_BMULT", &prm.SE_BMULT, 2, 1, 5},        {"SE_DBL", &prm.SE_DBL, 25, 8, 70},
           {"SE_TRI", &prm.SE_TRI, 100, 40, 220},       {"SE_DBLMAX", &prm.SE_DBLMAX, 6, 2, 12},
           {"ASP_DELTA", &prm.ASP_DELTA, 14, 6, 35},
+          {"RAZOR_UNC", &prm.RAZOR_UNC, 8, 0, 64},     {"RFP_UNC", &prm.RFP_UNC, 8, 0, 64},
+          {"FUT_UNC", &prm.FUT_UNC, 8, 0, 64},
   };
   return t;
 }

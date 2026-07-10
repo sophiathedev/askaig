@@ -34,6 +34,10 @@ namespace search {
     Move       move; // move made AT this ply (null move: to_from() == 0 with ch == nullptr)
     Move       excluded; // move excluded by a singular-verification search
     int        static_eval;
+    // Correction-dispersion of the static eval: how much the independent correction-history
+    // tables DISAGREED at this node (0 when the eval came from the TT — conservative: the
+    // uncertainty-widened prunings then behave exactly as before). See evaluate().
+    int        eval_unc;
     ContTable *ch; // continuation-history slice of `move`
     int        double_ext; // double-extension budget spent on this path
     bool       in_check;
