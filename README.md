@@ -21,6 +21,37 @@ generation is ported from [nkarve/surge](https://github.com/nkarve/surge) (MIT);
   [`tools/nnue/`](tools/nnue/README.md).
 - **Lazy SMP** parallel search sharing a lockless transposition table.
 
+## File Structure
+
+```text
+askaig/
+├── cmake/                  # CMake auxiliary scripts
+│   └── embed_file.cmake    # Embeds the neural network weights file directly into the binary
+├── networks/               # Neural network weights
+│   └── default.nnue        # Default evaluation network (quantized int16/int32)
+├── src/                    # Chess engine source code (C++26)
+│   ├── main.cpp            # Entry point
+│   ├── uci.h/.cpp          # UCI (Universal Chess Interface) protocol implementation
+│   ├── smp.h/.cpp          # Lazy SMP parallel search helper threads manager
+│   ├── search.h/.cpp       # Principal alpha-beta/Negamax search and pruning heuristics
+│   ├── movepick.h          # Move generation wrapper & move ordering state machine
+│   ├── position.h/.cpp     # Board representation, move generator (magic bitboards), and move play
+│   ├── see.h/.cpp          # Static Exchange Evaluation (SEE)
+│   ├── nnue.h/.cpp         # NNUE evaluation network inference (HalfKP, SCReLU accumulator)
+│   ├── simd.h              # SIMD (AVX2, ARM NEON, scalar fallback) optimization for NNUE
+│   ├── tt.h/.cpp           # Multi-threaded lockless Transposition Table
+│   ├── history.h           # Move history, capture history, and continuation history tables
+│   ├── tables.h/.cpp       # Precomputed attack bitboard lookup tables
+│   ├── types.h/.cpp        # Basic type definitions (Square, Move, Piece, Color, Value, etc.)
+│   └── datagen.h/.cpp      # Self-play data generation for NNUE training
+└── tools/                  # Match playing, tuning, and training tools
+    ├── nnue/               # NNUE training pipeline (PyTorch + Rust/Metal bullet runner)
+    ├── spsa.py             # SPSA (Simultaneous Perturbation Stochastic Approximation) parameters tuner
+    ├── sprt.sh             # SPRT (Sequential Probability Ratio Test) match runner against baseline
+    ├── build_pgo.sh        # Build script for Profile-Guided Optimization (PGO)
+    └── datagen.sh          # Orchestrator script for multi-threaded self-play training data generation
+```
+
 ## Search
 
 Fail-soft negamax (alpha-beta), iterative deepening, parallelised by lazy SMP:
