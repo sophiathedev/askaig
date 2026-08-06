@@ -11,11 +11,11 @@
 # Builds into build-pgo/ ONLY (never build/ or cmake-build-release/), so it is safe to run alongside an
 # SPSA/SPRT run — but the compile competes for CPU, so prefer running it when cores are free.
 #
-#   bash tools/build_pgo.sh
+#   bash tools/build_pgo.sh [SOURCE_ROOT]
 #
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$HERE/.." && pwd)"
+ROOT="$(cd "${1:-$HERE/..}" && pwd)"
 DIR="$ROOT/build-pgo"
 
 # llvm-profdata: Apple ships it behind xcrun; Homebrew/LLVM puts it on PATH.

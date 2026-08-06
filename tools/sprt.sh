@@ -11,8 +11,8 @@
 #     BASE       = the opponent. Two forms, auto-detected:
 #                    - a path to an EXECUTABLE (stockfish, another askaig binary, ...) -> played
 #                      directly, no build. THIS is how you test against a DIFFERENT engine.
-#                    - a git ref (commit/tag/branch, default HEAD) -> built Release into build/ from
-#                      a throwaway worktree of that commit.
+#                    - a git ref (commit/tag/branch, default HEAD) -> fresh PGO build in a throwaway
+#                      worktree of that commit.
 #
 # Typical loop — edit code, leave it uncommitted, test vs the last commit:
 #     tools/sprt.sh
@@ -108,14 +108,13 @@ CAND_DIR="$ROOT/build-pgo"
 PGO_SCRIPT="$HERE/build_pgo.sh"
 [ -f "$PGO_SCRIPT" ] || { echo "PGO helper missing: $PGO_SCRIPT"; exit 1; }
 echo ">> building candidate (current tree, PGO) -> build-pgo/ ..."
-bash "$PGO_SCRIPT"
+bash "$PGO_SCRIPT" "$ROOT"
 CAND_BIN="$CAND_DIR/askaig"
 [ -x "$CAND_BIN" ] || { echo "candidate binary missing: $CAND_BIN"; exit 1; }
 
-# --- Baseline: an EXTERNAL engine executable, or BASE_REF (a git ref) built into build/ -----------
+# --- Baseline: an external executable, or a PGO build of BASE_REF --------------------------------
 # If BASE_REF points at an executable (stockfish, another askaig binary, ...) play it directly — no
-# build. Otherwise treat it as a git ref: materialise it in a throwaway worktree and build Release into
-# build/ (wiped first so the CMake cache never points at a stale source dir).
+# build. Otherwise materialise it in a throwaway worktree and give it an independent PGO profile.
 if [ -f "$BASE_REF" ] && [ -x "$BASE_REF" ]; then
   BASE_BIN="$(cd "$(dirname "$BASE_REF")" && pwd)/$(basename "$BASE_REF")"   # absolute path
   BASE_NAME="$(basename "$BASE_REF")"
@@ -126,12 +125,10 @@ else
   trap cleanup EXIT
   cleanup
   BASE_NAME="base"
-  echo ">> building baseline  ($BASE_REF) -> build/ ..."
+  echo ">> building baseline ($BASE_REF, PGO) -> base-src/build-pgo/ ..."
   git -C "$ROOT" worktree add --detach -f "$BASE_SRC" "$BASE_REF" >/dev/null
-  rm -rf "$ROOT/build"
-  cmake -S "$BASE_SRC" -B "$ROOT/build" -DCMAKE_BUILD_TYPE=Release >/dev/null
-  cmake --build "$ROOT/build" -j"$CORES" >/dev/null
-  BASE_BIN="$ROOT/build/askaig"
+  bash "$PGO_SCRIPT" "$BASE_SRC"
+  BASE_BIN="$BASE_SRC/build-pgo/askaig"
 fi
 [ -x "$BASE_BIN" ] || { echo "baseline binary missing: $BASE_BIN"; exit 1; }
 
