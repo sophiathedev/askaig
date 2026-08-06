@@ -9,9 +9,9 @@
 generation is ported from [nkarve/surge](https://github.com/nkarve/surge) (MIT); everything else
 (NNUE inference, search, TT, UCI, SIMD) is built on top of it.
 
----
-
 ## Elo Ratings
+
+For the detailed result of rating from **CCI (Computer Chess Index)**. Please visit [Askaig Rating](https://github.com/computer-chess-index/cci/blob/main/engines/Askaig.md).
 
 | Version      | STC <sub>8.0+0.08s  | LTC <sub>60.0+0.60s | VLTC <sub>2m24s+1.12s |
 | ------------ | ------------------- | ------------------- | --------------------- |
