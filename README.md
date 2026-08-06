@@ -20,8 +20,6 @@ For the detailed result of rating from **CCI (Computer Chess Index)**. Please vi
 | 20260616     | 2396<sub>(+new)     | 2638<sub>(+new)     | 2734<sub>(+new)       |
 |              | cElo <sub>(∆ prev)  | cElo <sub>(∆ prev)  | cElo <sub>(∆ prev)    |
 
----
-
 ## Features
 
 - **UCI protocol** — works with any UCI GUI.
