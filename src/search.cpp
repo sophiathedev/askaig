@@ -74,8 +74,14 @@ namespace {
     return pos.turn() == g_root_color ? -g_contempt : g_contempt;
   }
 
+  struct EvalResult {
+    int raw;
+    int score;
+  };
+
   // correction disagreement feeds pruning uncertainty
-  [[gnu::hot, nodiscard]] int evaluate(ThreadData &t, const Position &pos, Stack *ss) {
+  [[gnu::hot, nodiscard]] EvalResult evaluate(ThreadData &t, const Position &pos, Stack *ss,
+                                              int raw = tt::VALUE_NONE_TT) {
     const Color  c     = pos.turn();
     const size_t i_paw = pawn_corr_index(pos), i_mat = material_corr_index(pos);
     const size_t i_min = minor_corr_index(pos), i_maj = major_corr_index(pos);
@@ -84,24 +90,27 @@ namespace {
     __builtin_prefetch(&g_hist.corr_minor[c][i_min]);
     __builtin_prefetch(&g_hist.corr_major[c][i_maj]);
 
-    const int npm = 3 * pop_count(pos.bitboard_of(WHITE_KNIGHT) | pos.bitboard_of(BLACK_KNIGHT) |
-                                  pos.bitboard_of(WHITE_BISHOP) | pos.bitboard_of(BLACK_BISHOP)) +
-                    5 * pop_count(pos.bitboard_of(WHITE_ROOK) | pos.bitboard_of(BLACK_ROOK)) +
-                    9 * pop_count(pos.bitboard_of(WHITE_QUEEN) | pos.bitboard_of(BLACK_QUEEN));
-    int raw = t.ev.evaluate(pos) * (prm.MAT_BASE + prm.MAT_MULT * npm) / 1024;
-    raw     = raw * (200 - std::min(pos.fifty(), 100)) / 200;
+    if (raw == tt::VALUE_NONE_TT) {
+      const int npm = 3 * pop_count(pos.bitboard_of(WHITE_KNIGHT) | pos.bitboard_of(BLACK_KNIGHT) |
+                                    pos.bitboard_of(WHITE_BISHOP) | pos.bitboard_of(BLACK_BISHOP)) +
+                      5 * pop_count(pos.bitboard_of(WHITE_ROOK) | pos.bitboard_of(BLACK_ROOK)) +
+                      9 * pop_count(pos.bitboard_of(WHITE_QUEEN) | pos.bitboard_of(BLACK_QUEEN));
+      raw           = t.ev.evaluate(pos) * (prm.MAT_BASE + prm.MAT_MULT * npm) / 1024;
+      raw           = raw * (200 - std::min(pos.fifty(), 100)) / 200;
+      raw           = std::clamp(raw, -MATE_IN_MAX + 1, MATE_IN_MAX - 1);
+    }
 
     const int c1 = g_hist.corr_pawn[c][i_paw], c2 = g_hist.corr_material[c][i_mat];
     const int c3 = g_hist.corr_minor[c][i_min], c4 = g_hist.corr_major[c][i_maj];
-    int corr = c1 + c2 + c3 + c4;
-    int mass = std::abs(c1) + std::abs(c2) + std::abs(c3) + std::abs(c4);
+    int       corr = c1 + c2 + c3 + c4;
+    int       mass = std::abs(c1) + std::abs(c2) + std::abs(c3) + std::abs(c4);
     if ((ss - 1)->move.to_from() != 0) {
       const int c5 = g_hist.corr_cont[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()];
       corr += c5;
       mass += std::abs(c5);
     }
     ss->eval_unc = mass - std::abs(corr);
-    return std::clamp(raw + corr / 256, -MATE_IN_MAX + 1, MATE_IN_MAX - 1);
+    return {raw, std::clamp(raw + corr / 256, -MATE_IN_MAX + 1, MATE_IN_MAX - 1)};
   }
 
   [[gnu::hot]] inline bool stopped() {
@@ -193,7 +202,7 @@ namespace {
     if (pos.is_draw())
       return draw_score(pos);
     if (ply >= MAX_PLY) [[unlikely]]
-      return evaluate(t, pos, ss);
+      return evaluate(t, pos, ss).score;
 
     const bool     in_check = stm_in_check(pos);
     const uint64_t key      = tt_key(pos);
@@ -208,8 +217,10 @@ namespace {
 
     int best = -INF, raw_eval = tt::VALUE_NONE_TT;
     if (!in_check) {
-      raw_eval = tp.hit && tp.eval != tt::VALUE_NONE_TT ? tp.eval : evaluate(t, pos, ss);
-      best     = raw_eval;
+      const EvalResult ev = evaluate(t, pos, ss, tp.eval);
+      raw_eval            = ev.raw;
+      ss->static_eval     = ev.score;
+      best                = ev.score;
       if (tp.hit && ttsc != tt::VALUE_NONE_TT) {
         if (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && ttsc > best) ||
             (tp.bound == tt::UPPER && ttsc < best))
@@ -218,8 +229,9 @@ namespace {
       if (best >= beta)
         return best;
       alpha = std::max(alpha, best);
-    }
-    const int futility_base = best + prm.QS_FUT;
+    } else
+      ss->static_eval = tt::VALUE_NONE_TT;
+    const int futility_base = ss->static_eval + prm.QS_FUT;
 
     const Move ttm = tp.move;
     MovePicker picker(pos, g_hist, ttm, nullptr, Move(), nullptr, nullptr, /*quiescence=*/true);
@@ -291,7 +303,7 @@ namespace {
       if (pos.is_draw())
         return draw_score(pos);
       if (ply >= MAX_PLY) [[unlikely]]
-        return evaluate(t, pos, ss);
+        return evaluate(t, pos, ss).score;
       alpha = std::max(alpha, -MATE + ply);
       beta  = std::min(beta, MATE - ply - 1);
       if (alpha >= beta) [[unlikely]]
@@ -316,35 +328,37 @@ namespace {
     const Move ttm  = tp.move;
     const int  ttsc = tp.hit && tp.score != tt::VALUE_NONE_TT ? from_tt(tp.score, ply) : tt::VALUE_NONE_TT;
 
-    int raw_eval = tt::VALUE_NONE_TT;
-    ss->eval_unc = 0; // tt eval has no dispersion
+    int raw_eval = tt::VALUE_NONE_TT, prune_eval = tt::VALUE_NONE_TT;
+    ss->eval_unc = 0;
     if (in_check)
       ss->static_eval = tt::VALUE_NONE_TT;
     else {
-      raw_eval        = tp.eval != tt::VALUE_NONE_TT ? tp.eval : evaluate(t, pos, ss);
-      ss->static_eval = raw_eval;
+      const EvalResult ev = evaluate(t, pos, ss, tp.eval);
+      raw_eval            = ev.raw;
+      ss->static_eval     = ev.score;
+      prune_eval          = ev.score;
       if (tp.hit && ttsc != tt::VALUE_NONE_TT &&
-          (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && ttsc > raw_eval) ||
-           (tp.bound == tt::UPPER && ttsc < raw_eval)))
-        ss->static_eval = ttsc;
+          (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && ttsc > prune_eval) ||
+           (tp.bound == tt::UPPER && ttsc < prune_eval)))
+        prune_eval = ttsc;
     }
-    const bool improving = !in_check && ply >= 2 && (ss - 2)->static_eval != tt::VALUE_NONE_TT &&
-                           ss->static_eval > (ss - 2)->static_eval;
+    bool improving = !in_check && ply >= 2 && (ss - 2)->static_eval != tt::VALUE_NONE_TT &&
+                     ss->static_eval > (ss - 2)->static_eval;
 
     if ((PV || cutnode) && depth >= prm.IIR_DEPTH && ttm.to_from() == 0)
       --depth;
 
     if (!PV && !in_check && !excluded) {
       if (depth <= prm.RAZOR_DEPTH &&
-          ss->static_eval + prm.RAZOR_MULT * depth + prm.RAZOR_UNC * ss->eval_unc / 1024 < alpha) {
+          prune_eval + prm.RAZOR_MULT * depth + prm.RAZOR_UNC * ss->eval_unc / 1024 < alpha) {
         const int v = qsearch<false>(t, pos, ss, alpha - 1, alpha, ply);
         if (v < alpha && std::abs(v) < MATE_IN_MAX)
           return v;
       }
 
       if (depth <= prm.RFP_DEPTH && std::abs(beta) < MATE_IN_MAX &&
-          ss->static_eval - prm.RFP_MULT * (depth - improving) - prm.RFP_UNC * ss->eval_unc / 1024 >= beta)
-        return ss->static_eval;
+          prune_eval - prm.RFP_MULT * (depth - improving) - prm.RFP_UNC * ss->eval_unc / 1024 >= beta)
+        return prune_eval;
 
       const Color    us       = pos.turn();
       const Bitboard non_pawn = pos.bitboard_of(us, KNIGHT) | pos.bitboard_of(us, BISHOP) |
@@ -373,7 +387,11 @@ namespace {
             return v >= MATE_IN_MAX ? beta : v; // don't return unproven mates
         }
       }
+    }
 
+    if (!in_check)
+      improving |= ss->static_eval >= beta;
+    if (!PV && !in_check && !excluded) {
       const int pc_beta = beta + prm.PC_MARGIN - prm.PC_IMP * improving;
       if (depth >= prm.PC_DEPTH && std::abs(beta) < MATE_IN_MAX &&
           !(tp.hit && tp.depth >= depth - 3 && ttsc != tt::VALUE_NONE_TT && ttsc < pc_beta)) {
