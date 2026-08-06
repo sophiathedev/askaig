@@ -1,6 +1,6 @@
 #pragma once
 #ifdef _MSC_VER
-  #pragma warning(disable : 26812) // unscoped enum (MoveFlags, PieceType, ...): intentional, matches Stockfish/Surge style
+  #pragma warning(disable : 26812) // intentional unscoped enums
 #endif
 
 #include <array>
@@ -13,7 +13,6 @@
 constexpr size_t NCOLORS = 2;
 enum Color : int { WHITE, BLACK };
 
-// Inverts the color (WHITE -> BLACK) and (BLACK -> WHITE)
 constexpr Color operator~(Color c) { return Color(c ^ BLACK); }
 
 constexpr size_t NDIRS = 8;
@@ -33,13 +32,10 @@ enum Direction : int {
 constexpr size_t NPIECE_TYPES = 6;
 enum PieceType : int { PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING };
 
-// PIECE_STR[piece] is the algebraic chess representation of that piece
 const std::string PIECE_STR = "PNBRQK~>pnbrqk.";
 
-// The FEN of the starting position
 const std::string DEFAULT_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -";
 
-// The Kiwipete position, used for perft debugging
 const std::string KIWIPETE = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -";
 
 
@@ -150,9 +146,6 @@ enum Rank : int { RANK1, RANK2, RANK3, RANK4, RANK5, RANK6, RANK7, RANK8 };
 
 extern const char *SQSTR[65];
 
-// Formulaic constant tables, constexpr in the header so the compiler SEES the values:
-// constant-index accesses fold to immediates (castling squares, shift<>'s file masks become
-// AND-with-immediate), instead of the opaque ldr that an extern table forces on every access.
 inline constexpr Bitboard MASK_FILE[8] = {
         0x101010101010101,  0x202020202020202,  0x404040404040404,  0x808080808080808,
         0x1010101010101010, 0x2020202020202020, 0x4040404040404040, 0x8080808080808080,
@@ -173,9 +166,6 @@ inline constexpr Bitboard MASK_ANTI_DIAGONAL[15] = {
         0x810204080000000, 0x1020408000000000, 0x2040800000000000, 0x4080000000000000, 0x8000000000000000,
 };
 
-// SQUARE_BB[NO_SQUARE] == 0 is load-bearing: en-passant code indexes with a possibly-NO_SQUARE
-// square and relies on getting an empty bitboard back. For indices that are PROVABLY a real
-// square, prefer sq_bb() below (two ALU ops, no table access at all).
 inline constexpr auto SQUARE_BB = [] {
   std::array<Bitboard, 65> t{};
   for (int i = 0; i < 64; ++i)
@@ -184,14 +174,10 @@ inline constexpr auto SQUARE_BB = [] {
   return t;
 }();
 
-// 1-bit bitboard of a real square (s < 64 REQUIRED — no NO_SQUARE sentinel handling).
 constexpr Bitboard sq_bb(Square s) { return Bitboard(1) << s; }
 
 extern void print_bitboard(Bitboard b);
 
-// SIMD/hardware-intrinsic bit primitives (pop_count, sparse_pop_count, bsf, pop_lsb).
-// Declared inline here so they inline at the call-site; needs Bitboard and Square to be
-// visible, hence included at this point.
 #include "simd.h"
 
 constexpr Rank   rank_of(Square s) { return Rank(s >> 3); }
@@ -200,7 +186,6 @@ constexpr int    diagonal_of(Square s) { return 7 + rank_of(s) - file_of(s); }
 constexpr int    anti_diagonal_of(Square s) { return int(rank_of(s)) + int(file_of(s)); }
 constexpr Square create_square(File f, Rank r) { return Square(r << 3 | f); }
 
-// Shifts a bitboard in a particular direction. There is no wrapping, so bits that are shifted of the edge are lost
 template<Direction D>
 constexpr Bitboard shift(Bitboard b) {
   return D == NORTH           ? b << 8
@@ -216,19 +201,16 @@ constexpr Bitboard shift(Bitboard b) {
                               : 0;
 }
 
-// Returns the actual rank from a given side's perspective (e.g. rank 1 is rank 8 from Black's perspective)
 template<Color C>
 constexpr Rank relative_rank(Rank r) {
   return C == WHITE ? r : Rank(RANK8 - r);
 }
 
-// Returns the actual direction from a given side's perspective (e.g. North is South from Black's perspective)
 template<Color C>
 constexpr Direction relative_dir(Direction d) {
   return Direction(C == WHITE ? d : -d);
 }
 
-// The type of the move
 enum MoveFlags : int {
   QUIET              = 0b0000,
   DOUBLE_PUSH        = 0b0001,
@@ -252,11 +234,9 @@ enum MoveFlags : int {
 
 class Move {
 private:
-  // The internal representation of the move
   uint16_t move;
 
 public:
-  // Defaults to a null move (a1a1)
   inline Move() : move(0) {}
 
   inline Move(uint16_t m) { move = m; }
@@ -277,14 +257,10 @@ public:
 
   [[nodiscard]] inline bool is_capture() const { return ((move >> 12) & CAPTURE) != 0; }
 
-  // No user-declared copy assignment: it did nothing but the implicit memberwise copy already
-  // does (move is a single uint16_t), and dropping it lets the implicit copy ctor/assignment
-  // stay implicit instead of triggering the rule-of-three deprecation.
   bool operator==(Move a) const { return to_from() == a.to_from(); }
   bool operator!=(Move a) const { return to_from() != a.to_from(); }
 };
 
-// Adds, to the move pointer all moves of the form (from, s), where s is a square in the bitboard to
 template<MoveFlags F = QUIET>
 inline Move *make(Square from, Bitboard to, Move *list) {
   while (to)
@@ -292,7 +268,6 @@ inline Move *make(Square from, Bitboard to, Move *list) {
   return list;
 }
 
-// Adds, to the move pointer all quiet promotion moves of the form (from, s), where s is a square in the bitboard to
 template<>
 inline Move *make<PROMOTIONS>(Square from, Bitboard to, Move *list) {
   Square p;
@@ -306,7 +281,6 @@ inline Move *make<PROMOTIONS>(Square from, Bitboard to, Move *list) {
   return list;
 }
 
-// Adds, to the move pointer all capture promotion moves of the form (from, s), where s is a square in the bitboard to
 template<>
 inline Move *make<PROMOTION_CAPTURES>(Square from, Bitboard to, Move *list) {
   Square p;
@@ -322,26 +296,17 @@ inline Move *make<PROMOTION_CAPTURES>(Square from, Bitboard to, Move *list) {
 
 extern std::ostream &operator<<(std::ostream &os, const Move &m);
 
-// The white king and kingside rook
 constexpr Bitboard WHITE_OO_MASK = 0x90;
-// The white king and queenside rook
 constexpr Bitboard WHITE_OOO_MASK = 0x11;
 
-// Squares between the white king and kingside rook
 constexpr Bitboard WHITE_OO_BLOCKERS_AND_ATTACKERS_MASK = 0x60;
-// Squares between the white king and queenside rook
 constexpr Bitboard WHITE_OOO_BLOCKERS_AND_ATTACKERS_MASK = 0xe;
 
-// The black king and kingside rook
 constexpr Bitboard BLACK_OO_MASK = 0x9000000000000000;
-// The black king and queenside rook
 constexpr Bitboard BLACK_OOO_MASK = 0x1100000000000000;
-// Squares between the black king and kingside rook
 constexpr Bitboard BLACK_OO_BLOCKERS_AND_ATTACKERS_MASK = 0x6000000000000000;
-// Squares between the black king and queenside rook
 constexpr Bitboard BLACK_OOO_BLOCKERS_AND_ATTACKERS_MASK = 0xE00000000000000;
 
-// The white king, white rooks, black king and black rooks
 constexpr Bitboard ALL_CASTLING_MASK = 0x9100000000000091;
 
 template<Color C>

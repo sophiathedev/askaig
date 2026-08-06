@@ -24,37 +24,27 @@
 namespace {
 
 #ifndef ASKAIG_VERSION
-#define ASKAIG_VERSION "dev" // set by CMake (the build date YYYYMMDD); see CMakeLists.txt
+#define ASKAIG_VERSION "dev" // set by cmake
 #endif
   constexpr auto ENGINE_NAME   = "Askaig " ASKAIG_VERSION;
   constexpr auto ENGINE_AUTHOR = "the Askaig developers (see AUTHORS file)";
 
-  // Number of perft worker threads (the "Threads" UCI option; the search is single-threaded).
   int g_threads = 1;
 
-  // The search runs on this background thread so the UCI loop stays responsive (stop/isready
-  // work mid-search). g_out serialises stdout so info/bestmove lines never interleave.
   std::thread g_search;
   std::mutex  g_out;
 
-  // Stops any running search and joins its thread. Called before any command that mutates
-  // engine state, so a search never runs concurrently with a position/option change.
   void stop_search() {
     search::request_stop();
     if (g_search.joinable())
       g_search.join();
   }
 
-  // Largest sensible thread count to advertise/accept.
   unsigned max_threads() {
     unsigned hw = std::thread::hardware_concurrency();
     return hw == 0 ? 1 : hw;
   }
 
-  // Converts an internal Move to its UCI string. Two special cases:
-  //  - castling is stored king-to-rook (e1h1 / e1a1) but UCI expects king-two-squares
-  //    (e1g1 / e1c1), so the destination is recomputed from the king square;
-  //  - promotions get a trailing piece letter (low 2 flag bits: 0=n 1=b 2=r 3=q).
   std::string move_to_uci(Move m) {
     Square    from = m.from();
     Square    to   = m.to();
@@ -75,7 +65,6 @@ namespace {
     return s;
   }
 
-  // Plays the legal move whose UCI string matches `mstr`. Returns false if none matches.
   template<Color Us>
   bool try_play(Position &pos, const std::string &mstr) {
     MoveList<Us> list(pos);
@@ -91,44 +80,25 @@ namespace {
     return pos.turn() == WHITE ? try_play<WHITE>(pos, mstr) : try_play<BLACK>(pos, mstr);
   }
 
-  // ---- Exact perft hash (a pure-function memoisation) --------------------------------------------
-  //
-  // perft(position, depth) is a *pure function*: the node count for a position at a depth never
-  // changes, so cached entries are never stale and the table is never cleared.
-  //
-  // The Chess Programming Wiki notes perft hashing gives "a small chance for inaccurate results".
-  // That inaccuracy has two sources: (1) two different positions colliding on the same 64-bit
-  // Zobrist key, and — specific to this engine — (2) our Zobrist hash encodes only piece placement +
-  // side to move, NOT castling rights or the en-passant square, both of which change the legal-move
-  // count. We avoid BOTH by making each entry store the *full* move-generation state and accepting a
-  // hit only on an exact, bit-for-bit match (not merely a matching hash). A hit therefore means the
-  // position is provably identical, so the cached count is exact — zero chance of a wrong result.
-  //
-  // The table is thread_local, so the parallel perft workers never share it: no concurrent writes,
-  // hence no torn reads, hence exactness holds without any locking.
   struct PerftEntry {
-    uint64_t board[4]; // the 64 squares packed 4 bits each — the exact piece placement
-    Bitboard castle; // history entry bitboard: distinguishes positions with different castling rights
-    uint64_t count; // the perft node count (valid only at `depth`)
-    int16_t  epsq; // en-passant square (or NO_SQUARE) — also affects the move count
-    int8_t   side; // side to move
-    int8_t   depth; // depth this count is for; -1 marks an empty slot
+    uint64_t board[4];
+    Bitboard castle;
+    uint64_t count;
+    int16_t  epsq;
+    int8_t   side;
+    int8_t   depth; // -1 = empty
   };
 
-  constexpr size_t PERFT_TT_ENTRIES     = 1u << 20; // per thread (~59 MB); only allocated when used
-  constexpr int    PERFT_HASH_MIN_DEPTH = 4; // memoise only where a subtree is big enough to pay
+  constexpr size_t PERFT_TT_ENTRIES     = 1u << 20;
+  constexpr int    PERFT_HASH_MIN_DEPTH = 4;
 
-  // Per-thread cache. Each perft worker is its own thread, so this is private to it (no races).
   thread_local std::vector<PerftEntry> t_perft_tt;
 
-  // Allocate (once) the calling thread's table. Pure-function cache: if it already exists we keep it
-  // (it can never go stale), so repeat perfts on the main thread reuse prior work.
   void ensure_perft_tt() {
     if (t_perft_tt.size() != PERFT_TT_ENTRIES)
       t_perft_tt.assign(PERFT_TT_ENTRIES, PerftEntry{{0, 0, 0, 0}, 0, 0, NO_SQUARE, 0, -1});
   }
 
-  // Packs the full move-generation state of `p` into a PerftEntry fingerprint (count/depth unset).
   PerftEntry perft_fingerprint(const Position &p) {
     PerftEntry e{{0, 0, 0, 0}, 0, 0, NO_SQUARE, 0, -1};
     for (int s = 0; s < int(NSQUARES); ++s)
@@ -139,33 +109,23 @@ namespace {
     return e;
   }
 
-  // True iff two fingerprints describe the bit-for-bit identical move-generation state.
   bool same_position(const PerftEntry &a, const PerftEntry &b) {
     return a.board[0] == b.board[0] && a.board[1] == b.board[1] && a.board[2] == b.board[2] &&
            a.board[3] == b.board[3] && a.castle == b.castle && a.epsq == b.epsq && a.side == b.side;
   }
 
   size_t perft_index(uint64_t hash, const PerftEntry &k) {
-    // Mix the Zobrist hash with the ep/castling state (which the hash omits) so positions differing
-    // only in those spread to different slots; the exact compare still guarantees correctness.
     const uint64_t h = hash ^ (static_cast<uint64_t>(static_cast<uint16_t>(k.epsq)) * 0x9E3779B97F4A7C15ull) ^ k.castle;
     return h & (PERFT_TT_ENTRIES - 1);
   }
 
-  // perft (move-generation node count) — used by "go perft <depth>". Memoised by the exact perft
-  // hash above when the calling thread has a table and the depth is worth caching.
   template<Color Us>
   uint64_t perft(Position &p, int depth, bool use_cache) {
-    // Bulk counting (always on): at the last ply return the legal-move count directly, skipping a
-    // make/unmake of every leaf (the bulk of the tree) — far faster, identical total. The leaf still
-    // materialises its move list (same work the search pays), so perft speed tracks real movegen speed.
     if (depth <= 1) {
       MoveList<Us> list(p);
       return static_cast<uint64_t>(list.size());
     }
 
-    // The perft hash is a memoisation of subtree counts; `go perft <d> noncache` skips it so every
-    // subtree is recomputed (the tree is still bulk-counted at the leaves).
     const bool use_hash = use_cache && !t_perft_tt.empty() && depth >= PERFT_HASH_MIN_DEPTH;
     PerftEntry key{{0, 0, 0, 0}, 0, 0, NO_SQUARE, 0, -1};
     size_t     idx = 0;
@@ -173,7 +133,7 @@ namespace {
       key                 = perft_fingerprint(p);
       idx                 = perft_index(p.get_hash(), key);
       const PerftEntry &e = t_perft_tt[idx];
-      if (e.depth == depth && same_position(e, key)) // exact match — provably the same position
+      if (e.depth == depth && same_position(e, key))
         return e.count;
     }
 
@@ -186,7 +146,7 @@ namespace {
     }
 
     if (use_hash) {
-      PerftEntry &e = t_perft_tt[idx]; // depth-preferred: keep the costlier (deeper) result on a clash
+      PerftEntry &e = t_perft_tt[idx]; // depth preferred
       if (e.depth <= depth) {
         key.count = nodes;
         key.depth = static_cast<int8_t>(depth);
@@ -196,19 +156,12 @@ namespace {
     return nodes;
   }
 
-  // Byte-clones a Position so each perft worker can make/unmake on its own copy. A plain copy would
-  // invoke UndoInfo's copy constructor (which resets epsq/captured) and corrupt the history stack;
-  // every Position member is plain data, so the bit pattern is a faithful, independent copy.
   Position clone_position(const Position &src) {
     Position dst;
     std::memcpy(static_cast<void *>(&dst), static_cast<const void *>(&src), sizeof(Position));
     return dst;
   }
 
-  // Divides the perft node count by root move (the standard "divide" output), parallelised across
-  // the "Threads" option. Each root move's subtree is an independent computation, so workers grab
-  // root moves from a shared atomic counter and accumulate into per-move slots on their own board
-  // clone; the divide lines are then printed in move-generation order.
   template<Color Us>
   void perft_divide(Position &p, int depth, bool use_cache) {
     std::vector<Move> moves;
@@ -217,14 +170,12 @@ namespace {
       moves.assign(list.begin(), list.end());
     }
     const size_t          n = moves.size();
-    std::vector<uint64_t> counts(n, 1); // depth 1: every root move is itself one leaf
+    std::vector<uint64_t> counts(n, 1);
 
     int nthreads = g_threads < 1 ? 1 : g_threads;
     if (nthreads > static_cast<int>(n))
       nthreads = static_cast<int>(n == 0 ? 1 : n);
 
-    // The exact perft hash pays off only for deep subtrees; allocate it then (per worker thread).
-    // `noncache` skips the hash on purpose — every subtree is recomputed.
     const bool hash = use_cache && depth - 1 >= PERFT_HASH_MIN_DEPTH;
 
     const auto start = std::chrono::steady_clock::now();
@@ -242,7 +193,7 @@ namespace {
         std::atomic<size_t> next{0};
         auto                worker = [&]() {
           if (hash)
-            ensure_perft_tt(); // this worker thread's private (thread_local) table
+            ensure_perft_tt();
           Position local = clone_position(p);
           size_t   i;
           while ((i = next.fetch_add(1, std::memory_order_relaxed)) < n) {
@@ -255,7 +206,7 @@ namespace {
         pool.reserve(static_cast<size_t>(nthreads - 1));
         for (int t = 1; t < nthreads; ++t)
           pool.emplace_back(worker);
-        worker(); // this thread is a worker too
+        worker();
         for (auto &th: pool)
           th.join();
       }
@@ -283,13 +234,6 @@ namespace {
       perft_divide<BLACK>(pos, depth, use_cache);
   }
 
-  // --- selftest nnue -----------------------------------------------------------------------------
-  // Plays seeded-random legal games and asserts at every checked ply that the incremental
-  // accumulator evaluation (push/pop + lazy walk-back) is bit-identical to a full refresh.
-  // Coverage by construction: all 11 MoveFlags cases (the start FENs force castling, en passant
-  // and promotions), multi-ply lazy chains (evaluation is skipped randomly), and mixed
-  // undo/pop back-off sequences. The scalar kernels are the reference; when the SIMD kernels
-  // land, this same test pins them to the scalar results (all paths are exact integer math).
 
   void play_any_color(Position &p, Move m) {
     if (p.turn() == WHITE)
@@ -297,7 +241,6 @@ namespace {
     else
       p.play<BLACK>(m);
   }
-  // undo<C> takes the color that MADE the move — the opposite of the side to move afterwards.
   void undo_any_color(Position &p, Move m) {
     if (p.turn() == WHITE)
       p.undo<BLACK>(m);
@@ -320,9 +263,6 @@ namespace {
       std::cout << "selftest nnue FAIL: no net loaded\n";
       return false;
     }
-    // Start positions chosen so random play quickly reaches every move type: castling rights
-    // both sides (kiwipete), en-passant-rich pawn endings, and promotion storms (pos4 and the
-    // 8-passers race, which also drives accumulator values toward their extremes).
     constexpr const char *FENS[] = {
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -",
             "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -", // kiwipete
@@ -353,8 +293,6 @@ namespace {
       std::vector<Move> made;
 
       for (int ply = 0; ply < maxply; ++ply) {
-        // Occasionally back off a few plies: pop() must land back on already-computed (or
-        // still-lazy) ancestors and the next pushes must rebuild correctly from there.
         if (!made.empty() && rng.rand<uint64_t>() % 8 == 0) {
           int k = 1 + static_cast<int>(rng.rand<uint64_t>() % std::min<size_t>(made.size(), 6));
           while (k--) {
@@ -370,17 +308,16 @@ namespace {
         Move         moves[218];
         const size_t n = legal_moves(pos, moves);
         if (n == 0)
-          break; // mate/stalemate — start the next game
+          break;
         const Move m = moves[rng.rand<uint64_t>() % n];
         ev.push(pos, m);
         play_any_color(pos, m);
         made.push_back(m);
 
-        // Evaluate only half the time so lazy multi-ply walk-back chains get exercised too.
         if (rng.rand<uint64_t>() % 2 == 0 && !check(pos))
           return false;
       }
-      if (!check(pos)) // end-of-game: one final check on whatever the lazy state is
+      if (!check(pos))
         return false;
     }
     std::cout << "selftest nnue PASS: " << games << " games, " << checks
@@ -388,13 +325,6 @@ namespace {
     return true;
   }
 
-  // --- selftest perft ------------------------------------------------------------------------
-  // Fast movegen regression check: the classic Chess Programming Wiki reference positions
-  // (the same six used for `bench`/NNUE-selftest FENs elsewhere in this file), at depths chosen
-  // to run in well under a second combined while still exercising every special-move class
-  // (castling, en passant, promotions). The expected counts are the well-known published
-  // values, cross-checked against this engine's own (already independently perft-verified —
-  // see the README's `go perft 6` = 119060324 check) output before being hardcoded here.
   bool selftest_perft() {
     struct Case {
       const char *fen;
@@ -425,13 +355,6 @@ namespace {
     return ok;
   }
 
-  // --- selftest see --------------------------------------------------------------------------
-  // Static exchange evaluation correctness: a handful of hand-traced absolute-value cases
-  // (values follow search::PIECE_VAL: P=100 N=320 B=330 R=500 Q=900) chosen to each exercise a
-  // different branch of the swap algorithm, plus a monotonicity/bounds fuzz pass over random
-  // captures from real playouts — a correct see_ge must be true for every threshold at or below
-  // the exchange's true value and false for every threshold above it (never true-after-false as
-  // the threshold rises), and must saturate to true/false far outside any realistic exchange.
   bool selftest_see() {
     bool ok = true;
     const auto expect = [&](bool cond, const char *what) {
@@ -441,25 +364,21 @@ namespace {
       }
     };
 
-    { // Undefended capture: Rd1xd4 wins a pawn outright (net +100), nothing else attacks d4.
-      // Exercises the first early-return (threshold > target value: false immediately) and the
-      // full loop with an empty attacker set on the first iteration (true).
+    {
       Position pos;
       Position::set("4k3/8/8/8/3p4/8/8/3R3K w - - 0 1", pos);
       const Move m(d1, d4, CAPTURE);
       expect(search::see_ge(pos, m, 100), "undefended pawn capture: expected SEE >= 100");
       expect(!search::see_ge(pos, m, 101), "undefended pawn capture: expected SEE < 101");
     }
-    { // Pawn-defended capture: Rd1xd4 wins a knight (+320) but a black pawn on c5 recaptures the
-      // rook (-500): net -180. Exercises the second early-return (recapture-for-free check).
+    {
       Position pos;
       Position::set("4k3/8/8/2p5/3n4/8/8/3R3K w - - 0 1", pos);
       const Move m(d1, d4, CAPTURE);
       expect(search::see_ge(pos, m, -180), "pawn-defended knight capture: expected SEE >= -180");
       expect(!search::see_ge(pos, m, -179), "pawn-defended knight capture: expected SEE < -179");
     }
-    { // Equal trade: Rd1xd4 (a black rook) is recaptured by a second black rook on d8 (open
-      // file, no blockers) — net exactly 0. Exercises the full loop running one extra ply deep.
+    {
       Position pos;
       Position::set("3rk3/8/8/8/3r4/8/8/3R3K w - - 0 1", pos);
       const Move m(d1, d4, CAPTURE);
@@ -467,8 +386,7 @@ namespace {
       expect(!search::see_ge(pos, m, 1), "even rook trade: expected SEE < 1");
     }
 
-    { // Fuzz: every capture seen across a few plies of random legal play in three structurally
-      // different openings, checked for monotonicity and sane saturation at extreme thresholds.
+    {
       PRNG                  rng(0xC0FFEEu);
       constexpr const char *FENS[] = {
               "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -",
@@ -488,7 +406,7 @@ namespace {
           for (size_t i = 0; i < n && checked < 300; ++i) {
             if (!moves[i].is_capture())
               continue;
-            bool prev = true; // see_ge at -infinity is always true
+            bool prev = true;
             for (int th: THRESH) {
               const bool cur = search::see_ge(pos, moves[i], th);
               if (cur && !prev) {
@@ -514,13 +432,6 @@ namespace {
     return ok;
   }
 
-  // --- selftest draw ---------------------------------------------------------------------------
-  // Position::is_draw() flags a draw on the SECOND occurrence of a position (a repeat), not the
-  // literal FIDE threefold — the search treats any repeated line as drawish rather than waiting
-  // for a third occurrence that a hypothetical search line will rarely reach — plus the
-  // fifty-move rule and dead material (bare kings + at most one minor). Verified directly
-  // against Position, independent of search/NNUE. The shuffle/fifty cases keep a rook per side
-  // on the board precisely so the dead-material rule cannot fire before the rule under test.
   bool selftest_draw() {
     bool ok = true;
     const auto expect = [&](bool cond, const char *what) {
@@ -530,13 +441,12 @@ namespace {
       }
     };
 
-    { // Negative control: a fresh position must never be flagged a draw.
+    {
       Position pos;
       Position::set(DEFAULT_FEN, pos);
       expect(!pos.is_draw(), "startpos incorrectly flagged as a draw");
     }
-    { // A king-shuffle round trip (4 plies) returns to the exact starting position — its SECOND
-      // occurrence — and must flip is_draw() to true exactly there, not on the 3 plies before it.
+    {
       Position pos;
       Position::set("r3k3/8/8/8/8/8/8/R3K3 w - - 0 1", pos);
       constexpr const char *SHUFFLE[] = {"e1d1", "e8d8", "d1e1", "d8e8"};
@@ -551,7 +461,7 @@ namespace {
                               : "false positive: draw flagged before the position actually repeated");
       }
     }
-    { // Fifty-move rule: one halfmove short of the limit, then one quiet move over it.
+    {
       Position pos;
       Position::set("r3k3/8/8/8/8/8/8/R3K3 w - - 99 1", pos);
       expect(!pos.is_draw(), "fifty-move rule fired one halfmove early");
@@ -561,8 +471,7 @@ namespace {
       }
       expect(pos.is_draw(), "fifty-move rule did not fire at halfmove 100");
     }
-    { // Dead material: KvK, KBvK and KNvK can never mate — drawn on the spot, whoever moves.
-      // KRvK, KPvK and KNNvK all still contain legal mates and must NOT be flagged.
+    {
       const auto draws = [](const char *fen) {
         Position pos;
         Position::set(fen, pos);
@@ -581,20 +490,12 @@ namespace {
     return ok;
   }
 
-  // --- selftest search -------------------------------------------------------------------------
-  // Runs a small, varied position set through the real search at Threads in {1, 2, 4} and
-  // checks, independent of the search's own move generator, that: the reported bestmove is
-  // legal, the FULL reported PV replays as legal moves one by one, and the score is within the
-  // representable mate range. This is the in-engine version of the ad-hoc PV-legality checks
-  // used throughout development — threading bugs (in the YBWC era: a stale split snapshot or
-  // child PV; under lazy SMP: any cross-thread state leaking into the main thread's PV) show
-  // up exactly as illegal PV moves at Threads > 1, the most direct regression guard there is.
   bool selftest_search() {
     if (!nnue::loaded()) {
       std::cout << "selftest search FAIL: no net loaded\n";
       return false;
     }
-    search::clear_stop(); // see bench_cmd's comment — think() no longer resets this itself
+    search::clear_stop();
     struct Case {
       const char *fen;
       int         depth;
@@ -667,21 +568,6 @@ namespace {
     return ok;
   }
 
-  // --- selftest stop ---------------------------------------------------------------------------
-  // Regression test for a real bug found while stress-testing "go" immediately followed by
-  // "stop": think() used to unconditionally reset g_stop at its own start. A stop requested on
-  // the UCI thread BEFORE the newly-spawned search thread's think() call actually started
-  // running could have that request silently wiped out by think()'s own reset, so the search
-  // ran to full (clamped) depth instead of stopping — observed as a multi-second delay where an
-  // instant response was expected. The fix moved the reset to search::clear_stop(), called
-  // synchronously by the spawner before the thread starts (go_cmd) or once up front by
-  // synchronous callers (bench_cmd, selftest_search here) — think() itself must never touch it.
-  //
-  // A real timing race is inherently flaky to test for directly, so this reproduces the bug
-  // deterministically instead: pre-set g_stop BEFORE calling think() (simulating "the stop
-  // request already landed"), with no depth/time limit at all. If think() were still resetting
-  // g_stop internally, it would search for real (many nodes, real time); since it must not, the
-  // very first time_up()/aborted() check has to bail immediately.
   bool selftest_stop() {
     if (!nnue::loaded()) {
       std::cout << "selftest stop FAIL: no net loaded\n";
@@ -693,11 +579,11 @@ namespace {
     search::new_game();
 
     search::clear_stop();
-    search::request_stop(); // simulate: the stop request already landed before think() runs
+    search::request_stop();
     const auto           t0 = std::chrono::steady_clock::now();
     const search::Result r  = search::think(pos, search::MAX_PLY - 1, nullptr, 0, 0);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    search::clear_stop(); // leave global state clean for whatever runs next
+    search::clear_stop();
 
     bool ok = true;
     if (r.nodes > 100) {
@@ -718,28 +604,16 @@ namespace {
     return ok;
   }
 
-  // --- selftest contempt -----------------------------------------------------------------------
-  // Regression test for the "Contempt" option: with it at 0, draw_score() must reproduce the old
-  // unconditional draw==0 exactly, so a position where the honest best line is worse than a
-  // drawing resource (repetition/perpetual) gets searched to a ~0 score. With Contempt clearly
-  // positive, that same resource must score noticeably *worse* than 0 from the root side's own
-  // perspective, since draw_score() now charges it -Contempt instead of handing it out for free —
-  // pushing the search to prefer fighting on unless every alternative is even worse. Compares the
-  // two scores rather than pinning either to an exact value: robust to future search tuning
-  // shifting the honest evaluation, while still catching a broken/reverted contempt wire-up (the
-  // two scores would then be equal).
   bool selftest_contempt() {
     if (!nnue::loaded()) {
       std::cout << "selftest contempt FAIL: no net loaded\n";
       return false;
     }
-    // Q+K vs Q+K+a-pawn: White (to move) is down a pawn but has real perpetual-check/repetition
-    // resources, so at moderate depth the "honest" line is worse than the drawing one.
     constexpr const char *FEN   = "3qk3/p7/8/8/8/8/8/3QK3 w - - 0 1";
     constexpr int         DEPTH = 12;
 
     const int saved_threads  = g_threads;
-    g_threads                = 1; // determinism: score comparisons need a bit-reproducible search
+    g_threads                = 1; // deterministic scores
     search::set_threads(1);
 
     Position pos;
@@ -755,7 +629,7 @@ namespace {
     search::set_contempt(80);
     const int score_c80 = search::think(pos, DEPTH, nullptr, 0, 0).score;
 
-    search::set_contempt(0); // leave global state at the actual default for whatever runs next
+    search::set_contempt(0);
     g_threads = saved_threads;
     search::set_threads(saved_threads);
     tt::clear();
@@ -777,10 +651,6 @@ namespace {
     return ok;
   }
 
-  // --- selftest all ----------------------------------------------------------------------------
-  // Runs every selftest and reports a combined verdict. Uses &= (not &&) deliberately: every
-  // suite runs regardless of an earlier failure, so a single pass reports everything that's
-  // broken instead of stopping at the first one.
   void selftest_all() {
     bool ok = true;
     ok &= selftest_perft();
@@ -793,10 +663,6 @@ namespace {
     std::cout << (ok ? "selftest all: ALL PASS\n" : "selftest all: SOME FAILED (see above)\n");
   }
 
-  // --- bench evalnps -----------------------------------------------------------------------------
-  // Micro-benchmark of the NNUE evaluation path a search will drive: cycles of push -> evaluate
-  // (one incremental apply + output dot) then unwind, on a fixed reversible knight-shuffle line
-  // from the start position, plus a separate full-refresh loop. Deterministic; movegen excluded.
   void bench_evalnps() {
     if (!nnue::loaded()) {
       std::cout << "bench evalnps FAIL: no net loaded\n";
@@ -807,15 +673,11 @@ namespace {
     nnue::Evaluator ev;
     ev.reset(pos);
 
-    // A 4-ply reversible cycle (knights out and back): the position returns to startpos, so the
-    // loop can run forever without growing the stack beyond 4 plies.
     const std::array<Move, 4> cyc = {Move(g1, f3, QUIET), Move(g8, f6, QUIET), Move(f3, g1, QUIET), Move(f6, g8, QUIET)};
 
-    // volatile: LTO can prove the eval functions pure and hoist them out of the loops otherwise
-    // (observed with the refresh loop) — a forced store per eval is noise at these sizes.
     volatile int64_t sink = 0;
 
-    constexpr int ITERS = 500'000; // x4 evals per iteration
+    constexpr int ITERS = 500'000;
     auto          t0    = std::chrono::steady_clock::now();
     for (int it = 0; it < ITERS; ++it) {
       for (const Move m: cyc) {
@@ -833,8 +695,7 @@ namespace {
     std::cout << "incremental: " << evals << " evals in " << us / 1000 << " ms = "
               << (us > 0 ? evals * 1'000'000 / uint64_t(us) : 0) << " evals/s\n";
 
-    // Refresh loop: walk the same 2-ply cycle so every call sees a different position.
-    constexpr int RITERS = 50'000; // x4 evals per iteration
+    constexpr int RITERS = 50'000;
     t0                   = std::chrono::steady_clock::now();
     for (int it = 0; it < RITERS; ++it) {
       play_any_color(pos, cyc[0]);
@@ -850,10 +711,9 @@ namespace {
     const uint64_t revals = uint64_t(RITERS) * 4;
     std::cout << "refresh:     " << revals << " evals in " << us / 1000 << " ms = "
               << (us > 0 ? revals * 1'000'000 / uint64_t(us) : 0) << " evals/s\n";
-    std::cout << "checksum " << sink << "\n"; // also a cross-build (NEON/AVX2/scalar) invariant
+    std::cout << "checksum " << sink << "\n"; // cross-build invariant
   }
 
-  // Formats a search score as a UCI "score ..." field: mate scores as "mate <n>" in moves.
   std::string format_score(int score) {
     if (score >= search::MATE_IN_MAX)
       return "mate " + std::to_string((search::MATE - score + 1) / 2);
@@ -862,10 +722,6 @@ namespace {
     return "cp " + std::to_string(score);
   }
 
-  // --- bench (search signature) ------------------------------------------------------------------
-  // Fixed positions searched at a fixed depth with a fixed-size, cleared TT: the summed node
-  // count is a deterministic signature of the search — any functional change moves it, a pure
-  // speedup does not (the `./askaig bench` OpenBench-style convention).
   constexpr const char *BENCH_FENS[] = {
           "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", // startpos
           "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", // kiwipete
@@ -883,19 +739,16 @@ namespace {
   constexpr int BENCH_DEPTH = 12;
 
   void bench_cmd(int depth) {
-    // Runs synchronously on this thread (no concurrent stop-sender to race), but g_stop may
-    // still be true from an earlier "go" + "stop" — think() no longer resets it itself (see
-    // search::clear_stop()'s comment), so every non-backgrounded caller must.
     search::clear_stop();
-    search::set_node_limit(0); // a prior "go nodes" must not cap the signature runs
-    const size_t prev_mb = tt::size_mb(); // restore the user's Hash afterwards
-    tt::resize(16); // fixed size: the signature must not depend on the Hash setting
+    search::set_node_limit(0);
+    const size_t prev_mb = tt::size_mb();
+    tt::resize(16); // deterministic signature
     uint64_t   total_nodes = 0;
     const auto t0          = std::chrono::steady_clock::now();
     int        i           = 0;
     for (const char *fen: BENCH_FENS) {
       tt::clear();
-      search::new_game(); // fresh heuristics per position -> bit-reproducible
+      search::new_game();
       Position bp;
       Position::set(fen, bp);
       search::Result r = search::think(bp, depth, nullptr, 0, 0);
@@ -911,15 +764,10 @@ namespace {
               << std::flush;
     tt::resize(prev_mb);
     tt::clear();
-    search::new_game(); // don't leak bench heuristics into a real game
+    search::new_game();
   }
 
-  // --- d / display ---------------------------------------------------------------------------
-  // Board preview (plain text, no ANSI codes): piece grid, the position facts, and the current
-  // static NNUE eval from the observer's (White's) point of view: + = better for White,
-  // - = better for Black, plus the raw centipawn value.
   void display_cmd(const Position &pos) {
-    // A castling right is lost once its king/rook "entry" squares have been touched.
     const Bitboard entry = pos.castle_entry();
     std::string    castles;
     if (!(entry & WHITE_OO_MASK))
@@ -939,7 +787,6 @@ namespace {
     std::ostringstream zob;
     zob << "0x" << std::hex << std::uppercase << pos.get_hash();
 
-    // The static NNUE eval, observer's (White's) POV: + = better for White, - for Black.
     std::string eval_str = "no net loaded";
     if (nnue::loaded()) {
       const int stm_cp = nnue::evaluate_refresh(pos);
@@ -960,7 +807,7 @@ namespace {
             "Eval: " + eval_str,
     };
 
-    std::cout << "   -------------------\n"; // 19 dashes: spans pipe-to-pipe of the 22-char rows
+    std::cout << "   -------------------\n";
     for (int r = 7; r >= 0; --r) {
       std::cout << " " << r + 1 << " |";
       for (int f = 0; f < 8; ++f) {
@@ -972,11 +819,10 @@ namespace {
         std::cout << " " << info[i];
       std::cout << "\n";
     }
-    std::cout << "   -------------------\n"; // 19 dashes: spans pipe-to-pipe of the 22-char rows
+    std::cout << "   -------------------\n";
     std::cout << "     A B C D E F G H\n";
   }
 
-  // Handles "position [startpos | fen <fen>] [moves <m1> ...]".
   void position_cmd(std::optional<Position> &pos, std::istringstream &is) {
     std::string token;
     std::string fen;
@@ -984,7 +830,7 @@ namespace {
 
     if (token == "startpos") {
       fen = DEFAULT_FEN;
-      is >> token; // consume "moves" if present
+      is >> token;
     } else if (token == "fen") {
       while (is >> token && token != "moves") {
         if (!fen.empty())
@@ -992,15 +838,11 @@ namespace {
         fen += token;
       }
     } else {
-      return; // malformed
+      return;
     }
 
-    pos.emplace(); // set() assumes a freshly-constructed Position
+    pos.emplace(); // set needs a fresh position
     if (!Position::set(fen, *pos)) {
-      // A malformed FEN: `*pos` is now a partially-built garbage position (set() stops the
-      // instant it finds the problem, without undoing what came before) — reset to a
-      // known-good position rather than handing `go`/`eval`/`d` something that could itself
-      // misbehave on it (e.g. a missing king breaking bsf() on an empty bitboard).
       std::cout << "info string ignoring malformed FEN (reset to startpos): " << fen << "\n";
       pos.emplace();
       Position::set(DEFAULT_FEN, *pos);
@@ -1018,14 +860,11 @@ namespace {
   }
 
   constexpr int     DEFAULT_DEPTH    = 12;
-  constexpr int64_t MOVE_OVERHEAD_MS = 30; // safety buffer for GUI/transport lag
-  constexpr int64_t URGENT_MS        = 200; // panic floor: never plan to leave less than this on the clock
+  constexpr int64_t MOVE_OVERHEAD_MS = 30;
+  constexpr int64_t URGENT_MS        = 200;
 
-  // Handles "go ...". "go perft <depth> [noncache]" counts move-generation nodes; otherwise
-  // it runs the iterative-deepening search. Recognised limits: depth <n>, infinite,
-  // movetime <ms>, wtime/btime/winc/binc/movestogo. (searchmoves/ponder/nodes/mate ignored.)
   void go_cmd(Position &pos, std::istringstream &is) {
-    stop_search(); // never run two searches at once, nor search while pos can change
+    stop_search(); // serialize searches
 
     int         depth    = 0;
     int64_t     movetime = 0, wtime = 0, btime = 0, winc = 0, binc = 0;
@@ -1037,11 +876,9 @@ namespace {
       if (token == "perft") {
         int d = 1;
         is >> d;
-        // Optional trailing "noncache": skip the perft-hash memoisation so every subtree is
-        // recomputed (still bulk-counted at the leaves). Default uses the cache.
         std::string opt;
         const bool  use_cache = !(is >> opt && opt == "noncache");
-        run_perft(pos, d, use_cache); // synchronous: perft is a debug node count, not a game move
+        run_perft(pos, d, use_cache);
         return;
       }
       if (token == "depth")
@@ -1064,54 +901,37 @@ namespace {
         infinite = true;
     }
 
-    // Soft node cap: set (or cleared) for EVERY go, so a previous "go nodes" can't leak.
     search::set_node_limit(nodes > 0 ? uint64_t(nodes) : 0);
 
-    // Resolve the limits into (max_depth, soft_ms, hard_ms). Time limits drive the search to
-    // the ply ceiling and let the clock stop it; a bare depth caps the depth instead.
     int     max_depth = DEFAULT_DEPTH;
     int64_t soft_ms = 0, hard_ms = 0;
     if (nodes > 0)
-      max_depth = search::MAX_PLY; // node-capped search: run until the cap stops it
+      max_depth = search::MAX_PLY;
     if (movetime > 0) {
       max_depth = search::MAX_PLY;
       hard_ms   = std::max<int64_t>(movetime - MOVE_OVERHEAD_MS, 1);
-      soft_ms   = 0; // fixed move time: run the whole budget
+      soft_ms   = 0;
     } else if (wtime > 0 || btime > 0) {
       max_depth         = search::MAX_PLY;
       const int64_t t   = pos.turn() == WHITE ? wtime : btime;
       const int64_t inc = pos.turn() == WHITE ? winc : binc;
       const int     mtg = movestogo > 0 ? movestogo : 40;
       const int64_t avail = std::max<int64_t>(t - MOVE_OVERHEAD_MS, 1);
-      // A share of the clock plus most of the increment, hard-capped at 3x that (and never
-      // more than half the remaining time, with a small reserve so lag can't flag us).
       const int64_t opt     = std::min<int64_t>(avail / mtg + 3 * inc / 4, std::max<int64_t>(avail / 2, 1));
       const int64_t reserve = std::clamp<int64_t>(t / 10, MOVE_OVERHEAD_MS, 500);
       soft_ms               = std::max<int64_t>(opt, 1);
       hard_ms = std::max<int64_t>(1, std::min<int64_t>({3 * opt, std::max<int64_t>(avail / 2, 1), t - reserve}));
-      // Urgent floor: whatever the budget formula above says, never let the hard deadline plan
-      // to leave less than URGENT_MS on the clock. Since the deadline is polled every 2048
-      // nodes and after every root move (see time_up() in search.cpp), this also catches the
-      // position dynamically running long mid-search — not just a `go` that already starts
-      // with little time left — and returns whatever bestmove the search has by then.
       hard_ms = std::min(hard_ms, std::max<int64_t>(t - URGENT_MS, 1));
       soft_ms = std::min(soft_ms, hard_ms);
     } else if (infinite) {
-      max_depth = search::MAX_PLY; // effectively until "stop"
+      max_depth = search::MAX_PLY;
     } else if (depth > 0)
       max_depth = depth;
-    if (depth > 0) // an explicit depth is always an upper bound, even alongside a time limit
+    if (depth > 0)
       max_depth = std::min(max_depth, depth);
 
-    // clear_stop() MUST happen here, synchronously on this (the UCI) thread, before the search
-    // thread is spawned — not inside think() on the new thread, which could start AFTER this
-    // thread has already read and processed a "stop" for it, silently discarding that request
-    // (found by testing "go depth 99999" immediately followed by "stop": the search ran to
-    // completion instead of stopping, because think()'s old internal reset raced the stop).
     search::clear_stop();
 
-    // Search on a background thread; the loop keeps reading stdin so "stop"/"isready" work.
-    // `pos` is safe to capture by pointer: every pos-mutating command calls stop_search() first.
     Position *pp = &pos;
     g_search     = std::thread([pp, max_depth, soft_ms, hard_ms]() {
       search::Result r = search::think(
@@ -1156,13 +976,12 @@ void uci::loop(bool tune) {
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
       std::cout << "option name Contempt type spin default 0 min -100 max 100\n"; // cp cost of a draw
       std::cout << "option name EvalFile type string default <embedded>\n";
-      if (tune) // hidden search-tuning knobs, only under --debug (tools/spsa.py discovers these)
+      if (tune) // hidden spsa options
         for (const auto &p: search::tunables())
           std::cout << "option name " << p.name << " type spin default " << p.def << " min " << p.lo << " max "
                     << p.hi << "\n";
       std::cout << "uciok\n";
     } else if (cmd == "isready") {
-      // Must answer even mid-search, so this never touches engine state.
       std::lock_guard<std::mutex> lk(g_out);
       std::cout << "readyok\n" << std::flush;
     } else if (cmd == "ucinewgame") {
@@ -1170,19 +989,17 @@ void uci::loop(bool tune) {
       pos.emplace();
       Position::set(DEFAULT_FEN, *pos);
       tt::clear();
-      search::new_game(); // history tables persist across "go"s, but not across games
+      search::new_game();
     } else if (cmd == "position") {
       stop_search();
       position_cmd(pos, is);
     } else if (cmd == "go") {
       go_cmd(*pos, is);
     } else if (cmd == "stop") {
-      search::request_stop(); // the search thread finishes promptly and prints its bestmove
+      search::request_stop();
     } else if (cmd == "d" || cmd == "display") {
       display_cmd(*pos);
     } else if (cmd == "eval") {
-      // Debug helper (like Stockfish's "eval"): the raw static NNUE evaluation of the current
-      // position via a full accumulator refresh. No search — for net testing (see parity.py).
       if (!nnue::loaded())
         std::cout << "info string no NNUE net loaded (use setoption name EvalFile value <path>)\n";
       else {
@@ -1191,11 +1008,10 @@ void uci::loop(bool tune) {
                   << " cp (white)\n";
       }
     } else if (cmd == "setoption") {
-      stop_search(); // resizing the TT under a running search is unsafe
-      // setoption name <id> [value <x>]
+      stop_search(); // stop before resize
       std::string token;
       std::string name;
-      is >> token >> name >> token; // "name", <id>, "value"
+      is >> token >> name >> token;
       if (name == "Hash") {
         int mb = 0;
         if (is >> mb) {
@@ -1203,21 +1019,16 @@ void uci::loop(bool tune) {
           tt::resize(size_t(mb));
         }
       } else if (name == "Threads") {
-        // Drives both the perft workers and the lazy-SMP helper pool (Threads-1 helpers).
         int t = 0;
         if (is >> t) {
           g_threads = t < 1 ? 1 : (t > 1024 ? 1024 : t);
           search::set_threads(g_threads);
         }
       } else if (name == "Contempt") {
-        // Centipawns the engine's own side pays to avoid a draw (negative: seeks draws). 0
-        // reproduces the old unconditional draw==0 exactly.
         int cp = 0;
         if (is >> cp)
           search::set_contempt(std::clamp(cp, -100, 100));
       } else if (name == "EvalFile") {
-        // The value is the rest of the line (paths can contain spaces). A bad file keeps the
-        // currently loaded net (the embedded default) and reports why.
         std::string path;
         std::getline(is, path);
         const size_t start = path.find_first_not_of(' ');
@@ -1229,21 +1040,18 @@ void uci::loop(bool tune) {
         else
           std::cout << "info string EvalFile loaded: " << path << "\n";
       } else if (tune) {
-        // Search-tuning knobs (only settable under --debug, matching their advertisement).
         for (const auto &p: search::tunables())
           if (name == p.name) {
             int v = 0;
             if (is >> v) {
               *p.p = std::clamp(v, p.lo, p.hi);
-              search::params_dirty(); // the LMR grid may depend on what changed
+              search::params_dirty();
             }
             break;
           }
       }
-      // (unknown options: silently ignored, per the UCI spec)
     } else if (cmd == "bench") {
-      // "bench [depth]" = the search signature; "bench evalnps" = the NNUE micro-benchmark.
-      stop_search(); // bench owns the TT/heuristics while it runs
+      stop_search();
       std::string what;
       is >> what;
       if (what == "evalnps")
@@ -1253,8 +1061,6 @@ void uci::loop(bool tune) {
         bench_cmd(d > 0 ? d : BENCH_DEPTH);
       }
     } else if (cmd == "datagen") {
-      // Hidden: datagen <count> <out.bf> [nodes=5000] [seed=1] — in-engine self-play data
-      // generation (src/datagen.h). Blocks this thread until done; Ctrl-C safe (flushed per game).
       stop_search();
       uint64_t    count = 0, nodes = 5000, seed = 1, tmp = 0;
       std::string out;
@@ -1268,9 +1074,6 @@ void uci::loop(bool tune) {
       else
         datagen::run(count, out, nodes, seed);
     } else if (cmd == "selftest") {
-      // Hidden test commands (not advertised): "selftest {nnue [games] [maxply] | perft | see |
-      // draw | search | contempt | stop | all}". selftest_search drives the shared TT/history/
-      // SMP pool directly, so stop any running search first, exactly like bench.
       stop_search();
       std::string what;
       is >> what;
@@ -1293,15 +1096,13 @@ void uci::loop(bool tune) {
       else if (what == "all")
         selftest_all();
     } else if (cmd == "register" || cmd.empty()) {
-      // accepted but no-op
     } else if (cmd == "quit" || cmd == "exit") {
       stop_search();
       break;
     }
-    // unknown commands are silently ignored, as the UCI spec requires
 
     std::cout.flush();
   }
 
-  stop_search(); // joins the search thread on EOF/quit so it isn't destroyed while joinable
+  stop_search(); // join on eof
 }

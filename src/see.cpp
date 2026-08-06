@@ -5,8 +5,6 @@ namespace {
 
   using search::PIECE_VAL;
 
-  // All pieces of both colors attacking `s` under occupancy `occ` (kings included — the swap
-  // loop needs them; Position::attackers_from omits kings and is single-color).
   [[gnu::pure, gnu::always_inline]] inline Bitboard attackers_to(const Position &pos, Square s, Bitboard occ) {
     return (pawn_attacks<WHITE>(s) & pos.bitboard_of(BLACK_PAWN)) |
            (pawn_attacks<BLACK>(s) & pos.bitboard_of(WHITE_PAWN)) |
@@ -24,10 +22,6 @@ namespace {
 
 } // namespace
 
-// Called from move ordering (every capture, every node) and from three separate pruning sites
-// in the main search — one of the hottest non-inlined functions in the engine. Pure: reads
-// `pos` and the (immutable after init) attack tables, writes nothing. Ignoring the result would
-// always be a pruning/ordering bug, hence `nodiscard`.
 [[gnu::pure, gnu::hot, nodiscard]] bool search::see_ge(const Position &pos, Move m, int threshold) {
   const MoveFlags f = m.flags();
   if (f == OO || f == OOO) // castling never wins or loses material
@@ -35,13 +29,10 @@ namespace {
 
   const Square from = m.from(), to = m.to();
 
-  // Balance after we make the capture (quiet moves capture nothing; EP captures a pawn that is
-  // not on `to`). Promotion gains are ignored — conservative, and keeps the loop simple.
   int swap = (f == EN_PASSANT ? PIECE_VAL[PAWN] : PIECE_VAL[type_of(pos.at(to))]) - threshold;
   if (swap < 0) // even capturing for free is not enough
     return false;
 
-  // ... and after the opponent recaptures our moving piece for free.
   swap = PIECE_VAL[type_of(pos.at(from))] - swap;
   if (swap <= 0) // we still meet the threshold even if recaptured
     return true;
@@ -62,10 +53,8 @@ namespace {
     attackers &= occ;
     const Bitboard own = attackers & (stm == WHITE ? color_bb<WHITE>(pos) : color_bb<BLACK>(pos));
     if (!own)
-      break; // side to move has no attacker left -> current `result` stands
+      break; // no attacker remains
 
-    // Least valuable attacker first. The king is special: capturing with it is only legal if
-    // the opponent has no attacker left — otherwise the flip is undone.
     Bitboard bb = 0;
     int      pt = PAWN;
     while (pt < KING && !(bb = own & pos.bitboard_of(make_piece(stm, PieceType(pt)))))

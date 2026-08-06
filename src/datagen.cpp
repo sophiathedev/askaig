@@ -10,9 +10,6 @@
 #include "tt.h"
 #include "types.h"
 
-// Self-play generator. Per game: a random opening (8 or 9 plies, alternating so both colors
-// lead), a balance gate, then node-limited self-play to the end; every quiet position is
-// buffered and the finished game's result is stamped into the records before they hit disk.
 namespace {
 
   using search::do_move;
@@ -26,7 +23,6 @@ namespace {
   constexpr int DRAW_ADJ_PLIES  = 8; // consecutive |score| <= 10 plies (after ply 80)
   constexpr int MAX_PLIES       = 400;
 
-  // bulletformat "ChessBoard": see tools/nnue/convert_fen.py for the authoritative layout.
   struct Record {
     uint64_t occ;
     uint8_t  pcs[16];
@@ -38,8 +34,6 @@ namespace {
   };
   static_assert(sizeof(Record) == 32);
 
-  // Encodes `pos` stm-normalized: black to move mirrors squares (^56) and swaps colors, so
-  // nibble color 0 always means "the side to move". `score` is already stm-relative.
   Record encode(const Position &pos, int score) {
     Record     r{};
     const bool black = pos.turn() == BLACK;
@@ -87,7 +81,6 @@ namespace {
     return r.score;
   }
 
-  // Compact duration for progress lines: "1h05m" / "12m30s" / "45s".
   std::string fmt_hms(double s) {
     if (!(s >= 0) || s > 3.15e9)
       return "?";
@@ -133,7 +126,6 @@ void datagen::run(uint64_t count, const std::string &out, uint64_t nodes, uint64
     Position pos;
     Position::set(DEFAULT_FEN, pos);
 
-    // Random opening, alternating length so both colors get the first "real" move.
     const int plies = 8 + int(games & 1);
     bool      ok    = true;
     for (int i = 0; i < plies; ++i) {
@@ -148,10 +140,9 @@ void datagen::run(uint64_t count, const std::string &out, uint64_t nodes, uint64
     if (!ok || count_legals(pos) == 0)
       continue;
     if (std::abs(search_once(pos, nullptr)) > OPENING_GATE_CP)
-      continue; // lopsided opening: labels would echo the imbalance, not the play
+      continue;
 
-    // Play the game out.
-    int wr         = -1; // white-POV result: 0 loss, 1 draw, 2 win (-1 = still running)
+    int wr         = -1; // white pov: 0 loss, 1 draw, 2 win
     int win_plies = 0, draw_plies = 0;
     for (int ply = 0; ply < MAX_PLIES; ++ply) {
       if (count_legals(pos) == 0) {
@@ -171,7 +162,6 @@ void datagen::run(uint64_t count, const std::string &out, uint64_t nodes, uint64
       if (!stm_in_check(pos) && is_quiet(best) && std::abs(score) < SCORE_CAP_CP)
         game.push_back({encode(pos, score), pos.turn() == BLACK});
 
-      // Adjudication: a held decisive score ends the game; a long dead-equal stretch draws it.
       win_plies  = std::abs(score) >= SCORE_CAP_CP ? win_plies + 1 : 0;
       draw_plies = std::abs(score) <= 10 && ply >= 80 ? draw_plies + 1 : 0;
       if (win_plies >= WIN_ADJ_PLIES) {
@@ -187,7 +177,7 @@ void datagen::run(uint64_t count, const std::string &out, uint64_t nodes, uint64
       do_move(pos, best);
     }
     if (wr < 0)
-      wr = 1; // ply cap / aborted: call it a draw rather than invent a winner
+      wr = 1; // cap and abort count as draws
 
     for (const Pending &p: game) {
       Record rec = p.rec;

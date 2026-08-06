@@ -12,27 +12,22 @@
   #include <arm_neon.h>
 #endif
 
-// The loader memcpys little-endian int16/int32 weight blocks straight into memory; a
-// big-endian port would need byte swaps here, so fail loudly at compile time instead.
 static_assert(std::endian::native == std::endian::little, "NNUE net loading assumes a little-endian host");
 
 namespace {
 
   using namespace nnue;
 
-  // The quantized network, in the exact layout the kernels read. One global copy (~6.3 MB,
-  // zero-initialised BSS; nets are immutable after load, every thread reads the same weights).
   struct Network {
-    alignas(64) int16_t ft_w[FEATURES * HL]; // feature-major: row f = ft_w[f*HL .. f*HL+HL)
+    alignas(64) int16_t ft_w[FEATURES * HL];
     alignas(64) int16_t ft_b[HL];
-    alignas(64) int16_t out_w[OUT_BUCKETS][2 * HL]; // [bucket][stm half | other half]
+    alignas(64) int16_t out_w[OUT_BUCKETS][2 * HL];
     int32_t out_b[OUT_BUCKETS];
   };
 
   Network g_net;
   bool    g_loaded = false;
 
-  // King context of a perspective given its PERSPECTIVE-ORIENTED king square (black: sq^56).
   [[gnu::pure, gnu::always_inline]] inline KingCtx king_ctx(Square oriented_ksq) {
     const bool mir = file_of(oriented_ksq) >= EFILE;
     const int  sq  = mir ? (oriented_ksq ^ 7) : oriented_ksq;
@@ -44,7 +39,6 @@ namespace {
     return king_ctx(persp == WHITE ? k : Square(k ^ 56));
   }
 
-  // Feature index of (pc, s) from `persp`'s point of view under king context `c`.
   [[gnu::const, gnu::always_inline]] inline int feature_index(Color persp, Piece pc, Square s, KingCtx c) {
     const int rel = color_of(pc) == persp ? 0 : 1;
     int       sq  = persp == WHITE ? s : (s ^ 56);
@@ -57,18 +51,10 @@ namespace {
     return &g_net.ft_w[feature_index(persp, pc, s, c) * HL];
   }
 
-  // The material output bucket: 2..32 pieces -> 0..7.
   [[gnu::pure, gnu::always_inline]] inline int out_bucket(const Position &pos) {
     return (pop_count(pos.all_pieces<WHITE>() | pos.all_pieces<BLACK>()) - 2) / 4;
   }
 
-  // --- Kernels ---------------------------------------------------------------------------------
-  // Three implementations selected at compile time: AVX2, NEON, scalar. All are exact integer
-  // math (int16 adds wrap identically, int32 sums are order-independent mod 2^32), so the paths
-  // are bit-identical — `selftest nnue` pins the vector paths to the scalar reference.
-  //
-  // Alignment: Network/Accumulator arrays are alignas(64) and one feature row is HL*2 bytes,
-  // so every row and half is 64-byte aligned — aligned vector loads throughout, no tail loops.
 
 #if defined(SIMD) && defined(ARCH_AVX2)
 
@@ -101,7 +87,6 @@ namespace {
     }
   }
 
-  // Refresh: tiled so the accumulator tile stays in registers across all piece rows.
   [[gnu::hot]] void refresh_kernel(int16_t *dst, const int16_t *const *rows, int n) {
     for (int i = 0; i < HL; i += 64) { // 4 x 16-lane vectors per tile
       __m256i v0 = _mm256_load_si256(reinterpret_cast<const __m256i *>(g_net.ft_b + i));
@@ -122,8 +107,6 @@ namespace {
     }
   }
 
-  // In-place diff apply for the refresh cache: acc += sum(add rows) - sum(sub rows), tiled
-  // like refresh_kernel so each accumulator tile is loaded and stored exactly once.
   [[gnu::hot]] void apply_rows_kernel(int16_t *acc, const int16_t *const *add, int na, const int16_t *const *sub,
                                       int ns) {
     for (int i = 0; i < HL; i += 64) { // 4 x 16-lane vectors per tile
@@ -152,7 +135,6 @@ namespace {
     }
   }
 
-  // One half of the SCReLU dot: sum clamp(a,0,QA) * (clamp(a,0,QA) * w) in int32 lanes.
   [[gnu::pure, gnu::hot]] __m256i dot_half(const int16_t *a, const int16_t *w) {
     const __m256i zero = _mm256_setzero_si256();
     const __m256i qa   = _mm256_set1_epi16(QA);
@@ -180,9 +162,6 @@ namespace {
 
 #elif defined(SIMD) && defined(ARCH_ARM_NEON)
 
-  // The add/sub update kernels process an 8-vector (64 int16) tile per iteration — eight
-  // independent dependency chains keep the four SIMD pipes filled across the multi-cycle
-  // load latencies, and 1/8 the loop-branch overhead.
   [[gnu::hot]] void add1_sub1(int16_t *dst, const int16_t *src, const int16_t *a0, const int16_t *s0) {
     for (int i = 0; i < HL; i += 64) {
       int16x8_t v0 = vsubq_s16(vaddq_s16(vld1q_s16(src + i), vld1q_s16(a0 + i)), vld1q_s16(s0 + i));
@@ -287,7 +266,6 @@ namespace {
     }
   }
 
-  // In-place diff apply for the refresh cache — see the AVX2 twin above.
   [[gnu::hot]] void apply_rows_kernel(int16_t *acc, const int16_t *const *add, int na, const int16_t *const *sub,
                                       int ns) {
     for (int i = 0; i < HL; i += 64) { // 8 x 8-lane vectors per tile
@@ -335,14 +313,7 @@ namespace {
   [[gnu::pure, gnu::hot]] int32_t dot_reduce(const int16_t *stm_a, const int16_t *opp_a, const int16_t *w) {
     const int16x8_t zero = vdupq_n_s16(0);
     const int16x8_t qa   = vdupq_n_s16(QA);
-    const int16_t  *wo   = w + HL; // opponent half of the bucket's weights
-    // Both perspective halves in ONE loop with EIGHT independent accumulators. vmlal has
-    // multi-cycle latency and Apple cores run four SIMD pipes: four chains per half (the old
-    // dot_half) leaves the pipes under-filled between dependent iterations — interleaving the
-    // two halves doubles the independent work in flight and halves loop overhead. Each
-    // accumulator sees exactly the same additions in the same order as before, and the final
-    // reduction keeps the old (s0+s1)+(s2+s3), stm-half + opp-half structure: int32 wraparound
-    // addition makes the whole thing bit-identical to the two-call version.
+    const int16_t  *wo   = w + HL;
     int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0), a2 = vdupq_n_s32(0), a3 = vdupq_n_s32(0);
     int32x4_t b0 = vdupq_n_s32(0), b1 = vdupq_n_s32(0), b2 = vdupq_n_s32(0), b3 = vdupq_n_s32(0);
     for (int i = 0; i < HL; i += 16) {
@@ -350,7 +321,6 @@ namespace {
       int16x8_t v1 = vminq_s16(vmaxq_s16(vld1q_s16(stm_a + i + 8), zero), qa);
       int16x8_t u0 = vminq_s16(vmaxq_s16(vld1q_s16(opp_a + i), zero), qa);
       int16x8_t u1 = vminq_s16(vmaxq_s16(vld1q_s16(opp_a + i + 8), zero), qa);
-      // v*w fits int16 exactly (|w_q| <= 127) — the NEON equivalent of AVX2's mullo+madd.
       const int16x8_t p0 = vmulq_s16(v0, vld1q_s16(w + i));
       const int16x8_t p1 = vmulq_s16(v1, vld1q_s16(w + i + 8));
       const int16x8_t q0 = vmulq_s16(u0, vld1q_s16(wo + i));
@@ -394,8 +364,6 @@ namespace {
     }
   }
 
-  // In-place diff apply for the refresh cache — see the AVX2/NEON twins above. All three are
-  // exact int16 wraparound arithmetic, so the paths stay bit-identical.
   [[gnu::hot]] void apply_rows_kernel(int16_t *acc, const int16_t *const *add, int na, const int16_t *const *sub,
                                       int ns) {
     for (int k = 0; k < na; ++k) {
@@ -426,9 +394,6 @@ namespace {
 
 #endif
 
-  // Rebuilds one perspective half from scratch (bias + every piece). Reference path for
-  // evaluate_refresh only; the search refreshes through the cache (refresh_half_cached),
-  // which selftest nnue pins bit-exactly against this.
   [[gnu::hot]] void refresh_half(Accumulator &acc, Color persp, const Position &pos) {
     const KingCtx  c = king_ctx_of(pos, persp);
     const int16_t *rows[40]; // 32 pieces max in a legal game; headroom for weird FEN input
@@ -445,30 +410,27 @@ namespace {
     acc.computed[persp] = true;
   }
 
-  // Builds one perspective half of `child` from `parent` by applying child.dp under a king
-  // context that is KNOWN not to change (the caller checked). Kings are ordinary features.
   [[gnu::hot]] void apply_half(Accumulator &child, const Accumulator &parent, Color persp) {
     const DirtyPiece &dp  = child.dp;
     const KingCtx     c   = parent.ctx[persp];
     const int16_t    *src = parent.v[persp];
     int16_t          *dst = child.v[persp];
 
-    if (dp.n_add == 2) // castling: 2 adds, 2 subs
+    if (dp.n_add == 2)
       add2_sub2(dst, src, ft_row(persp, dp.add_pc[0], dp.add_sq[0], c), ft_row(persp, dp.add_pc[1], dp.add_sq[1], c),
                 ft_row(persp, dp.sub_pc[0], dp.sub_sq[0], c), ft_row(persp, dp.sub_pc[1], dp.sub_sq[1], c));
-    else if (dp.n_sub == 2) // capture / en passant: 1 add, 2 subs
+    else if (dp.n_sub == 2)
       add1_sub2(dst, src, ft_row(persp, dp.add_pc[0], dp.add_sq[0], c), ft_row(persp, dp.sub_pc[0], dp.sub_sq[0], c),
                 ft_row(persp, dp.sub_pc[1], dp.sub_sq[1], c));
-    else if (dp.n_add == 1) // quiet / promotion: 1 add, 1 sub
+    else if (dp.n_add == 1)
       add1_sub1(dst, src, ft_row(persp, dp.add_pc[0], dp.add_sq[0], c), ft_row(persp, dp.sub_pc[0], dp.sub_sq[0], c));
-    else // null move: no feature changes
+    else
       std::memcpy(dst, src, sizeof(int16_t) * HL);
 
     child.ctx[persp]      = c;
     child.computed[persp] = true;
   }
 
-  // True when `dp` moves `persp`'s own king (adds always contain the mover).
   [[gnu::pure, gnu::always_inline]] inline bool moves_own_king(const DirtyPiece &dp, Color persp) {
     for (int i = 0; i < dp.n_add; ++i)
       if (dp.add_pc[i] == make_piece(persp, KING))
@@ -476,7 +438,6 @@ namespace {
     return false;
   }
 
-  // New king context after `dp` (call only when moves_own_king): from the king's add square.
   [[gnu::pure, gnu::always_inline]] inline KingCtx ctx_after(const DirtyPiece &dp, Color persp) {
     for (int i = 0; i < dp.n_add; ++i)
       if (dp.add_pc[i] == make_piece(persp, KING))
@@ -484,16 +445,13 @@ namespace {
     return {0, false}; // unreachable
   }
 
-  // SCReLU output layer through the position's material bucket, stm half first.
   [[gnu::pure, gnu::hot]] int output_dot(const Accumulator &acc, Color stm, int bucket) {
     const int32_t sum = dot_reduce(acc.v[stm], acc.v[~stm], g_net.out_w[bucket]);
-    // sum is at scale QA^2*QB; one /QA plus the bias (at QA*QB) then rescale to centipawns.
     return ((sum / QA) + g_net.out_b[bucket]) * SCALE / (QA * QB);
   }
 
 } // namespace
 
-// --- Loading -------------------------------------------------------------------------------
 
 bool nnue::load_buffer(const unsigned char *data, size_t size, std::string *err) {
   const auto fail = [err](const char *m) {
@@ -547,8 +505,6 @@ bool nnue::load_file(const std::string &path, std::string *err) {
   return load_buffer(buf.data(), buf.size(), err);
 }
 
-// The build-time default net (a byte copy of networks/default.nnue), generated into the
-// build tree by cmake/embed_file.cmake.
 extern const unsigned char g_default_net[];
 extern const size_t        g_default_net_size;
 
@@ -556,7 +512,6 @@ bool nnue::load_embedded(std::string *err) { return load_buffer(g_default_net, g
 
 bool nnue::loaded() { return g_loaded; }
 
-// --- Evaluator -----------------------------------------------------------------------------
 
 nnue::Evaluator::Evaluator() : stack(new Accumulator[MAX_PLY + 8]), finny(new RefreshTable), top(0) {
   stack[0].computed[WHITE] = stack[0].computed[BLACK] = false;
@@ -564,18 +519,14 @@ nnue::Evaluator::Evaluator() : stack(new Accumulator[MAX_PLY + 8]), finny(new Re
 
 void nnue::Evaluator::reset(const Position &pos) {
   top           = 0;
-  finny->inited = false; // net weights may have changed since the last search (EvalFile)
+  finny->inited = false; // net may have changed
   refresh_half_cached(WHITE, pos);
   refresh_half_cached(BLACK, pos);
 }
 
-// Rebuilds stack[top]'s `persp` half through the refresh cache: diff the position's piece
-// placement against the cached one for this (perspective, mirror, bucket) context and apply
-// just the difference — a handful of rows versus the ~32 a from-scratch rebuild pays.
 [[gnu::hot]] void nnue::Evaluator::refresh_half_cached(Color persp, const Position &pos) {
   const KingCtx c = king_ctx_of(pos, persp);
   if (!finny->inited) [[unlikely]] {
-    // First use after reset(): every cached context restarts from the empty board.
     for (auto &per_persp: finny->e)
       for (auto &per_mirror: per_persp)
         for (RefreshEntry &e: per_mirror) {
@@ -601,7 +552,6 @@ void nnue::Evaluator::reset(const Position &pos) {
     e.bb[pc] = now;
   }
   if (over) [[unlikely]] {
-    // A non-game FEN blew the diff headroom: rebuild the entry from scratch instead.
     const int16_t *rows[40];
     int            n = 0;
     for (int pc = WHITE_PAWN; pc <= BLACK_KING; ++pc) {
@@ -622,9 +572,6 @@ void nnue::Evaluator::reset(const Position &pos) {
   acc.computed[persp] = true;
 }
 
-// Records the feature changes of `m` (to be played on `before`) into a new stack entry.
-// Mirrors the play<C>() switch exactly; castling squares are hardcoded per color and the
-// captured piece is read from `before`.
 [[gnu::hot]] void nnue::Evaluator::push(const Position &before, Move m) {
   assert(top + 1 < MAX_PLY + 8);
   Accumulator &a     = stack[++top];
@@ -706,7 +653,7 @@ void nnue::Evaluator::push_null() {
   Accumulator &a    = stack[++top];
   a.computed[WHITE] = false;
   a.computed[BLACK] = false;
-  a.dp.n_add = a.dp.n_sub = 0; // no feature changes; applied as a copy
+  a.dp.n_add = a.dp.n_sub = 0;
 }
 
 [[gnu::hot]] void nnue::Evaluator::pop() {
@@ -714,10 +661,6 @@ void nnue::Evaluator::push_null() {
   --top;
 }
 
-// Makes stack[top]'s `persp` half valid: walk back to the nearest computed ancestor and apply
-// the recorded updates forward — unless an own-king move changes the (bucket, mirror) context
-// anywhere in the chain (or there is no usable ancestor), in which case the half is rebuilt
-// through the refresh cache (refresh_half_cached).
 [[gnu::hot]] void nnue::Evaluator::ensure_half(Color persp, const Position &pos) {
   if (stack[top].computed[persp])
     return;
@@ -731,7 +674,6 @@ void nnue::Evaluator::push_null() {
     return;
   }
 
-  // Scan forward: any context-crossing king move forces a refresh instead.
   KingCtx c = stack[j].ctx[persp];
   for (int k = j + 1; k <= top; ++k) {
     if (moves_own_king(stack[k].dp, persp)) {
@@ -747,7 +689,6 @@ void nnue::Evaluator::push_null() {
     apply_half(stack[k], stack[k - 1], persp);
 }
 
-// The main search's static-eval entry point (lazy: pays for the walk-back only when called).
 [[gnu::hot, nodiscard]] int nnue::Evaluator::evaluate(const Position &pos) {
   assert(g_loaded);
   ensure_half(WHITE, pos);
@@ -755,8 +696,6 @@ void nnue::Evaluator::push_null() {
   return output_dot(stack[top], pos.turn(), out_bucket(pos));
 }
 
-// One-shot eval via a full LOCAL from-scratch refresh: the reference path for the UCI
-// `eval`/`d` commands and the parity selftests.
 [[gnu::pure, nodiscard]] int nnue::evaluate_refresh(const Position &pos) {
   assert(g_loaded);
   Accumulator acc;

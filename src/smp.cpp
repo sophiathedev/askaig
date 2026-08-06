@@ -2,8 +2,6 @@
 #include <algorithm>
 #include <cstring>
 
-// Lazy SMP pool lifecycle — see smp.h. The searching lives in search.cpp (smp_worker_iterate);
-// this file only owns threads, wake-ups and counters.
 namespace {
 
   search::ThreadPool g_pool;
@@ -53,12 +51,9 @@ void search::ThreadPool::start_search(const Position &pos, int md) {
     return;
   {
     std::lock_guard<std::mutex> lk(mtx);
-    // Position::operator= is deleted; byte-copy, same as the helpers clone it back out.
     std::memcpy(static_cast<void *>(&root), static_cast<const void *>(&pos), sizeof(Position));
     max_depth = md;
     ++gen;
-    // Count every helper as searching UP FRONT: think() may reach wait_idle() before a slow
-    // helper even wakes for this generation, and must still wait for it.
     searching = int(tds.size());
   }
   cv.notify_all();
