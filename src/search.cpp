@@ -392,7 +392,8 @@ namespace {
     if (!in_check)
       improving |= ss->static_eval >= beta;
     if (!PV && !in_check && !excluded) {
-      const int pc_beta = beta + prm.PC_MARGIN - prm.PC_IMP * improving;
+      const int pc_beta  = beta + prm.PC_MARGIN - prm.PC_IMP * improving;
+      const int pc_depth = std::max(depth - (improving ? 5 : 3), 0);
       if (depth >= prm.PC_DEPTH && std::abs(beta) < MATE_IN_MAX &&
           !(tp.hit && tp.depth >= depth - 3 && ttsc != tt::VALUE_NONE_TT && ttsc < pc_beta)) {
         MovePicker pcpick(pos, g_hist, ttm.is_capture() ? ttm : Move(), nullptr, Move(), nullptr, nullptr,
@@ -407,14 +408,14 @@ namespace {
           do_move(pos, m);
           tt::prefetch(tt_key(pos));
           int v = -qsearch<false>(t, pos, ss + 1, -pc_beta, -pc_beta + 1, ply + 1);
-          if (v >= pc_beta)
-            v = -negamax<false>(t, pos, ss + 1, -pc_beta, -pc_beta + 1, depth - 4, ply + 1, !cutnode);
+          if (v >= pc_beta && pc_depth > 0)
+            v = -negamax<false>(t, pos, ss + 1, -pc_beta, -pc_beta + 1, pc_depth, ply + 1, !cutnode);
           undo_move(pos, m);
           t.ev.pop();
           if (stopped()) [[unlikely]]
             return 0;
           if (v >= pc_beta) {
-            tt::store(tp.slot, key, m, to_tt(v, ply), raw_eval, depth - 3, tt::LOWER, false);
+            tt::store(tp.slot, key, m, to_tt(v, ply), raw_eval, pc_depth + 1, tt::LOWER, false);
             return v;
           }
         }
