@@ -2,12 +2,23 @@
 <p align="center">A UCI chess engine in modern C++26 — bitboards, NNUE eval, lazy-SMP search.</p>
 
 > [!IMPORTANT]
-> This product was maintained by [@sophiathedev](https://github.com/sophiathedev) and Claude Fable 5.
+> This product was maintained by [@sophiathedev](https://github.com/sophiathedev) and having LLM's contributions.
 
 **Askaig** is a **UCI chess engine** in **C++26** — magic bitboards for move generation, an
 **NNUE** evaluation, and a heavily-pruned alpha-beta search parallelised with **lazy SMP**. Move
 generation is ported from [nkarve/surge](https://github.com/nkarve/surge) (MIT); everything else
 (NNUE inference, search, TT, UCI, SIMD) is built on top of it.
+
+---
+
+## Elo Ratings
+
+| Version      | STC <sub>8.0+0.08s  | LTC <sub>60.0+0.60s | VLTC <sub>2m24s+1.12s |
+| ------------ | ------------------- | ------------------- | --------------------- |
+| **20260704** | **3005<sub>(+610)** | **3193<sub>(+532)** | **3245<sub>(+536)**   |
+| 20260628     | 2395<sub>(-1)       | 2661<sub>(+23)      | 2709<sub>(-25)        |
+| 20260616     | 2396<sub>(+new)     | 2638<sub>(+new)     | 2734<sub>(+new)       |
+|              | cElo <sub>(∆ prev)  | cElo <sub>(∆ prev)  | cElo <sub>(∆ prev)    |
 
 ---
 
