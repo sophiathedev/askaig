@@ -9,6 +9,8 @@ cmake-build-*/
 /_archive_rewrite/
 /tools/*
 !/tools/nnue/
+!/tools/README.md
+!/tools/sprt_state.py
 tools/nnue/__pycache__/
 tools/nnue/*.pt
 build-tune/

@@ -6,6 +6,8 @@
 # node counts and tactical spot-checks confirm *correctness*, not Elo.
 #
 #   tools/sprt.sh [BASE]
+#   tools/sprt.sh --resume RUN_ID
+#   tools/sprt.sh --adopt CONFIG [BASE]
 #
 #     CANDIDATE  = build-pgo/askaig — a fresh PGO build of the CURRENT source tree.
 #     BASE       = the opponent. Two forms, auto-detected:
@@ -40,6 +42,41 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
+WORK="$HERE/work"
+RUNS="$WORK/sprt-runs"
+STATE_TOOL="$HERE/sprt_state.py"
+
+usage() {
+  echo "usage: tools/sprt.sh [BASE]"
+  echo "       tools/sprt.sh --resume RUN_ID"
+  echo "       tools/sprt.sh --adopt CONFIG [BASE]"
+}
+
+MODE=new
+BASE_REF=HEAD
+RESUME_RUN=""
+LEGACY_CONFIG=""
+case "${1:-}" in
+  --resume)
+    [ "$#" -eq 2 ] || { usage; exit 2; }
+    MODE=resume
+    RESUME_RUN="$2"
+    ;;
+  --adopt)
+    [ "$#" -ge 2 ] && [ "$#" -le 3 ] || { usage; exit 2; }
+    MODE=adopt
+    LEGACY_CONFIG="$2"
+    BASE_REF="${3:-HEAD}"
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    [ "$#" -le 1 ] || { usage; exit 2; }
+    BASE_REF="${1:-HEAD}"
+    ;;
+esac
 
 # Locate the fastchess match-runner: $FASTCHESS env wins, else search common locations.
 if [ -z "${FASTCHESS:-}" ]; then
@@ -48,16 +85,51 @@ if [ -z "${FASTCHESS:-}" ]; then
     if [ -n "$c" ] && [ -x "$c" ]; then FASTCHESS="$c"; break; fi
   done
 fi
+[ -n "${FASTCHESS:-}" ] && [ -x "$FASTCHESS" ] || {
+  echo "fastchess not found — set FASTCHESS=/path/to/fastchess (or run 'bash tools/setup.sh')"
+  exit 1
+}
+
+resolve_run_dir() {
+  case "$1" in
+    */*) printf '%s\n' "$1" ;;
+    *) printf '%s\n' "$RUNS/$1" ;;
+  esac
+}
+
+if [ "$MODE" = resume ]; then
+  RUN_DIR="$(resolve_run_dir "$RESUME_RUN")"
+  [ -d "$RUN_DIR" ] || { echo "SPRT run missing: $RUN_DIR"; exit 1; }
+  RUN_DIR="$(cd "$RUN_DIR" && pwd -P)"
+  CONFIG="$RUN_DIR/fastchess.json"
+  LOG="$RUN_DIR/fastchess.log"
+  [ -f "$CONFIG" ] || { echo "SPRT config missing: $CONFIG"; exit 1; }
+  [ -f "$RUN_DIR/checksums.sha256" ] || { echo "SPRT checksums missing: $RUN_DIR/checksums.sha256"; exit 1; }
+  (cd "$RUN_DIR" && shasum -a 256 -c checksums.sha256 >/dev/null) || {
+    echo "frozen engine checksum mismatch: $RUN_DIR"
+    exit 1
+  }
+  [ "$(python3 "$STATE_TOOL" get "$CONFIG" candidate)" = "$RUN_DIR/bin/cand" ] || {
+    echo "candidate path does not match the frozen run"
+    exit 1
+  }
+  [ "$(python3 "$STATE_TOOL" get "$CONFIG" baseline)" = "$RUN_DIR/bin/base" ] || {
+    echo "baseline path does not match the frozen run"
+    exit 1
+  }
+  python3 "$STATE_TOOL" validate "$CONFIG"
+  echo ">> resuming SPRT run: $RUN_DIR"
+  echo
+  "$FASTCHESS" -config file="$CONFIG" outname="$CONFIG" stats=true 2>&1 | tee -a "$LOG"
+  exit "${PIPESTATUS[0]}"
+fi
+
 BOOK="${BOOK:-$HERE/books/UHO_4060_v3.epd}"
 # Opening-book format passed to fastchess (epd|pgn). Default epd (UHO). A balanced PGN book
 # (e.g. books/8moves_v3.pgn) reaches endgames far more often — set BOOK_FORMAT=pgn for it. Pair
 # with ADJUDICATE=0 when testing endgame eval, or the resign rule ends won games before they
 # reach the bare-king phase those terms operate in.
 BOOK_FORMAT="${BOOK_FORMAT:-epd}"
-[ -n "${FASTCHESS:-}" ] && [ -x "$FASTCHESS" ] || {
-  echo "fastchess not found — set FASTCHESS=/path/to/fastchess (or run 'bash tools/setup.sh')"
-  exit 1
-}
 [ -f "$BOOK" ] || { echo "opening book missing — run 'bash tools/setup.sh' to download it"; exit 1; }
 
 TC="${TC:-5+0.05}"
@@ -76,8 +148,6 @@ ELO1="${ELO1:-10}"
 ALPHA="${ALPHA:-0.1}"
 BETA="${BETA:-0.1}"
 ROUNDS="${ROUNDS:-5000}"
-
-BASE_REF="${1:-HEAD}"
 
 # Adjudication — ends games whose outcome is no longer in doubt (the fishtest/OpenBench standard;
 # with an unbalanced UHO book MOST games end this way, which is the intended time saving, roughly
@@ -100,37 +170,93 @@ if [ "${ADJUDICATE:-1}" != "0" ]; then
   ADJ_ARGS="-draw movenumber=34 movecount=8 score=20 -resign movecount=4 score=700 twosided=true -maxmoves 200"
 fi
 
-WORK="$HERE/work"
-mkdir -p "$WORK"
+mkdir -p "$RUNS"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)-$(git -C "$ROOT" rev-parse --short HEAD)}"
+case "$RUN_ID" in
+  latest|*[^A-Za-z0-9._-]*) echo "invalid RUN_ID: $RUN_ID"; exit 1 ;;
+esac
+RUN_DIR="$RUNS/$RUN_ID"
+[ ! -e "$RUN_DIR" ] || { echo "SPRT run already exists: $RUN_DIR"; exit 1; }
 
-# --- Candidate: PGO build of the current source tree ---------------------------------------------
-CAND_DIR="$ROOT/build-pgo"
+LEGACY_CAND=""
+LEGACY_BASE=""
+LEGACY_PGN=""
+if [ "$MODE" = adopt ]; then
+  [ -f "$LEGACY_CONFIG" ] || { echo "legacy config missing: $LEGACY_CONFIG"; exit 1; }
+  LEGACY_CAND="$(python3 "$STATE_TOOL" get "$LEGACY_CONFIG" candidate)"
+  LEGACY_BASE="$(python3 "$STATE_TOOL" get "$LEGACY_CONFIG" baseline)"
+  LEGACY_PGN="$(python3 "$STATE_TOOL" get "$LEGACY_CONFIG" pgn)"
+  [ -f "$LEGACY_PGN" ] || { echo "legacy PGN missing: $LEGACY_PGN"; exit 1; }
+fi
+
 PGO_SCRIPT="$HERE/build_pgo.sh"
 [ -f "$PGO_SCRIPT" ] || { echo "PGO helper missing: $PGO_SCRIPT"; exit 1; }
-echo ">> building candidate (current tree, PGO) -> build-pgo/ ..."
-bash "$PGO_SCRIPT" "$ROOT"
-CAND_BIN="$CAND_DIR/askaig"
+
+if [ -n "$LEGACY_CAND" ] && [ -x "$LEGACY_CAND" ]; then
+  CAND_BIN="$LEGACY_CAND"
+  echo ">> adopting candidate binary: $CAND_BIN"
+else
+  echo ">> building candidate (current tree, PGO) -> build-pgo/ ..."
+  bash "$PGO_SCRIPT" "$ROOT"
+  CAND_BIN="$ROOT/build-pgo/askaig"
+fi
 [ -x "$CAND_BIN" ] || { echo "candidate binary missing: $CAND_BIN"; exit 1; }
 
-# --- Baseline: an external executable, or a PGO build of BASE_REF --------------------------------
-# If BASE_REF points at an executable (stockfish, another askaig binary, ...) play it directly — no
-# build. Otherwise materialise it in a throwaway worktree and give it an independent PGO profile.
-if [ -f "$BASE_REF" ] && [ -x "$BASE_REF" ]; then
+BASE_SRC=""
+cleanup() {
+  if [ -n "$BASE_SRC" ]; then
+    git -C "$ROOT" worktree remove --force "$BASE_SRC" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+if [ -n "$LEGACY_BASE" ] && [ -x "$LEGACY_BASE" ]; then
+  BASE_BIN="$LEGACY_BASE"
+  BASE_NAME="$(basename "$LEGACY_BASE")"
+  echo ">> adopting baseline binary: $BASE_BIN"
+elif [ -f "$BASE_REF" ] && [ -x "$BASE_REF" ]; then
   BASE_BIN="$(cd "$(dirname "$BASE_REF")" && pwd)/$(basename "$BASE_REF")"   # absolute path
   BASE_NAME="$(basename "$BASE_REF")"
   echo ">> baseline = external engine: $BASE_BIN"
 else
-  BASE_SRC="$WORK/base-src"
-  cleanup() { git -C "$ROOT" worktree remove --force "$BASE_SRC" >/dev/null 2>&1 || true; }
-  trap cleanup EXIT
+  BASE_SRC="$WORK/base-src-$RUN_ID"
   cleanup
   BASE_NAME="base"
-  echo ">> building baseline ($BASE_REF, PGO) -> base-src/build-pgo/ ..."
+  echo ">> building baseline ($BASE_REF, PGO) ..."
   git -C "$ROOT" worktree add --detach -f "$BASE_SRC" "$BASE_REF" >/dev/null
   bash "$PGO_SCRIPT" "$BASE_SRC"
   BASE_BIN="$BASE_SRC/build-pgo/askaig"
 fi
 [ -x "$BASE_BIN" ] || { echo "baseline binary missing: $BASE_BIN"; exit 1; }
+
+mkdir -p "$RUN_DIR/bin"
+install -m 755 "$CAND_BIN" "$RUN_DIR/bin/cand"
+install -m 755 "$BASE_BIN" "$RUN_DIR/bin/base"
+CAND_BIN="$RUN_DIR/bin/cand"
+BASE_BIN="$RUN_DIR/bin/base"
+CONFIG="$RUN_DIR/fastchess.json"
+PGN="$RUN_DIR/games.pgn"
+LOG="$RUN_DIR/fastchess.log"
+
+TREE_STATE=clean
+git -C "$ROOT" diff --quiet HEAD -- || TREE_STATE=dirty
+{
+  printf 'run_id=%s\n' "$RUN_ID"
+  printf 'created_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'candidate_head=%s\n' "$(git -C "$ROOT" rev-parse HEAD)"
+  printf 'candidate_tree=%s\n' "$TREE_STATE"
+  printf 'base_ref=%s\n' "$BASE_REF"
+  printf 'mode=%s\n' "$MODE"
+} > "$RUN_DIR/run.env"
+(cd "$RUN_DIR" && shasum -a 256 bin/cand bin/base > checksums.sha256)
+ln -sfn "$RUN_DIR" "$RUNS/latest"
+
+if [ "$MODE" = adopt ]; then
+  python3 "$STATE_TOOL" adopt "$LEGACY_CONFIG" "$LEGACY_PGN" "$CONFIG" "$PGN" "$CAND_BIN" "$BASE_BIN"
+  echo ">> adopted SPRT run: $RUN_DIR"
+  echo ">> resume with: tools/sprt.sh --resume $RUN_ID"
+  exit 0
+fi
 
 # Timed games by default; DEPTH=<n> switches to fixed-depth (no clock — see the header).
 if [ -n "$DEPTH" ]; then LIMIT="depth=$DEPTH"; else LIMIT="tc=$TC"; fi
@@ -157,6 +283,8 @@ echo
   $SPRT_ARGS \
   $ADJ_ARGS \
   -recover \
+  -config outname="$CONFIG" stats=true \
+  -autosaveinterval 20 \
   -concurrency "$CONCURRENCY" \
   -ratinginterval 20 \
-  -pgnout file="$WORK/games.pgn"
+  -pgnout file="$PGN" append=true 2>&1 | tee -a "$LOG"
