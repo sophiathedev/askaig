@@ -150,6 +150,20 @@ namespace {
     return h;
   }
 
+  [[gnu::hot]] inline void update_tt_quiet_hist(Stack *ss, const Position &pos, Move m, int depth) {
+    const Piece pc = pos.at(m.from());
+    if (depth < 8 || m.to_from() == 0 || !is_quiet(m) || pc == NO_PIECE || color_of(pc) != pos.turn() ||
+        pos.at(m.to()) != NO_PIECE)
+      return;
+
+    const int bonus = hist_bonus(depth) / 8;
+    hist_update(g_hist.butterfly[pos.turn()][m.from()][m.to()], bonus);
+    if ((ss - 1)->ch)
+      hist_update((*(ss - 1)->ch)[pc][m.to()], bonus);
+    if ((ss - 2)->ch)
+      hist_update((*(ss - 2)->ch)[pc][m.to()], bonus);
+  }
+
   [[gnu::hot]] void update_quiet_hists(Stack *ss, const Position &pos, Move best, const Move *tried, int n_tried,
                                        int depth) {
     const int  bonus = hist_bonus(depth);
@@ -322,8 +336,11 @@ namespace {
       tp = tt::probe(key);
       const int sc = tp.hit && tp.score != tt::VALUE_NONE_TT ? from_tt(tp.score, ply) : tt::VALUE_NONE_TT;
       if (!PV && tp.hit && tp.depth >= depth && sc != tt::VALUE_NONE_TT &&
-          (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && sc >= beta) || (tp.bound == tt::UPPER && sc <= alpha)))
+          (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && sc >= beta) || (tp.bound == tt::UPPER && sc <= alpha))) {
+        if (tp.bound == tt::LOWER && sc >= beta)
+          update_tt_quiet_hist(ss, pos, tp.move, depth);
         return sc;
+      }
     }
     const Move ttm  = tp.move;
     const int  ttsc = tp.hit && tp.score != tt::VALUE_NONE_TT ? from_tt(tp.score, ply) : tt::VALUE_NONE_TT;
