@@ -503,9 +503,11 @@ namespace {
       } else if (in_check && ply < 2 * t.root_depth)
         extension = 1;
 
-      const Piece moved = pos.at(m.from());
-      ss->move          = m;
-      ss->ch            = &g_hist.cont[moved][m.to()];
+      const bool  lmr         = depth >= 3 && move_count > 1 + 2 * PV && (quiet || move_count > prm.LMR_TACT_MC);
+      const int   lmr_history = lmr && quiet ? quiet_hist(ss, pos, m) : 0;
+      const Piece moved       = pos.at(m.from());
+      ss->move                = m;
+      ss->ch                  = &g_hist.cont[moved][m.to()];
 
       const uint64_t nodes_before = t.nodes; // root effort
       ++t.nodes;
@@ -516,14 +518,14 @@ namespace {
       const int new_depth = depth - 1 + extension;
       int       v         = -INF;
 
-      if (depth >= 3 && move_count > 1 + 2 * PV && (quiet || move_count > prm.LMR_TACT_MC)) {
+      if (lmr) {
         int r = lmr_base(depth, move_count);
         r += cutnode;
         r += !improving;
         r -= PV;
         r -= tp.pv; // reduce less on former pv nodes
         if (quiet)
-          r -= std::clamp(quiet_hist(ss, pos, m) / 8192, -2, 2);
+          r -= std::clamp(lmr_history / 8192, -2, 2);
         else
           r /= 2;
         r = std::clamp(r, 0, new_depth - 1);
