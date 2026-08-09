@@ -263,6 +263,10 @@ namespace {
           continue;
       }
 
+      const Piece moved = pos.at(m.from());
+      ss->move          = m;
+      ss->ch            = &g_hist.cont[moved][m.to()];
+
       ++t.nodes;
       t.ev.push(pos, m);
       do_move(pos, m);
