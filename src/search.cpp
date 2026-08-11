@@ -549,6 +549,8 @@ namespace {
 
       undo_move(pos, m);
       t.ev.pop();
+      if (extension > 1)
+        --ss->double_ext;
       if (root && move_count == 1) { // root effort sample
         t.root_m1_nodes = t.nodes - nodes_before;
         t.root_m1_move  = m;
