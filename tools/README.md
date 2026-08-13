@@ -12,7 +12,7 @@ bash tools/setup.sh
 ```
 
 This builds the [`fastchess`](https://github.com/Disservin/fastchess) match-runner from source (with
-`clang++`) and downloads the default opening book (`UHO_Lichess_4852_v1.epd`). Everything it produces lives
+`clang++`) and downloads the default opening book (`UHO_4060_v3.epd`). Everything it produces lives
 under `tools/` and is git-ignored; only the scripts here are committed.
 
 Requirements: `git`, `clang++`, `curl`, `unzip` (all present on a standard macOS dev setup).
@@ -67,7 +67,7 @@ is frozen.
 | `ELO0`/`ELO1` | `0`/`10` | SPRT hypothesis bounds |
 | `ALPHA`/`BETA` | `0.1`/`0.1` | SPRT error rates |
 | `ROUNDS` | `5000` | max opening-pairs (each played with both colors) |
-| `BOOK` | `UHO_Lichess_4852_v1.epd` | opening book path |
+| `BOOK` | `UHO_4060_v3.epd` | opening book path |
 | `ADJUDICATE` | `1` | `0` disables draw/resign adjudication (games run to mate/50-move/repetition, ~2x wall-clock) |
 | `RUN_ID` | timestamp + commit | Stable name used by `--resume` |
 

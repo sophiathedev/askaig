@@ -25,7 +25,7 @@
 #     tools/sprt.sh ~/Downloads/askaig-20260616
 #
 # Tunables via env: TC (5+0.05), HASH (16), CONCURRENCY (P-cores - 1), ELO0/ELO1 (0/10),
-#                   ALPHA/BETA (0.1), ROUNDS (5000), BOOK (UHO_Lichess_4852_v1.epd), ADJUDICATE (1),
+#                   ALPHA/BETA (0.1), ROUNDS (5000), BOOK (UHO_4060_v3.epd), ADJUDICATE (1),
 #                   DEPTH (unset).
 #
 # DEPTH=<n> plays FIXED-DEPTH games (both engines search exactly n plies, no clock). This removes
@@ -124,7 +124,7 @@ if [ "$MODE" = resume ]; then
   exit "${PIPESTATUS[0]}"
 fi
 
-BOOK="${BOOK:-$HERE/books/UHO_Lichess_4852_v1.epd}"
+BOOK="${BOOK:-$HERE/books/UHO_4060_v3.epd}"
 # Opening-book format passed to fastchess (epd|pgn). Default epd (UHO). A balanced PGN book
 # (e.g. books/8moves_v3.pgn) reaches endgames far more often — set BOOK_FORMAT=pgn for it. Pair
 # with ADJUDICATE=0 when testing endgame eval, or the resign rule ends won games before they

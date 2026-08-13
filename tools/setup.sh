@@ -27,12 +27,12 @@ echo "           $("$FASTCHESS" --version 2>/dev/null | head -1)"
 
 # opening book
 mkdir -p "$HERE/books"
-if [ ! -f "$HERE/books/UHO_Lichess_4852_v1.epd" ]; then
-  curl -L --fail --retry 3 -o "$HERE/books/UHO_Lichess_4852_v1.epd.zip" \
-    https://github.com/official-stockfish/books/raw/master/UHO_Lichess_4852_v1.epd.zip
-  unzip -o "$HERE/books/UHO_Lichess_4852_v1.epd.zip" -d "$HERE/books"
-  rm -f "$HERE/books/UHO_Lichess_4852_v1.epd.zip"
+if [ ! -f "$HERE/books/UHO_4060_v3.epd" ]; then
+  curl -L --fail --retry 3 -o "$HERE/books/UHO_4060_v3.epd.zip" \
+    https://github.com/official-stockfish/books/raw/master/UHO_4060_v3.epd.zip
+  unzip -o "$HERE/books/UHO_4060_v3.epd.zip" -d "$HERE/books"
+  rm -f "$HERE/books/UHO_4060_v3.epd.zip"
 fi
-echo "book: $(wc -l < "$HERE/books/UHO_Lichess_4852_v1.epd" | tr -d ' ') openings"
+echo "book: $(wc -l < "$HERE/books/UHO_4060_v3.epd" | tr -d ' ') openings"
 
 echo "setup OK — now run:  tools/sprt.sh"
