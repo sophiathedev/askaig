@@ -10,6 +10,7 @@
 #include "nnue.h"
 #include "see.h"
 #include "smp.h"
+#include "syzygy.h"
 #include "tt.h"
 
 namespace {
@@ -17,15 +18,15 @@ namespace {
   using namespace search;
   using Clock = std::chrono::steady_clock;
 
-  Histories          g_hist;
-  ThreadData         g_main;
-  std::atomic<bool>  g_stop{false};
-  std::atomic<bool>  g_helper_stop{false};
-  int64_t            g_hard_ms = 0;
-  uint64_t           g_node_limit = 0; // 0 = off
-  Clock::time_point  g_t0;
-  int                g_contempt   = 0;
-  Color              g_root_color = WHITE; // draw reference
+  Histories         g_hist;
+  ThreadData        g_main;
+  std::atomic<bool> g_stop{false};
+  std::atomic<bool> g_helper_stop{false};
+  int64_t           g_hard_ms    = 0;
+  uint64_t          g_node_limit = 0; // 0 = off
+  Clock::time_point g_t0;
+  int               g_contempt   = 0;
+  Color             g_root_color = WHITE; // draw reference
 
   int  g_lmr[64][64];
   bool g_lmr_init = false;
@@ -53,13 +54,13 @@ namespace {
     return (key * 0x9E3779B97F4A7C15ull) & (Histories::CORR_SIZE - 1);
   }
   [[gnu::pure, gnu::always_inline]] inline size_t minor_corr_index(const Position &p) {
-    const Bitboard minors = p.bitboard_of(WHITE_KNIGHT) | p.bitboard_of(WHITE_BISHOP) |
-                            p.bitboard_of(BLACK_KNIGHT) | p.bitboard_of(BLACK_BISHOP);
+    const Bitboard minors = p.bitboard_of(WHITE_KNIGHT) | p.bitboard_of(WHITE_BISHOP) | p.bitboard_of(BLACK_KNIGHT) |
+                            p.bitboard_of(BLACK_BISHOP);
     return (minors * 0x9E3779B97F4A7C15ull) & (Histories::CORR_SIZE - 1);
   }
   [[gnu::pure, gnu::always_inline]] inline size_t major_corr_index(const Position &p) {
-    const Bitboard majors = p.bitboard_of(WHITE_ROOK) | p.bitboard_of(WHITE_QUEEN) |
-                            p.bitboard_of(BLACK_ROOK) | p.bitboard_of(BLACK_QUEEN);
+    const Bitboard majors = p.bitboard_of(WHITE_ROOK) | p.bitboard_of(WHITE_QUEEN) | p.bitboard_of(BLACK_ROOK) |
+                            p.bitboard_of(BLACK_QUEEN);
     return (majors * 0xC2B2AE3D27D4EB4Full) & (Histories::CORR_SIZE - 1);
   }
 
@@ -97,7 +98,7 @@ namespace {
                       9 * pop_count(pos.bitboard_of(WHITE_QUEEN) | pos.bitboard_of(BLACK_QUEEN));
       raw           = t.ev.evaluate(pos) * (prm.MAT_BASE + prm.MAT_MULT * npm) / 1024;
       raw           = raw * (200 - std::min(pos.fifty(), 100)) / 200;
-      raw           = std::clamp(raw, -MATE_IN_MAX + 1, MATE_IN_MAX - 1);
+      raw           = std::clamp(raw, -TABLEBASE_WIN + 1, TABLEBASE_WIN - 1);
     }
 
     const int c1 = g_hist.corr_pawn[c][i_paw], c2 = g_hist.corr_material[c][i_mat];
@@ -110,7 +111,7 @@ namespace {
       mass += std::abs(c5);
     }
     ss->eval_unc = mass - std::abs(corr);
-    return {raw, std::clamp(raw + corr / 256, -MATE_IN_MAX + 1, MATE_IN_MAX - 1)};
+    return {raw, std::clamp(raw + corr / 256, -TABLEBASE_WIN + 1, TABLEBASE_WIN - 1)};
   }
 
   [[gnu::hot]] inline bool stopped() {
@@ -205,6 +206,13 @@ namespace {
                            bool cutnode);
 
   uint64_t all_nodes() { return g_main.nodes + pool().total_nodes(); }
+  uint64_t all_tbhits() { return g_main.tbhits + pool().total_tbhits(); }
+
+  [[gnu::pure]] int tablebase_score(syzygy::Wdl wdl, const Position &pos) {
+    if (wdl == syzygy::Wdl::DRAW)
+      return draw_score(pos);
+    return wdl == syzygy::Wdl::WIN ? TABLEBASE_WIN : -TABLEBASE_WIN;
+  }
 
   template<bool PV>
   [[gnu::hot]] int qsearch(ThreadData &t, Position &pos, Stack *ss, int alpha, int beta, int ply) {
@@ -224,8 +232,7 @@ namespace {
     const tt::Probe tp   = tt::probe(key);
     const int       ttsc = tp.hit && tp.score != tt::VALUE_NONE_TT ? from_tt(tp.score, ply) : tt::VALUE_NONE_TT;
     if (!PV && tp.hit && ttsc != tt::VALUE_NONE_TT) {
-      if (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && ttsc >= beta) ||
-          (tp.bound == tt::UPPER && ttsc <= alpha))
+      if (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && ttsc >= beta) || (tp.bound == tt::UPPER && ttsc <= alpha))
         return ttsc;
     }
 
@@ -236,8 +243,7 @@ namespace {
       ss->static_eval     = ev.score;
       best                = ev.score;
       if (tp.hit && ttsc != tt::VALUE_NONE_TT) {
-        if (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && ttsc > best) ||
-            (tp.bound == tt::UPPER && ttsc < best))
+        if (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && ttsc > best) || (tp.bound == tt::UPPER && ttsc < best))
           best = ttsc;
       }
       if (best >= beta)
@@ -296,8 +302,8 @@ namespace {
       }
     }
 
-    tt::store(tp.slot, key, best_move, to_tt(best, ply), raw_eval, /*depth=*/0,
-              best >= beta ? tt::LOWER : tt::UPPER, PV);
+    tt::store(tp.slot, key, best_move, to_tt(best, ply), raw_eval, /*depth=*/0, best >= beta ? tt::LOWER : tt::UPPER,
+              PV);
     return best;
   }
 
@@ -337,7 +343,7 @@ namespace {
     const uint64_t key = tt_key(pos);
     tt::Probe      tp;
     if (!excluded) {
-      tp = tt::probe(key);
+      tp           = tt::probe(key);
       const int sc = tp.hit && tp.score != tt::VALUE_NONE_TT ? from_tt(tp.score, ply) : tt::VALUE_NONE_TT;
       if (!PV && tp.hit && tp.depth >= depth && sc != tt::VALUE_NONE_TT &&
           (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && sc >= beta) || (tp.bound == tt::UPPER && sc <= alpha))) {
@@ -348,6 +354,15 @@ namespace {
     }
     const Move ttm  = tp.move;
     const int  ttsc = tp.hit && tp.score != tt::VALUE_NONE_TT ? from_tt(tp.score, ply) : tt::VALUE_NONE_TT;
+
+    if (!root && !excluded && syzygy::can_probe(pos, depth)) {
+      if (const auto wdl = syzygy::probe_wdl(pos)) {
+        ++t.tbhits;
+        const int value = tablebase_score(*wdl, pos);
+        tt::store(tp.slot, key, Move(), value, tt::VALUE_NONE_TT, depth, tt::EXACT, PV);
+        return value;
+      }
+    }
 
     int raw_eval = tt::VALUE_NONE_TT, prune_eval = tt::VALUE_NONE_TT;
     ss->eval_unc = 0;
@@ -382,13 +397,14 @@ namespace {
         return prune_eval;
 
       const Color    us       = pos.turn();
-      const Bitboard non_pawn = pos.bitboard_of(us, KNIGHT) | pos.bitboard_of(us, BISHOP) |
-                                pos.bitboard_of(us, ROOK) | pos.bitboard_of(us, QUEEN);
+      const Bitboard non_pawn = pos.bitboard_of(us, KNIGHT) | pos.bitboard_of(us, BISHOP) | pos.bitboard_of(us, ROOK) |
+                                pos.bitboard_of(us, QUEEN);
       if (depth >= prm.NMP_DEPTH && ss->static_eval >= beta && non_pawn && (ss - 1)->move.to_from() != 0 &&
           beta > -MATE_IN_MAX) {
-        const int R = prm.NMP_BASE + depth / prm.NMP_DDIV + std::min((ss->static_eval - beta) / prm.NMP_EDIV, prm.NMP_ECAP);
-        ss->move    = Move();
-        ss->ch      = nullptr;
+        const int R =
+                prm.NMP_BASE + depth / prm.NMP_DDIV + std::min((ss->static_eval - beta) / prm.NMP_EDIV, prm.NMP_ECAP);
+        ss->move = Move();
+        ss->ch   = nullptr;
         t.ev.push_null();
         pos.play_null();
         tt::prefetch(tt_key(pos));
@@ -536,9 +552,8 @@ namespace {
 
         v = -negamax<false>(t, pos, ss + 1, -alpha - 1, -alpha, new_depth - r, ply + 1, true);
         if (v > alpha && r > 0) {
-          const int confirm_depth = std::clamp(new_depth + int(v > best + prm.LMR_CONF_HI) -
-                                                       int(v < best + prm.LMR_CONF_LO),
-                                               1, new_depth + 1);
+          const int confirm_depth = std::clamp(
+                  new_depth + int(v > best + prm.LMR_CONF_HI) - int(v < best + prm.LMR_CONF_LO), 1, new_depth + 1);
           v = -negamax<false>(t, pos, ss + 1, -alpha - 1, -alpha, confirm_depth, ply + 1, !cutnode);
         }
       } else if (!PV || move_count > 1)
@@ -588,7 +603,6 @@ namespace {
           }
         }
       }
-
     }
 
     if (best == -INF) // all moves pruned
@@ -598,8 +612,8 @@ namespace {
       tt::store(tp.slot, key, best_move, to_tt(best, ply), raw_eval, depth, bound, PV);
 
       if (!in_check && (best_move.to_from() == 0 || is_quiet(best_move)) &&
-          !(bound == tt::LOWER && best <= ss->static_eval) &&
-          !(bound == tt::UPPER && best >= ss->static_eval) && std::abs(best) < MATE_IN_MAX) {
+          !(bound == tt::LOWER && best <= ss->static_eval) && !(bound == tt::UPPER && best >= ss->static_eval) &&
+          std::abs(best) < MATE_IN_MAX) {
         const int   b = std::clamp((best - ss->static_eval) * depth / 8, -256, 256);
         const Color c = pos.turn();
         hist_update(g_hist.corr_pawn[c][pawn_corr_index(pos)], b);
@@ -655,32 +669,28 @@ search::Params search::prm;
 
 const std::vector<search::ParamInfo> &search::tunables() {
   static const std::vector<ParamInfo> t = {
-          {"LMR_BASE", &prm.LMR_BASE, 80, 30, 150},    {"LMR_DIV", &prm.LMR_DIV, 230, 140, 360},
-          {"LMR_TACT_MC", &prm.LMR_TACT_MC, 6, 2, 12}, {"LMR_CONF_HI", &prm.LMR_CONF_HI, 40, 10, 90},
-          {"LMR_CONF_LO", &prm.LMR_CONF_LO, 15, 2, 45},
-          {"MAT_BASE", &prm.MAT_BASE, 736, 550, 950},  {"MAT_MULT", &prm.MAT_MULT, 5, 1, 10},
-          {"HB_MULT", &prm.HB_MULT, 160, 60, 320},     {"HB_SUB", &prm.HB_SUB, 80, 0, 250},
-          {"HB_MAX", &prm.HB_MAX, 2000, 800, 4000},
-          {"QS_FUT", &prm.QS_FUT, 120, 40, 260},
-          {"IIR_DEPTH", &prm.IIR_DEPTH, 4, 2, 8},
-          {"RAZOR_DEPTH", &prm.RAZOR_DEPTH, 4, 2, 7},  {"RAZOR_MULT", &prm.RAZOR_MULT, 300, 120, 560},
-          {"RFP_DEPTH", &prm.RFP_DEPTH, 8, 4, 12},     {"RFP_MULT", &prm.RFP_MULT, 80, 30, 160},
-          {"NMP_DEPTH", &prm.NMP_DEPTH, 3, 2, 6},      {"NMP_BASE", &prm.NMP_BASE, 3, 2, 6},
-          {"NMP_DDIV", &prm.NMP_DDIV, 3, 2, 8},        {"NMP_EDIV", &prm.NMP_EDIV, 200, 80, 400},
-          {"NMP_ECAP", &prm.NMP_ECAP, 3, 1, 7},        {"NMP_VDEPTH", &prm.NMP_VDEPTH, 12, 7, 18},
-          {"PC_MARGIN", &prm.PC_MARGIN, 180, 70, 350}, {"PC_IMP", &prm.PC_IMP, 60, 0, 140},
-          {"PC_DEPTH", &prm.PC_DEPTH, 5, 3, 8},
-          {"LMP_BASE", &prm.LMP_BASE, 3, 1, 8},        {"LMP_DEPTH", &prm.LMP_DEPTH, 8, 4, 12},
-          {"FUT_DEPTH", &prm.FUT_DEPTH, 6, 3, 10},     {"FUT_BASE", &prm.FUT_BASE, 100, 20, 250},
-          {"FUT_MULT", &prm.FUT_MULT, 120, 50, 240},
-          {"HP_DEPTH", &prm.HP_DEPTH, 4, 2, 8},        {"HP_MULT", &prm.HP_MULT, 2048, 700, 4500},
-          {"SEEP_DEPTH", &prm.SEEP_DEPTH, 8, 4, 12},   {"SEEP_QUIET", &prm.SEEP_QUIET, 50, 15, 110},
-          {"SEEP_CAPT", &prm.SEEP_CAPT, 90, 30, 180},
-          {"SE_DEPTH", &prm.SE_DEPTH, 8, 5, 12},       {"SE_TTSUB", &prm.SE_TTSUB, 3, 1, 6},
-          {"SE_BMULT", &prm.SE_BMULT, 2, 1, 5},        {"SE_DBL", &prm.SE_DBL, 25, 8, 70},
-          {"SE_TRI", &prm.SE_TRI, 100, 40, 220},       {"SE_DBLMAX", &prm.SE_DBLMAX, 6, 2, 12},
-          {"ASP_DELTA", &prm.ASP_DELTA, 14, 6, 35},
-          {"RAZOR_UNC", &prm.RAZOR_UNC, 8, 0, 64},     {"RFP_UNC", &prm.RFP_UNC, 8, 0, 64},
+          {"LMR_BASE", &prm.LMR_BASE, 80, 30, 150},     {"LMR_DIV", &prm.LMR_DIV, 230, 140, 360},
+          {"LMR_TACT_MC", &prm.LMR_TACT_MC, 6, 2, 12},  {"LMR_CONF_HI", &prm.LMR_CONF_HI, 40, 10, 90},
+          {"LMR_CONF_LO", &prm.LMR_CONF_LO, 15, 2, 45}, {"MAT_BASE", &prm.MAT_BASE, 736, 550, 950},
+          {"MAT_MULT", &prm.MAT_MULT, 5, 1, 10},        {"HB_MULT", &prm.HB_MULT, 160, 60, 320},
+          {"HB_SUB", &prm.HB_SUB, 80, 0, 250},          {"HB_MAX", &prm.HB_MAX, 2000, 800, 4000},
+          {"QS_FUT", &prm.QS_FUT, 120, 40, 260},        {"IIR_DEPTH", &prm.IIR_DEPTH, 4, 2, 8},
+          {"RAZOR_DEPTH", &prm.RAZOR_DEPTH, 4, 2, 7},   {"RAZOR_MULT", &prm.RAZOR_MULT, 300, 120, 560},
+          {"RFP_DEPTH", &prm.RFP_DEPTH, 8, 4, 12},      {"RFP_MULT", &prm.RFP_MULT, 80, 30, 160},
+          {"NMP_DEPTH", &prm.NMP_DEPTH, 3, 2, 6},       {"NMP_BASE", &prm.NMP_BASE, 3, 2, 6},
+          {"NMP_DDIV", &prm.NMP_DDIV, 3, 2, 8},         {"NMP_EDIV", &prm.NMP_EDIV, 200, 80, 400},
+          {"NMP_ECAP", &prm.NMP_ECAP, 3, 1, 7},         {"NMP_VDEPTH", &prm.NMP_VDEPTH, 12, 7, 18},
+          {"PC_MARGIN", &prm.PC_MARGIN, 180, 70, 350},  {"PC_IMP", &prm.PC_IMP, 60, 0, 140},
+          {"PC_DEPTH", &prm.PC_DEPTH, 5, 3, 8},         {"LMP_BASE", &prm.LMP_BASE, 3, 1, 8},
+          {"LMP_DEPTH", &prm.LMP_DEPTH, 8, 4, 12},      {"FUT_DEPTH", &prm.FUT_DEPTH, 6, 3, 10},
+          {"FUT_BASE", &prm.FUT_BASE, 100, 20, 250},    {"FUT_MULT", &prm.FUT_MULT, 120, 50, 240},
+          {"HP_DEPTH", &prm.HP_DEPTH, 4, 2, 8},         {"HP_MULT", &prm.HP_MULT, 2048, 700, 4500},
+          {"SEEP_DEPTH", &prm.SEEP_DEPTH, 8, 4, 12},    {"SEEP_QUIET", &prm.SEEP_QUIET, 50, 15, 110},
+          {"SEEP_CAPT", &prm.SEEP_CAPT, 90, 30, 180},   {"SE_DEPTH", &prm.SE_DEPTH, 8, 5, 12},
+          {"SE_TTSUB", &prm.SE_TTSUB, 3, 1, 6},         {"SE_BMULT", &prm.SE_BMULT, 2, 1, 5},
+          {"SE_DBL", &prm.SE_DBL, 25, 8, 70},           {"SE_TRI", &prm.SE_TRI, 100, 40, 220},
+          {"SE_DBLMAX", &prm.SE_DBLMAX, 6, 2, 12},      {"ASP_DELTA", &prm.ASP_DELTA, 14, 6, 35},
+          {"RAZOR_UNC", &prm.RAZOR_UNC, 8, 0, 64},      {"RFP_UNC", &prm.RFP_UNC, 8, 0, 64},
           {"FUT_UNC", &prm.FUT_UNC, 8, 0, 64},
   };
   return t;
@@ -703,14 +713,26 @@ void search::set_node_limit(uint64_t n) { g_node_limit = n; }
 search::Result search::think(Position &pos, int max_depth, const InfoFn &info, int64_t soft_ms, int64_t hard_ms) {
   if (!g_lmr_init)
     init_lmr();
-  g_root_color = pos.turn();
-  g_main.nodes = 0;
-  g_hard_ms    = hard_ms;
-  g_t0         = Clock::now();
+  g_root_color  = pos.turn();
+  g_main.nodes  = 0;
+  g_main.tbhits = 0;
+  g_hard_ms     = hard_ms;
+  g_t0          = Clock::now();
   std::memset(g_main.stack, 0, sizeof(g_main.stack));
   g_main.ev.reset(pos);
   pool().reset_counters();
   tt::new_search();
+
+  if (const auto root = syzygy::probe_root(pos)) {
+    Result res;
+    res.best   = root->move;
+    res.score  = tablebase_score(root->wdl, pos);
+    res.pv     = {root->move};
+    res.tbhits = ++g_main.tbhits;
+    if (info)
+      info(0, res, 0, 0);
+    return res;
+  }
 
   max_depth = std::clamp(max_depth, 1, MAX_PLY - 1);
 
@@ -718,22 +740,23 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
   pool().start_search(pos, max_depth);
 
   Result res;
-  int    prev      = 0;
+  int    prev = 0;
   Move   last_best{};
   int    stability = 0;
   for (int d = 1; d <= max_depth; ++d) {
     g_main.root_depth = d;
     g_main.seldepth   = 0;
-    const int v = aspiration(g_main, pos, d, prev);
+    const int v       = aspiration(g_main, pos, d, prev);
     if (g_stop.load(std::memory_order_relaxed) && d > 1)
       break;
 
-    Stack   *ss         = g_main.stack + 4;
+    Stack    *ss         = g_main.stack + 4;
     const int prev_score = prev;
-    prev         = v;
-    res.score    = v;
-    res.nodes    = all_nodes();
-    res.seldepth = g_main.seldepth;
+    prev                 = v;
+    res.score            = v;
+    res.nodes            = all_nodes();
+    res.tbhits           = all_tbhits();
+    res.seldepth         = g_main.seldepth;
     res.pv.assign(ss->pv, ss->pv + ss->pv_len);
     if (!res.pv.empty()) {
       res.best = res.pv[0];
@@ -772,12 +795,13 @@ search::Result search::think(Position &pos, int max_depth, const InfoFn &info, i
   pool().wait_idle();
 
   if (res.best.to_from() == 0) {
-    Move buf[218];
+    Move         buf[218];
     const size_t n = pos.turn() == WHITE ? size_t(pos.generate_legals<WHITE>(buf) - buf)
                                          : size_t(pos.generate_legals<BLACK>(buf) - buf);
     if (n > 0)
       res.best = buf[0];
   }
-  res.nodes = all_nodes();
+  res.nodes  = all_nodes();
+  res.tbhits = all_tbhits();
   return res;
 }

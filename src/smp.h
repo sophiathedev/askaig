@@ -32,9 +32,10 @@ namespace search {
     nnue::Evaluator ev;
     Stack           stack[MAX_PLY + 8];
     uint64_t        nodes    = 0;
+    uint64_t        tbhits   = 0;
     int             seldepth = 0, root_depth = 1;
-    uint64_t root_m1_nodes = 0;
-    Move     root_m1_move{};
+    uint64_t        root_m1_nodes = 0;
+    Move            root_m1_move{};
   };
 
   class ThreadPool {
@@ -47,6 +48,8 @@ namespace search {
 
     ASKAIG_TSAN_IGNORE
     [[nodiscard]] uint64_t total_nodes() const;
+    ASKAIG_TSAN_IGNORE
+    [[nodiscard]] uint64_t total_tbhits() const;
     void                   reset_counters();
 
     void start_search(const Position &root, int max_depth);

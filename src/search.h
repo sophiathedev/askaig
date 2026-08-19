@@ -8,16 +8,18 @@
 
 namespace search {
 
-  constexpr int MAX_PLY = 120;
-  constexpr int MATE    = 32000;
-  constexpr int MATE_IN_MAX = MATE - MAX_PLY; // |score| >= this  <=>  a forced mate line
-  constexpr int INF         = MATE + 1;
+  constexpr int MAX_PLY       = 120;
+  constexpr int MATE          = 32000;
+  constexpr int MATE_IN_MAX   = MATE - MAX_PLY; // |score| >= this  <=>  a forced mate line
+  constexpr int TABLEBASE_WIN = 30000;
+  constexpr int INF           = MATE + 1;
 
   struct Result {
     Move              best{};
     int               score = 0;
     std::vector<Move> pv;
     uint64_t          nodes    = 0;
+    uint64_t          tbhits   = 0;
     int               seldepth = 0;
   };
 
@@ -40,8 +42,8 @@ namespace search {
     int LMR_BASE = 80, LMR_DIV = 230, LMR_TACT_MC = 6, LMR_CONF_HI = 40, LMR_CONF_LO = 15;
     int MAT_BASE = 736, MAT_MULT = 5;
     int HB_MULT = 160, HB_SUB = 80, HB_MAX = 2000;
-    int QS_FUT = 120;
-    int IIR_DEPTH = 4;
+    int QS_FUT      = 120;
+    int IIR_DEPTH   = 4;
     int RAZOR_DEPTH = 4, RAZOR_MULT = 300;
     int RFP_DEPTH = 8, RFP_MULT = 80;
     int NMP_DEPTH = 3, NMP_BASE = 3, NMP_DDIV = 3, NMP_EDIV = 200, NMP_ECAP = 3, NMP_VDEPTH = 12;
@@ -62,6 +64,6 @@ namespace search {
     int         def, lo, hi;
   };
   const std::vector<ParamInfo> &tunables();
-  void params_dirty();
+  void                          params_dirty();
 
 } // namespace search

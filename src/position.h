@@ -336,8 +336,9 @@ template<Color C>
       __builtin_unreachable();
   }
 
-  history[game_ply].hash  = hash;
-  history[game_ply].fifty = (type != QUIET || type_of(board[m.to()]) == PAWN) ? 0 : history[game_ply - 1].fifty + 1;
+  history[game_ply].hash = hash;
+  const bool zeroing = type_of(board[m.to()]) == PAWN || (type != QUIET && type != OO && type != OOO);
+  history[game_ply].fifty = zeroing ? 0 : history[game_ply - 1].fifty + 1;
 }
 
 template<Color C>

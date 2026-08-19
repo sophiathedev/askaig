@@ -39,9 +39,18 @@ uint64_t search::ThreadPool::total_nodes() const {
   return n;
 }
 
+ASKAIG_TSAN_IGNORE
+uint64_t search::ThreadPool::total_tbhits() const {
+  uint64_t n = 0;
+  for (const auto &t: tds)
+    n += t->tbhits;
+  return n;
+}
+
 void search::ThreadPool::reset_counters() {
   for (auto &t: tds) {
     t->nodes    = 0;
+    t->tbhits   = 0;
     t->seldepth = 0;
   }
 }

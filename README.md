@@ -7,7 +7,8 @@
 **Askaig** is a **UCI chess engine** in **C++26** — magic bitboards for move generation, an
 **NNUE** evaluation, and a heavily-pruned alpha-beta search parallelised with **lazy SMP**. Move
 generation is ported from [nkarve/surge](https://github.com/nkarve/surge) (MIT); everything else
-(NNUE inference, search, TT, UCI, SIMD) is built on top of it.
+(NNUE inference, search, TT, UCI, SIMD) is built on top of it. Syzygy probing uses the
+[Fathom](https://github.com/jdart1/Fathom) backend (MIT).
 
 ## Elo Ratings
 
@@ -29,6 +30,7 @@ For the detailed result of rating from **CCI (Computer Chess Index)**. Please vi
   (`setoption name EvalFile` to override). Training pipeline in
   [`tools/nnue/`](tools/nnue/README.md).
 - **Lazy SMP** parallel search sharing a lockless transposition table.
+- **Syzygy tablebases** — WDL probes in search, DTZ root moves, shared read-only file mappings.
 
 ## File Structure
 
@@ -42,6 +44,7 @@ askaig/
 │   ├── main.cpp            # Entry point
 │   ├── uci.h/.cpp          # UCI (Universal Chess Interface) protocol implementation
 │   ├── smp.h/.cpp          # Lazy SMP parallel search helper threads manager
+│   ├── syzygy.h/.cpp       # Syzygy configuration and search probes
 │   ├── search.h/.cpp       # Principal alpha-beta/Negamax search and pruning heuristics
 │   ├── movepick.h          # Move generation wrapper & move ordering state machine
 │   ├── position.h/.cpp     # Board representation, move generator (magic bitboards), and move play
@@ -76,6 +79,8 @@ Fail-soft negamax (alpha-beta), iterative deepening, parallelised by lazy SMP:
 - **Extensions**: check extensions, singular extensions (multicut, double/triple/negative).
 - **Correction history**: five tables nudging static eval toward what search has found.
 - **Draw detection**: repetition + fifty-move rule; `Contempt` biases against early draws.
+- **Tablebases**: Syzygy WDL cutoffs in search and DTZ probing at the root; `tbhits` is summed
+  across workers.
 - **Time management**: soft/hard budgets scaled by node concentration, move stability, eval
   trend; 200 ms floor always reserved.
 
@@ -103,7 +108,11 @@ printf 'uci\nposition startpos moves e2e4 e7e5\ngo depth 12\nquit\n' | ./build/a
 
 Commands: `uci`, `isready`, `ucinewgame`, `position [startpos|fen <fen>] [moves ...]`,
 `go depth <n> / movetime <ms> / wtime <ms> btime <ms> [winc/binc/movestogo] / infinite / perft
-<depth>`, `setoption name Hash|Threads|Contempt|EvalFile value <x>`, `d`, `eval`, `stop`, `quit`.
+<depth>`, `setoption name <option> value <x>`, `d`, `eval`, `stop`, `quit`.
+
+Options: `Hash`, `Threads`, `Contempt`, `EvalFile`, `SyzygyPath`, `SyzygyProbeDepth`,
+`Syzygy50MoveRule`, and `SyzygyProbeLimit`. Every accepted `setoption` prints its effective value
+as an `info string` line.
 
 Debug: `bench [depth]`, `bench evalnps`, `selftest [nnue|perft|see|draw|search|contempt|stop|
 all]`. Runs in CI on every push/PR under ASan/UBSan/TSan + an assertions-enabled Debug build.
@@ -124,5 +133,6 @@ exact, collision-free state hash, kept per-thread.
 ## Credits
 
 - Move generation ported from **[nkarve/surge](https://github.com/nkarve/surge)** (MIT License).
+- Syzygy probing powered by **[Fathom](https://github.com/jdart1/Fathom)** (MIT License).
 - NNUE training data from the [Lichess evaluation database](https://database.lichess.org/#evals).
 - Search/evaluation techniques follow the [Chess Programming Wiki](https://www.chessprogramming.org/).

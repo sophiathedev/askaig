@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include "position.h"
 #include "search.h"
 #include "see.h"
+#include "syzygy.h"
 #include "tables.h"
 #include "tt.h"
 #include "types.h"
@@ -320,8 +322,7 @@ namespace {
       if (!check(pos))
         return false;
     }
-    std::cout << "selftest nnue PASS: " << games << " games, " << checks
-              << " eval checks, incremental == refresh\n";
+    std::cout << "selftest nnue PASS: " << games << " games, " << checks << " eval checks, incremental == refresh\n";
     return true;
   }
 
@@ -345,8 +346,8 @@ namespace {
       Position::set(c.fen, pos);
       const uint64_t got = pos.turn() == WHITE ? perft<WHITE>(pos, c.depth, true) : perft<BLACK>(pos, c.depth, true);
       if (got != c.expected) {
-        std::cout << "selftest perft FAIL: depth " << c.depth << " got " << got << " expected " << c.expected
-                  << " fen " << c.fen << "\n";
+        std::cout << "selftest perft FAIL: depth " << c.depth << " got " << got << " expected " << c.expected << " fen "
+                  << c.fen << "\n";
         ok = false;
       }
     }
@@ -356,7 +357,7 @@ namespace {
   }
 
   bool selftest_see() {
-    bool ok = true;
+    bool       ok     = true;
     const auto expect = [&](bool cond, const char *what) {
       if (!cond) {
         std::cout << "selftest see FAIL: " << what << "\n";
@@ -433,7 +434,7 @@ namespace {
   }
 
   bool selftest_draw() {
-    bool ok = true;
+    bool       ok     = true;
     const auto expect = [&](bool cond, const char *what) {
       if (!cond) {
         std::cout << "selftest draw FAIL: " << what << "\n";
@@ -470,6 +471,15 @@ namespace {
         return false;
       }
       expect(pos.is_draw(), "fifty-move rule did not fire at halfmove 100");
+    }
+    {
+      Position pos;
+      Position::set("5k2/8/8/8/8/8/8/4K2R w K - 99 1", pos);
+      if (!play_uci_move(pos, "e1g1")) {
+        std::cout << "selftest draw FAIL: illegal castling fifty-move test\n";
+        return false;
+      }
+      expect(pos.is_draw(), "castling did not advance the fifty-move clock");
     }
     {
       const auto draws = [](const char *fen) {
@@ -564,7 +574,8 @@ namespace {
     search::new_game();
 
     if (ok)
-      std::cout << "selftest search PASS: " << std::size(CASES) << " positions x {1,2,4} threads, legal PV + sane score\n";
+      std::cout << "selftest search PASS: " << std::size(CASES)
+                << " positions x {1,2,4} threads, legal PV + sane score\n";
     return ok;
   }
 
@@ -582,7 +593,8 @@ namespace {
     search::request_stop();
     const auto           t0 = std::chrono::steady_clock::now();
     const search::Result r  = search::think(pos, search::MAX_PLY - 1, nullptr, 0, 0);
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    const auto           ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
     search::clear_stop();
 
     bool ok = true;
@@ -612,8 +624,8 @@ namespace {
     constexpr const char *FEN   = "3qk3/p7/8/8/8/8/8/3QK3 w - - 0 1";
     constexpr int         DEPTH = 12;
 
-    const int saved_threads  = g_threads;
-    g_threads                = 1; // deterministic scores
+    const int saved_threads = g_threads;
+    g_threads               = 1; // deterministic scores
     search::set_threads(1);
 
     Position pos;
@@ -673,7 +685,8 @@ namespace {
     nnue::Evaluator ev;
     ev.reset(pos);
 
-    const std::array<Move, 4> cyc = {Move(g1, f3, QUIET), Move(g8, f6, QUIET), Move(f3, g1, QUIET), Move(f6, g8, QUIET)};
+    const std::array<Move, 4> cyc = {Move(g1, f3, QUIET), Move(g8, f6, QUIET), Move(f3, g1, QUIET),
+                                     Move(f6, g8, QUIET)};
 
     volatile int64_t sink = 0;
 
@@ -692,8 +705,8 @@ namespace {
     }
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     const uint64_t evals = uint64_t(ITERS) * 4;
-    std::cout << "incremental: " << evals << " evals in " << us / 1000 << " ms = "
-              << (us > 0 ? evals * 1'000'000 / uint64_t(us) : 0) << " evals/s\n";
+    std::cout << "incremental: " << evals << " evals in " << us / 1000
+              << " ms = " << (us > 0 ? evals * 1'000'000 / uint64_t(us) : 0) << " evals/s\n";
 
     constexpr int RITERS = 50'000;
     t0                   = std::chrono::steady_clock::now();
@@ -709,8 +722,8 @@ namespace {
     }
     us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     const uint64_t revals = uint64_t(RITERS) * 4;
-    std::cout << "refresh:     " << revals << " evals in " << us / 1000 << " ms = "
-              << (us > 0 ? revals * 1'000'000 / uint64_t(us) : 0) << " evals/s\n";
+    std::cout << "refresh:     " << revals << " evals in " << us / 1000
+              << " ms = " << (us > 0 ? revals * 1'000'000 / uint64_t(us) : 0) << " evals/s\n";
     std::cout << "checksum " << sink << "\n"; // cross-build invariant
   }
 
@@ -863,6 +876,25 @@ namespace {
   constexpr int64_t MOVE_OVERHEAD_MS = 30;
   constexpr int64_t URGENT_MS        = 200;
 
+  bool parse_int_option(const std::string &value, int &out) {
+    std::istringstream input(value);
+    char               trailing;
+    return bool(input >> out) && !(input >> trailing);
+  }
+
+  bool parse_bool_option(std::string value, bool &out) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    if (value == "true" || value == "1" || value == "on") {
+      out = true;
+      return true;
+    }
+    if (value == "false" || value == "0" || value == "off") {
+      out = false;
+      return true;
+    }
+    return false;
+  }
+
   void go_cmd(Position &pos, std::istringstream &is) {
     stop_search(); // serialize searches
 
@@ -912,11 +944,11 @@ namespace {
       hard_ms   = std::max<int64_t>(movetime - MOVE_OVERHEAD_MS, 1);
       soft_ms   = 0;
     } else if (wtime > 0 || btime > 0) {
-      max_depth         = search::MAX_PLY;
-      const int64_t t   = pos.turn() == WHITE ? wtime : btime;
-      const int64_t inc = pos.turn() == WHITE ? winc : binc;
-      const int     mtg = movestogo > 0 ? movestogo : 40;
-      const int64_t avail = std::max<int64_t>(t - MOVE_OVERHEAD_MS, 1);
+      max_depth             = search::MAX_PLY;
+      const int64_t t       = pos.turn() == WHITE ? wtime : btime;
+      const int64_t inc     = pos.turn() == WHITE ? winc : binc;
+      const int     mtg     = movestogo > 0 ? movestogo : 40;
+      const int64_t avail   = std::max<int64_t>(t - MOVE_OVERHEAD_MS, 1);
       const int64_t opt     = std::min<int64_t>(avail / mtg + 3 * inc / 4, std::max<int64_t>(avail / 2, 1));
       const int64_t reserve = std::clamp<int64_t>(t / 10, MOVE_OVERHEAD_MS, 500);
       soft_ms               = std::max<int64_t>(opt, 1);
@@ -939,9 +971,9 @@ namespace {
               [](int d, const search::Result &res, uint64_t nodes, long long ms) {
                 const uint64_t              nps = ms > 0 ? nodes * 1000 / uint64_t(ms) : nodes * 1000;
                 std::lock_guard<std::mutex> lk(g_out);
-                std::cout << "info depth " << d << " seldepth " << res.seldepth << " score "
-                          << format_score(res.score) << " nodes " << nodes << " nps " << nps << " hashfull "
-                          << tt::hashfull() << " time " << ms;
+                std::cout << "info depth " << d << " seldepth " << res.seldepth << " score " << format_score(res.score)
+                          << " nodes " << nodes << " nps " << nps << " hashfull " << tt::hashfull() << " tbhits "
+                          << res.tbhits << " time " << ms;
                 if (!res.pv.empty()) {
                   std::cout << " pv";
                   for (Move m: res.pv)
@@ -976,10 +1008,14 @@ void uci::loop(bool tune) {
       std::cout << "option name Threads type spin default 1 min 1 max " << max_threads() << "\n";
       std::cout << "option name Contempt type spin default 0 min -100 max 100\n"; // cp cost of a draw
       std::cout << "option name EvalFile type string default <embedded>\n";
+      std::cout << "option name SyzygyPath type string default <empty>\n";
+      std::cout << "option name SyzygyProbeDepth type spin default 1 min 1 max 100\n";
+      std::cout << "option name Syzygy50MoveRule type check default true\n";
+      std::cout << "option name SyzygyProbeLimit type spin default 7 min 0 max 7\n";
       if (tune) // hidden spsa options
         for (const auto &p: search::tunables())
-          std::cout << "option name " << p.name << " type spin default " << p.def << " min " << p.lo << " max "
-                    << p.hi << "\n";
+          std::cout << "option name " << p.name << " type spin default " << p.def << " min " << p.lo << " max " << p.hi
+                    << "\n";
       std::cout << "uciok\n";
     } else if (cmd == "isready") {
       std::lock_guard<std::mutex> lk(g_out);
@@ -1004,51 +1040,111 @@ void uci::loop(bool tune) {
         std::cout << "info string no NNUE net loaded (use setoption name EvalFile value <path>)\n";
       else {
         const int cp = nnue::evaluate_refresh(*pos);
-        std::cout << "eval " << cp << " cp (side to move), " << (pos->turn() == WHITE ? cp : -cp)
-                  << " cp (white)\n";
+        std::cout << "eval " << cp << " cp (side to move), " << (pos->turn() == WHITE ? cp : -cp) << " cp (white)\n";
       }
     } else if (cmd == "setoption") {
       stop_search(); // stop before resize
       std::string token;
       std::string name;
-      is >> token >> name >> token;
+      std::string value;
+      is >> token;
+      if (token != "name") {
+        std::cout << "info string setoption rejected: expected 'name'\n";
+        std::cout.flush();
+        continue;
+      }
+      while (is >> token && token != "value") {
+        if (!name.empty())
+          name += ' ';
+        name += token;
+      }
+      if (token == "value") {
+        std::getline(is, value);
+        const size_t start = value.find_first_not_of(' ');
+        value              = start == std::string::npos ? std::string{} : value.substr(start);
+      }
+
       if (name == "Hash") {
         int mb = 0;
-        if (is >> mb) {
+        if (parse_int_option(value, mb)) {
           mb = std::clamp(mb, 1, 65536);
           tt::resize(size_t(mb));
-        }
+          std::cout << "info string option Hash set to " << tt::size_mb() << "\n";
+        } else
+          std::cout << "info string option Hash rejected: invalid integer '" << value << "'\n";
       } else if (name == "Threads") {
         int t = 0;
-        if (is >> t) {
+        if (parse_int_option(value, t)) {
           g_threads = t < 1 ? 1 : (t > 1024 ? 1024 : t);
           search::set_threads(g_threads);
-        }
+          std::cout << "info string option Threads set to " << g_threads << "\n";
+        } else
+          std::cout << "info string option Threads rejected: invalid integer '" << value << "'\n";
       } else if (name == "Contempt") {
         int cp = 0;
-        if (is >> cp)
-          search::set_contempt(std::clamp(cp, -100, 100));
+        if (parse_int_option(value, cp)) {
+          cp = std::clamp(cp, -100, 100);
+          search::set_contempt(cp);
+          std::cout << "info string option Contempt set to " << cp << "\n";
+        } else
+          std::cout << "info string option Contempt rejected: invalid integer '" << value << "'\n";
       } else if (name == "EvalFile") {
-        std::string path;
-        std::getline(is, path);
-        const size_t start = path.find_first_not_of(' ');
-        path = start == std::string::npos ? std::string{} : path.substr(start);
         std::string err;
-        if (path.empty() || !nnue::load_file(path, &err))
-          std::cout << "info string EvalFile '" << path << "' rejected (" << (path.empty() ? "empty path" : err)
-                    << "), keeping the current net\n";
+        if (value.empty() || !nnue::load_file(value, &err))
+          std::cout << "info string option EvalFile rejected: '" << value << "' ("
+                    << (value.empty() ? "empty path" : err) << "), keeping the current net\n";
         else
-          std::cout << "info string EvalFile loaded: " << path << "\n";
+          std::cout << "info string option EvalFile set to '" << value << "'\n";
+      } else if (name == "SyzygyPath") {
+        if (syzygy::set_path(value)) {
+          tt::clear();
+          std::cout << "info string option SyzygyPath set to '" << syzygy::path() << "' (max "
+                    << syzygy::max_cardinality() << " pieces)\n";
+        } else
+          std::cout << "info string option SyzygyPath rejected: '" << value << "'\n";
+      } else if (name == "SyzygyProbeDepth") {
+        int depth = 0;
+        if (parse_int_option(value, depth)) {
+          syzygy::set_probe_depth(depth);
+          tt::clear();
+          std::cout << "info string option SyzygyProbeDepth set to " << syzygy::probe_depth << "\n";
+        } else
+          std::cout << "info string option SyzygyProbeDepth rejected: invalid integer '" << value << "'\n";
+      } else if (name == "Syzygy50MoveRule") {
+        bool enabled = false;
+        if (parse_bool_option(value, enabled)) {
+          syzygy::set_50_move_rule(enabled);
+          tt::clear();
+          std::cout << "info string option Syzygy50MoveRule set to " << (enabled ? "true" : "false") << "\n";
+        } else
+          std::cout << "info string option Syzygy50MoveRule rejected: invalid boolean '" << value << "'\n";
+      } else if (name == "SyzygyProbeLimit") {
+        int limit = 0;
+        if (parse_int_option(value, limit)) {
+          syzygy::set_probe_limit(limit);
+          tt::clear();
+          std::cout << "info string option SyzygyProbeLimit set to " << syzygy::probe_limit << " (effective "
+                    << syzygy::cardinality << ")\n";
+        } else
+          std::cout << "info string option SyzygyProbeLimit rejected: invalid integer '" << value << "'\n";
       } else if (tune) {
+        bool matched = false;
         for (const auto &p: search::tunables())
           if (name == p.name) {
-            int v = 0;
-            if (is >> v) {
+            int v   = 0;
+            matched = true;
+            if (parse_int_option(value, v)) {
               *p.p = std::clamp(v, p.lo, p.hi);
               search::params_dirty();
-            }
+              std::cout << "info string option " << p.name << " set to " << *p.p << "\n";
+            } else
+              std::cout << "info string option " << p.name << " rejected: invalid integer '" << value << "'\n";
             break;
           }
+        if (!matched)
+          std::cout << "info string option '" << name << "' ignored: unknown option\n";
+      } else {
+        std::cout << "info string option '" << name << "' ignored: unknown option\n";
       }
     } else if (cmd == "bench") {
       stop_search();

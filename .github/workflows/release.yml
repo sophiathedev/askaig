@@ -160,11 +160,11 @@ jobs:
           if [ -f build/askaig.exe ]; then
             mv "build/askaig.exe" "build/$binname.exe"
             archive="$base.zip"
-            (cd build && zip -q "../$archive" "$binname.exe")
+            (cd build && zip -q "../$archive" "$binname.exe" FATHOM_LICENSE)
           else
             mv "build/askaig" "build/$binname"
             archive="$base.tar.gz"
-            tar -czf "$archive" -C build "$binname"
+            tar -czf "$archive" -C build "$binname" FATHOM_LICENSE
           fi
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 

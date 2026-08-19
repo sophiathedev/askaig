@@ -26,7 +26,7 @@
 #
 # Tunables via env: TC (5+0.05), HASH (16), CONCURRENCY (P-cores - 1), ELO0/ELO1 (0/10),
 #                   ALPHA/BETA (0.1), ROUNDS (5000), BOOK (UHO_4060_v3.epd), ADJUDICATE (1),
-#                   DEPTH (unset).
+#                   DEPTH (unset), CAND_SYZYGY_PATH/BASE_SYZYGY_PATH (unset), SAME_BINARY (0).
 #
 # DEPTH=<n> plays FIXED-DEPTH games (both engines search exactly n plies, no clock). This removes
 # every speed effect — nps, cache pressure, time management — and measures ONLY the quality of the
@@ -148,6 +148,46 @@ ELO1="${ELO1:-10}"
 ALPHA="${ALPHA:-0.1}"
 BETA="${BETA:-0.1}"
 ROUNDS="${ROUNDS:-5000}"
+SAME_BINARY="${SAME_BINARY:-0}"
+case "$SAME_BINARY" in
+  0|1) ;;
+  *) echo "SAME_BINARY must be 0 or 1"; exit 1 ;;
+esac
+[ "$SAME_BINARY" = 0 ] || [ "$MODE" = new ] || { echo "SAME_BINARY is only supported for new runs"; exit 1; }
+[ "$SAME_BINARY" = 0 ] || [ "$BASE_REF" = HEAD ] || { echo "SAME_BINARY does not accept a baseline argument"; exit 1; }
+
+CAND_SYZYGY_PATH="${CAND_SYZYGY_PATH:-}"
+CAND_SYZYGY_PROBE_DEPTH="${CAND_SYZYGY_PROBE_DEPTH:-1}"
+CAND_SYZYGY_50_MOVE_RULE="${CAND_SYZYGY_50_MOVE_RULE:-true}"
+CAND_SYZYGY_PROBE_LIMIT="${CAND_SYZYGY_PROBE_LIMIT:-5}"
+BASE_SYZYGY_PATH="${BASE_SYZYGY_PATH:-}"
+BASE_SYZYGY_PROBE_DEPTH="${BASE_SYZYGY_PROBE_DEPTH:-1}"
+BASE_SYZYGY_50_MOVE_RULE="${BASE_SYZYGY_50_MOVE_RULE:-true}"
+BASE_SYZYGY_PROBE_LIMIT="${BASE_SYZYGY_PROBE_LIMIT:-5}"
+
+CAND_ENGINE_ARGS=()
+if [ -n "$CAND_SYZYGY_PATH" ]; then
+  [ -d "$CAND_SYZYGY_PATH" ] || { echo "candidate Syzygy path missing: $CAND_SYZYGY_PATH"; exit 1; }
+  CAND_SYZYGY_PATH="$(cd "$CAND_SYZYGY_PATH" && pwd -P)"
+  CAND_ENGINE_ARGS+=(
+    option.SyzygyPath="$CAND_SYZYGY_PATH"
+    option.SyzygyProbeDepth="$CAND_SYZYGY_PROBE_DEPTH"
+    option.Syzygy50MoveRule="$CAND_SYZYGY_50_MOVE_RULE"
+    option.SyzygyProbeLimit="$CAND_SYZYGY_PROBE_LIMIT"
+  )
+fi
+
+BASE_ENGINE_ARGS=()
+if [ -n "$BASE_SYZYGY_PATH" ]; then
+  [ -d "$BASE_SYZYGY_PATH" ] || { echo "baseline Syzygy path missing: $BASE_SYZYGY_PATH"; exit 1; }
+  BASE_SYZYGY_PATH="$(cd "$BASE_SYZYGY_PATH" && pwd -P)"
+  BASE_ENGINE_ARGS+=(
+    option.SyzygyPath="$BASE_SYZYGY_PATH"
+    option.SyzygyProbeDepth="$BASE_SYZYGY_PROBE_DEPTH"
+    option.Syzygy50MoveRule="$BASE_SYZYGY_50_MOVE_RULE"
+    option.SyzygyProbeLimit="$BASE_SYZYGY_PROBE_LIMIT"
+  )
+fi
 
 # Adjudication — ends games whose outcome is no longer in doubt (the fishtest/OpenBench standard;
 # with an unbalanced UHO book MOST games end this way, which is the intended time saving, roughly
@@ -210,7 +250,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ -n "$LEGACY_BASE" ] && [ -x "$LEGACY_BASE" ]; then
+if [ "$SAME_BINARY" = 1 ]; then
+  BASE_BIN="$CAND_BIN"
+  BASE_NAME=base
+  echo ">> baseline = candidate binary"
+elif [ -n "$LEGACY_BASE" ] && [ -x "$LEGACY_BASE" ]; then
   BASE_BIN="$LEGACY_BASE"
   BASE_NAME="$(basename "$LEGACY_BASE")"
   echo ">> adopting baseline binary: $BASE_BIN"
@@ -246,7 +290,16 @@ git -C "$ROOT" diff --quiet HEAD -- || TREE_STATE=dirty
   printf 'candidate_head=%s\n' "$(git -C "$ROOT" rev-parse HEAD)"
   printf 'candidate_tree=%s\n' "$TREE_STATE"
   printf 'base_ref=%s\n' "$BASE_REF"
+  printf 'same_binary=%s\n' "$SAME_BINARY"
   printf 'mode=%s\n' "$MODE"
+  printf 'candidate_syzygy_path=%s\n' "$CAND_SYZYGY_PATH"
+  printf 'candidate_syzygy_probe_depth=%s\n' "$CAND_SYZYGY_PROBE_DEPTH"
+  printf 'candidate_syzygy_50_move_rule=%s\n' "$CAND_SYZYGY_50_MOVE_RULE"
+  printf 'candidate_syzygy_probe_limit=%s\n' "$CAND_SYZYGY_PROBE_LIMIT"
+  printf 'base_syzygy_path=%s\n' "$BASE_SYZYGY_PATH"
+  printf 'base_syzygy_probe_depth=%s\n' "$BASE_SYZYGY_PROBE_DEPTH"
+  printf 'base_syzygy_50_move_rule=%s\n' "$BASE_SYZYGY_50_MOVE_RULE"
+  printf 'base_syzygy_probe_limit=%s\n' "$BASE_SYZYGY_PROBE_LIMIT"
 } > "$RUN_DIR/run.env"
 (cd "$RUN_DIR" && shasum -a 256 bin/cand bin/base > checksums.sha256)
 ln -sfn "$RUN_DIR" "$RUNS/latest"
@@ -272,11 +325,13 @@ if [ -n "$SPRT_ARGS" ]; then
 else
   echo ">> MATCH cand vs $BASE_NAME   $LIMIT  Hash=$HASH  concurrency=$CONCURRENCY  fixed $ROUNDS rounds x2 (no SPRT)"
 fi
+[ -z "$CAND_SYZYGY_PATH" ] || echo ">> candidate Syzygy: $CAND_SYZYGY_PATH  limit=$CAND_SYZYGY_PROBE_LIMIT"
+[ -z "$BASE_SYZYGY_PATH" ] || echo ">> baseline Syzygy: $BASE_SYZYGY_PATH  limit=$BASE_SYZYGY_PROBE_LIMIT"
 echo
 
 "$FASTCHESS" \
-  -engine cmd="$CAND_BIN" name=cand \
-  -engine cmd="$BASE_BIN" name="$BASE_NAME" \
+  -engine cmd="$CAND_BIN" name=cand "${CAND_ENGINE_ARGS[@]}" \
+  -engine cmd="$BASE_BIN" name="$BASE_NAME" "${BASE_ENGINE_ARGS[@]}" \
   -each "$LIMIT" option.Hash="$HASH" option.Threads=1 proto=uci \
   -openings file="$BOOK" format="$BOOK_FORMAT" order=random \
   -games 2 -rounds "$ROUNDS" -repeat \

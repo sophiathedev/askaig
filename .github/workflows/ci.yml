@@ -89,6 +89,10 @@ jobs:
           position fen 4k3/8/8/8/8/8/8/4K3 w - - 0 1
           setoption name Threads value not_a_number
           setoption name Hash value -5
+          setoption name SyzygyProbeDepth value 4
+          setoption name Syzygy50MoveRule value false
+          setoption name SyzygyProbeLimit value 5
+          setoption name SyzygyPath value <empty>
           setoption name NoSuchOption value 123
           go wtime -100 btime -100
           stop
@@ -105,6 +109,9 @@ jobs:
           echo "$out"
           [ "$status" -eq 0 ]
           [ "$(echo "$out" | grep -c '^readyok$')" -eq 2 ]
+          echo "$out" | grep -q '^info string option SyzygyProbeDepth set to 4$'
+          echo "$out" | grep -q '^info string option Syzygy50MoveRule set to false$'
+          echo "$out" | grep -q '^info string option SyzygyProbeLimit set to 5 (effective 0)$'
 
   debug-assert-build:
     name: debug (assertions active)

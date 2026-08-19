@@ -26,6 +26,7 @@ add_executable(askaig
     src/tt.cpp
     src/see.cpp
     src/smp.cpp
+    src/syzygy.cpp
     src/datagen.cpp
     src/search.cpp
     src/uci.cpp
@@ -35,7 +36,26 @@ add_executable(askaig
 target_include_directories(askaig PRIVATE src)
 
 find_package(Threads REQUIRED)
-target_link_libraries(askaig PRIVATE Threads::Threads)
+
+include(FetchContent)
+FetchContent_Declare(fathom
+    URL https://github.com/jdart1/Fathom/archive/c9c6fef0dddc05d2e242c183acf5833149ab676d.tar.gz
+    URL_HASH SHA256=ba4553045d796f0521a8554ef21bad44b20fd4a7657eb08ff85d17c9f27ff8ac
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(fathom)
+
+add_library(fathom STATIC ${fathom_SOURCE_DIR}/src/tbprobe.c)
+set_target_properties(fathom PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON)
+target_include_directories(fathom
+    PRIVATE ${CMAKE_SOURCE_DIR}/src/fathom
+    PUBLIC ${fathom_SOURCE_DIR}/src)
+target_link_libraries(fathom PRIVATE Threads::Threads)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(fathom PRIVATE -Wno-sign-compare)
+endif()
+configure_file(${CMAKE_SOURCE_DIR}/third_party/fathom/LICENSE ${CMAKE_BINARY_DIR}/FATHOM_LICENSE COPYONLY)
+
+target_link_libraries(askaig PRIVATE Threads::Threads fathom)
 
 # Build-date version. CI passes -DASKAIG_VERSION=<YYYYMMDD> (shared across all targets, == the release
 # tag); a plain local build auto-stamps the configure date. uci.cpp falls back to "dev" if undefined.
@@ -49,6 +69,7 @@ message(STATUS "Askaig version: ${ASKAIG_VERSION}")
 option(SIMD "Enable SIMD/hardware bit intrinsics" ON)
 set(ARCH "" CACHE STRING "Target SIMD arch: AVX2 or ARM_NEON (auto-detected when empty)")
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+set_property(TARGET fathom PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
 
 if(SIMD)
     if(ARCH STREQUAL "")
@@ -63,6 +84,7 @@ if(SIMD)
     if(ARCH STREQUAL "AVX2")
         target_compile_definitions(askaig PRIVATE ARCH_AVX2)
         target_compile_options(askaig PRIVATE -mavx2 -mbmi -mbmi2 -mpopcnt) # -mbmi2 -> PEXT for sliding attacks
+        target_compile_options(fathom PRIVATE -mavx2 -mbmi -mpopcnt)
     elseif(ARCH STREQUAL "ARM_NEON")
         target_compile_definitions(askaig PRIVATE ARCH_ARM_NEON)  # NEON is baseline on arm64
     else()
@@ -96,7 +118,7 @@ if(NOT PGO STREQUAL "")
             target_compile_options(askaig PRIVATE -fprofile-instr-generate)
             target_link_options(askaig PRIVATE -fprofile-instr-generate)
         else()
-            target_compile_options(askaig PRIVATE -fprofile-instr-use=${PGO_PROFILE})
+            target_compile_options(askaig PRIVATE -fprofile-instr-use=${PGO_PROFILE} -Wno-profile-instr-unprofiled)
             target_link_options(askaig PRIVATE -fprofile-instr-use=${PGO_PROFILE})
         endif()
     elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -114,4 +136,3 @@ if(NOT PGO STREQUAL "")
     endif()
     message(STATUS "PGO: ${PGO} (${CMAKE_CXX_COMPILER_ID})")
 endif()
-
