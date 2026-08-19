@@ -89,6 +89,15 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja
 
+      - name: Fetch Syzygy PGO fixture
+        if: ${{ matrix.pgo == 'gcc' || matrix.pgo == 'clang' }}
+        run: |
+          mkdir -p build/pgo-syzygy
+          curl -fsSL https://tablebase.sesse.net/syzygy/3-4-5/KPvK.rtbw -o build/pgo-syzygy/KPvK.rtbw
+          curl -fsSL https://tablebase.sesse.net/syzygy/3-4-5/KPvK.rtbz -o build/pgo-syzygy/KPvK.rtbz
+          cmake -E sha256sum build/pgo-syzygy/KPvK.rtbw | grep -q '^02fd2bdcd92821c869458f019f63524def1c9e7a2862ca8d2b16dc7712b16183 '
+          cmake -E sha256sum build/pgo-syzygy/KPvK.rtbz | grep -q '^ad01af2076183c90ccee662ca6c5d74da3222ff1fee47c01b5d4e56ed01938de '
+
       - name: Configure & build (native, no PGO — Linux / macOS)
         if: ${{ matrix.mingw_triple == '' && matrix.pgo == '' }}
         run: |
@@ -101,7 +110,7 @@ jobs:
           cmake --build build -j
 
       # PGO (behaviour-neutral, ~3-8% nps): instrument -> run the same training workload as
-      # tools/build_pgo.sh (perft, NNUE eval, depth-16 search) -> rebuild optimised. Only on targets whose
+      # tools/build_pgo.sh (perft, NNUE, search, Syzygy) -> rebuild optimised. Only on targets whose
       # build host can RUN the binary to collect a profile. The node count is unchanged by PGO, so no
       # SPRT is needed; a broken profile build just fails this job (and blocks the release — it never
       # ships an un-profiled-but-mislabelled binary).
@@ -109,7 +118,7 @@ jobs:
         if: ${{ matrix.pgo == 'gcc' }}
         run: |
           set -e
-          common="-S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSIMD=ON -DARCH=${{ matrix.arch }} -DASKAIG_VERSION=${{ needs.meta.outputs.date }} -DCMAKE_CXX_COMPILER=g++-14"
+          common="-S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSIMD=ON -DARCH=${{ matrix.arch }} -DASKAIG_VERSION=${{ needs.meta.outputs.date }} -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14"
           cmake $common -DPGO=generate
           cmake --build build -j
           # GCC writes .gcda into build/; the 'use' stage below must reuse this same dir.
@@ -117,7 +126,7 @@ jobs:
           printf 'position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1\ngo perft 5\nquit\n' | ./build/askaig >/dev/null 2>&1 || true
           printf 'position startpos\ngo perft 5 noncache\nquit\n' | ./build/askaig >/dev/null 2>&1 || true
           printf 'bench evalnps\nquit\n' | ./build/askaig >/dev/null 2>&1 || true
-          printf 'bench 16\nquit\n' | ./build/askaig >/dev/null 2>&1 || true
+          printf 'setoption name SyzygyPath value build/pgo-syzygy\nsetoption name SyzygyProbeLimit value 5\nbench 16\nquit\n' | ./build/askaig >/dev/null 2>&1
           cmake $common -DPGO=use
           cmake --build build -j
 
@@ -133,7 +142,7 @@ jobs:
           printf 'position fen r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1\ngo perft 5\nquit\n' | LLVM_PROFILE_FILE="build/pgo-%p.profraw" ./build/askaig >/dev/null 2>&1 || true
           printf 'position startpos\ngo perft 5 noncache\nquit\n' | LLVM_PROFILE_FILE="build/pgo-%p.profraw" ./build/askaig >/dev/null 2>&1 || true
           printf 'bench evalnps\nquit\n' | LLVM_PROFILE_FILE="build/pgo-%p.profraw" ./build/askaig >/dev/null 2>&1 || true
-          printf 'bench 16\nquit\n' | LLVM_PROFILE_FILE="build/pgo-%p.profraw" ./build/askaig >/dev/null 2>&1 || true
+          printf 'setoption name SyzygyPath value build/pgo-syzygy\nsetoption name SyzygyProbeLimit value 5\nbench 16\nquit\n' | LLVM_PROFILE_FILE="build/pgo-%p.profraw" ./build/askaig >/dev/null 2>&1
           xcrun llvm-profdata merge -output=build/pgo.profdata build/pgo-*.profraw
           cmake $common -DPGO=use -DPGO_PROFILE="$PWD/build/pgo.profdata"
           cmake --build build -j
