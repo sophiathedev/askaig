@@ -330,8 +330,8 @@ fi
 echo
 
 "$FASTCHESS" \
-  -engine cmd="$CAND_BIN" name=cand "${CAND_ENGINE_ARGS[@]}" \
-  -engine cmd="$BASE_BIN" name="$BASE_NAME" "${BASE_ENGINE_ARGS[@]}" \
+  -engine cmd="$CAND_BIN" name=cand ${CAND_ENGINE_ARGS[@]+"${CAND_ENGINE_ARGS[@]}"} \
+  -engine cmd="$BASE_BIN" name="$BASE_NAME" ${BASE_ENGINE_ARGS[@]+"${BASE_ENGINE_ARGS[@]}"} \
   -each "$LIMIT" option.Hash="$HASH" option.Threads=1 proto=uci \
   -openings file="$BOOK" format="$BOOK_FORMAT" order=random \
   -games 2 -rounds "$ROUNDS" -repeat \
