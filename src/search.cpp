@@ -1,6 +1,7 @@
 #include "search.h"
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -40,10 +41,13 @@ namespace {
     return g_lmr[std::min(depth, 63)][std::min(movecount, 63)];
   }
 
+  static_assert(std::has_single_bit(Histories::CORR_SIZE));
+  constexpr int CORR_SHIFT = 64 - std::countr_zero(Histories::CORR_SIZE); // low bits ignore upper-board squares
+
   [[gnu::pure, gnu::always_inline]] inline size_t pawn_corr_index(const Position &p) {
     const uint64_t w = p.bitboard_of(WHITE_PAWN) * 0x9E3779B97F4A7C15ull;
     const uint64_t b = p.bitboard_of(BLACK_PAWN) * 0xC2B2AE3D27D4EB4Full;
-    return (w ^ (b + 0x165667B19E3779F9ull + (w << 6) + (w >> 2))) & (Histories::CORR_SIZE - 1);
+    return (w ^ (b + 0x165667B19E3779F9ull + (w << 6) + (w >> 2))) >> CORR_SHIFT;
   }
   [[gnu::pure, gnu::always_inline]] inline size_t material_corr_index(const Position &p) {
     uint64_t key = 0;
@@ -56,12 +60,12 @@ namespace {
   [[gnu::pure, gnu::always_inline]] inline size_t minor_corr_index(const Position &p) {
     const Bitboard minors = p.bitboard_of(WHITE_KNIGHT) | p.bitboard_of(WHITE_BISHOP) | p.bitboard_of(BLACK_KNIGHT) |
                             p.bitboard_of(BLACK_BISHOP);
-    return (minors * 0x9E3779B97F4A7C15ull) & (Histories::CORR_SIZE - 1);
+    return (minors * 0x9E3779B97F4A7C15ull) >> CORR_SHIFT;
   }
   [[gnu::pure, gnu::always_inline]] inline size_t major_corr_index(const Position &p) {
     const Bitboard majors = p.bitboard_of(WHITE_ROOK) | p.bitboard_of(WHITE_QUEEN) | p.bitboard_of(BLACK_ROOK) |
                             p.bitboard_of(BLACK_QUEEN);
-    return (majors * 0xC2B2AE3D27D4EB4Full) & (Histories::CORR_SIZE - 1);
+    return (majors * 0xC2B2AE3D27D4EB4Full) >> CORR_SHIFT;
   }
 
   [[gnu::const, gnu::always_inline]] inline int to_tt(int v, int ply) {
@@ -697,6 +701,43 @@ const std::vector<search::ParamInfo> &search::tunables() {
 }
 
 void search::params_dirty() { g_lmr_init = false; }
+
+bool search::selftest_correction() {
+  const Position empty;
+  for (Piece pc: {WHITE_PAWN, BLACK_PAWN, WHITE_KNIGHT, BLACK_KNIGHT, WHITE_BISHOP, BLACK_BISHOP, WHITE_ROOK,
+                  BLACK_ROOK, WHITE_QUEEN, BLACK_QUEEN}) {
+    const PieceType pt          = type_of(pc);
+    const auto      index       = pt == PAWN                     ? pawn_corr_index
+                                  : pt == KNIGHT || pt == BISHOP ? minor_corr_index
+                                                                 : major_corr_index;
+    const size_t    empty_index = index(empty);
+    bool            seen[Histories::CORR_SIZE]{};
+    Position        pos;
+    const int       first = pt == PAWN ? a2 : a1;
+    const int       end   = pt == PAWN ? a8 : NSQUARES;
+    for (int s = first; s < end; ++s) {
+      pos.put_piece(pc, Square(s));
+      const size_t value = index(pos);
+      if (value >= Histories::CORR_SIZE || value == empty_index || seen[value])
+        return false;
+      seen[value] = true;
+      pos.remove_piece(Square(s));
+    }
+  }
+
+  Position pos;
+  if (!Position::set(DEFAULT_FEN, pos))
+    return false;
+  const size_t start = pawn_corr_index(pos);
+  pos.play<WHITE>(Move(g1, f3, QUIET));
+  if (pawn_corr_index(pos) != start)
+    return false;
+  pos.play<BLACK>(Move(e7, e5, DOUBLE_PUSH));
+  if (pawn_corr_index(pos) == start)
+    return false;
+  pos.undo<BLACK>(Move(e7, e5, DOUBLE_PUSH));
+  return pawn_corr_index(pos) == start;
+}
 
 void search::request_stop() { g_stop.store(true, std::memory_order_relaxed); }
 

@@ -663,11 +663,19 @@ namespace {
     return ok;
   }
 
+  bool selftest_correction() {
+    const bool ok = search::selftest_correction();
+    std::cout << (ok ? "selftest correction PASS: placement coverage and pawn-move regression\n"
+                     : "selftest correction FAIL: placement hash loses square information\n");
+    return ok;
+  }
+
   void selftest_all() {
     bool ok = true;
     ok &= selftest_perft();
     ok &= selftest_see();
     ok &= selftest_draw();
+    ok &= selftest_correction();
     ok &= selftest_nnue(500, 80);
     ok &= selftest_search();
     ok &= selftest_contempt();
@@ -1183,6 +1191,8 @@ void uci::loop(bool tune) {
         selftest_see();
       else if (what == "draw")
         selftest_draw();
+      else if (what == "correction")
+        selftest_correction();
       else if (what == "search")
         selftest_search();
       else if (what == "contempt")
