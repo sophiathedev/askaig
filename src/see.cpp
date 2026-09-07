@@ -9,8 +9,7 @@ namespace {
     return (pawn_attacks<WHITE>(s) & pos.bitboard_of(BLACK_PAWN)) |
            (pawn_attacks<BLACK>(s) & pos.bitboard_of(WHITE_PAWN)) |
            (attacks<KNIGHT>(s, occ) & (pos.bitboard_of(WHITE_KNIGHT) | pos.bitboard_of(BLACK_KNIGHT))) |
-           (attacks<BISHOP>(s, occ) &
-            (pos.diagonal_sliders<WHITE>() | pos.diagonal_sliders<BLACK>())) |
+           (attacks<BISHOP>(s, occ) & (pos.diagonal_sliders<WHITE>() | pos.diagonal_sliders<BLACK>())) |
            (attacks<ROOK>(s, occ) & (pos.orthogonal_sliders<WHITE>() | pos.orthogonal_sliders<BLACK>())) |
            (KING_ATTACKS[s] & (pos.bitboard_of(WHITE_KING) | pos.bitboard_of(BLACK_KING)));
   }
@@ -29,11 +28,18 @@ namespace {
 
   const Square from = m.from(), to = m.to();
 
-  int swap = (f == EN_PASSANT ? PIECE_VAL[PAWN] : PIECE_VAL[type_of(pos.at(to))]) - threshold;
+  int moved_value = PIECE_VAL[type_of(pos.at(from))];
+  int gain        = f == EN_PASSANT ? PIECE_VAL[PAWN] : PIECE_VAL[type_of(pos.at(to))];
+  if (f & PR_KNIGHT) {
+    moved_value = PIECE_VAL[KNIGHT + (f & 3)];
+    gain += moved_value - PIECE_VAL[PAWN];
+  }
+
+  int swap = gain - threshold;
   if (swap < 0) // even capturing for free is not enough
     return false;
 
-  swap = PIECE_VAL[type_of(pos.at(from))] - swap;
+  swap = moved_value - swap;
   if (swap <= 0) // we still meet the threshold even if recaptured
     return true;
 

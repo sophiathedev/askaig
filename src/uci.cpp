@@ -388,6 +388,46 @@ namespace {
     }
 
     {
+      struct Case {
+        const char *fen;
+        Square      from, to;
+        MoveFlags   flags;
+        int         gain[4];
+      };
+      constexpr Case CASES[] = {
+              {"k6r/6P1/8/8/8/8/8/K7 w - - 0 1", g7, h8, PC_KNIGHT, {720, 730, 900, 1300}},
+              {"6kr/6P1/8/8/8/8/8/K7 w - - 0 1", g7, h8, PC_KNIGHT, {400, 400, 400, 400}},
+              {"k6r/6P1/7r/8/8/8/K7/8 w - - 0 1", g7, h8, PC_KNIGHT, {400, 400, 400, 400}},
+              {"7k/1P6/8/8/8/8/8/K7 w - - 0 1", b7, b8, PR_KNIGHT, {220, 230, 400, 800}},
+              {"7k/1P6/1r6/8/8/8/8/K7 w - - 0 1", b7, b8, PR_KNIGHT, {-100, -100, -100, -100}},
+              {"k7/8/8/8/8/8/6p1/K6R b - - 0 1", g2, h1, PC_KNIGHT, {720, 730, 900, 1300}},
+              {"k7/8/8/8/8/8/6p1/6KR b - - 0 1", g2, h1, PC_KNIGHT, {400, 400, 400, 400}},
+              {"k7/8/8/8/8/8/1p6/7K b - - 0 1", b2, b1, PR_KNIGHT, {220, 230, 400, 800}},
+              {"k7/8/8/8/8/1R6/1p6/7K b - - 0 1", b2, b1, PR_KNIGHT, {-100, -100, -100, -100}},
+      };
+      for (const Case &c: CASES) {
+        Position pos;
+        if (!Position::set(c.fen, pos))
+          return false;
+        Move         moves[218];
+        const size_t count = legal_moves(pos, moves);
+        for (int promotion = 0; promotion < 4; ++promotion) {
+          const Move m(c.from, c.to, MoveFlags(c.flags + promotion));
+          expect(std::find(moves, moves + count, m) != moves + count, "illegal promotion fixture");
+          const int gain = c.gain[promotion];
+          for (int threshold: {-2000, -100, 0, 1000, 2000, gain - 1, gain, gain + 1}) {
+            if (search::see_ge(pos, m, threshold) != (threshold <= gain)) {
+              std::cout << "selftest see FAIL: " << move_to_uci(m) << " threshold " << threshold << " expected gain "
+                        << gain << " fen " << c.fen << "\n";
+              ok = false;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    {
       PRNG                  rng(0xC0FFEEu);
       constexpr const char *FENS[] = {
               "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -",
