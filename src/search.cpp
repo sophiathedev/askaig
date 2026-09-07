@@ -80,7 +80,7 @@ namespace {
   }
 
   struct EvalResult {
-    int raw;
+    int raw; // pre-rule50, VALUE_NONE_TT if not cacheable
     int score;
   };
 
@@ -101,9 +101,9 @@ namespace {
                       5 * pop_count(pos.bitboard_of(WHITE_ROOK) | pos.bitboard_of(BLACK_ROOK)) +
                       9 * pop_count(pos.bitboard_of(WHITE_QUEEN) | pos.bitboard_of(BLACK_QUEEN));
       raw           = t.ev.evaluate(pos) * (prm.MAT_BASE + prm.MAT_MULT * npm) / 1024;
-      raw           = raw * (200 - std::min(pos.fifty(), 100)) / 200;
-      raw           = std::clamp(raw, -TABLEBASE_WIN + 1, TABLEBASE_WIN - 1);
     }
+    const int scaled =
+            std::clamp(raw * (200 - std::min(pos.fifty(), 100)) / 200, -TABLEBASE_WIN + 1, TABLEBASE_WIN - 1);
 
     const int c1 = g_hist.corr_pawn[c][i_paw], c2 = g_hist.corr_material[c][i_mat];
     const int c3 = g_hist.corr_minor[c][i_min], c4 = g_hist.corr_major[c][i_maj];
@@ -115,7 +115,8 @@ namespace {
       mass += std::abs(c5);
     }
     ss->eval_unc = mass - std::abs(corr);
-    return {raw, std::clamp(raw + corr / 256, -TABLEBASE_WIN + 1, TABLEBASE_WIN - 1)};
+    return {raw > -TABLEBASE_WIN && raw < TABLEBASE_WIN ? raw : tt::VALUE_NONE_TT,
+            std::clamp(scaled + corr / 256, -TABLEBASE_WIN + 1, TABLEBASE_WIN - 1)};
   }
 
   [[gnu::hot]] inline bool stopped() {
@@ -737,6 +738,43 @@ bool search::selftest_correction() {
     return false;
   pos.undo<BLACK>(Move(e7, e5, DOUBLE_PUSH));
   return pawn_corr_index(pos) == start;
+}
+
+bool search::selftest_tt_eval() {
+  if (!nnue::loaded())
+    return false;
+  auto   t  = std::make_unique<ThreadData>();
+  Stack *ss = t->stack + 4;
+  bool   ok = true;
+  for (const char *fen: {"4k3/8/8/8/8/8/8/3QK3 w - - 0 1", "4k3/8/8/8/8/8/8/3QK3 b - - 0 1"}) {
+    Position pos;
+    if (!Position::set(fen, pos))
+      return false;
+    t->ev.reset(pos);
+    const uint64_t key = tt_key(pos);
+    for (int stored_clock: {0, 90}) {
+      pos.history[pos.ply()].fifty = stored_clock;
+      const EvalResult source      = evaluate(*t, pos, ss);
+      const auto       slot        = tt::probe(key).slot;
+      const tt::Entry  saved       = *slot;
+      tt::store(slot, key, Move(), 0, source.raw, 0, tt::EXACT, false);
+      for (int clock: {0, 1, 50, 90, 99, 100}) {
+        pos.history[pos.ply()].fifty = clock;
+        const auto       hit         = tt::probe(tt_key(pos));
+        const EvalResult fresh       = evaluate(*t, pos, ss);
+        const EvalResult cached      = evaluate(*t, pos, ss, hit.eval);
+        ok &= hit.hit && hit.eval == source.raw && cached.raw == fresh.raw && cached.score == fresh.score;
+      }
+      *slot = saved;
+    }
+    pos.history[pos.ply()].fifty = 100;
+    const int correction         = evaluate(*t, pos, ss, 0).score;
+    for (int raw: {-40000, 40000}) {
+      const EvalResult result = evaluate(*t, pos, ss, raw);
+      ok &= result.raw == tt::VALUE_NONE_TT && result.score == raw / 2 + correction;
+    }
+  }
+  return ok;
 }
 
 void search::request_stop() { g_stop.store(true, std::memory_order_relaxed); }

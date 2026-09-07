@@ -66,5 +66,6 @@ namespace search {
   const std::vector<ParamInfo> &tunables();
   void                          params_dirty();
   bool                          selftest_correction();
+  bool                          selftest_tt_eval();
 
 } // namespace search

@@ -670,12 +670,20 @@ namespace {
     return ok;
   }
 
+  bool selftest_tt_eval() {
+    const bool ok = search::selftest_tt_eval();
+    std::cout << (ok ? "selftest tt-eval PASS: cached and fresh eval agree across halfmove clocks\n"
+                     : "selftest tt-eval FAIL: cached eval depends on stored halfmove clock\n");
+    return ok;
+  }
+
   void selftest_all() {
     bool ok = true;
     ok &= selftest_perft();
     ok &= selftest_see();
     ok &= selftest_draw();
     ok &= selftest_correction();
+    ok &= selftest_tt_eval();
     ok &= selftest_nnue(500, 80);
     ok &= selftest_search();
     ok &= selftest_contempt();
@@ -1193,6 +1201,8 @@ void uci::loop(bool tune) {
         selftest_draw();
       else if (what == "correction")
         selftest_correction();
+      else if (what == "tt-eval")
+        selftest_tt_eval();
       else if (what == "search")
         selftest_search();
       else if (what == "contempt")
