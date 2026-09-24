@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -15,6 +16,7 @@
 #include <vector>
 #include "datagen.h"
 #include "nnue.h"
+#include "movepick.h"
 #include "position.h"
 #include "search.h"
 #include "see.h"
@@ -354,6 +356,271 @@ namespace {
     if (ok)
       std::cout << "selftest perft PASS: " << std::size(CASES) << " known positions match exactly\n";
     return ok;
+  }
+
+  bool selftest_movepick() {
+    auto hist = std::make_unique<search::Histories>();
+    hist->clear();
+    PRNG       rng(0x4d6f76655069636bull);
+    int        positions = 0, pickers = 0, qs_tail_checks = 0;
+    const auto check = [&](Position &pos, bool exhaustive) {
+      Move                    legal[218];
+      const size_t            n = legal_moves(pos, legal);
+      std::array<bool, 65536> present{};
+      for (size_t i = 0; i < n; ++i)
+        present[legal[i].to_from()] = true;
+      {
+        LegalContext context;
+        Move         captures[218], quiets[218], child[218];
+        Move        *ce = pos.turn() == WHITE ? pos.generate_legals<WHITE, MoveGen::CAPTURES>(captures, &context)
+                                              : pos.generate_legals<BLACK, MoveGen::CAPTURES>(captures, &context);
+        if (n) {
+          play_any_color(pos, legal[0]);
+          legal_moves(pos, child);
+          undo_any_color(pos, legal[0]);
+        }
+        Move  *qe = pos.turn() == WHITE ? pos.generate_legals<WHITE, MoveGen::QUIETS>(quiets, &context)
+                                        : pos.generate_legals<BLACK, MoveGen::QUIETS>(quiets, &context);
+        size_t ci = 0, qi = 0;
+        for (size_t i = 0; i < n; ++i) {
+          const bool capture = legal[i].is_capture();
+          if ((capture && (ci == size_t(ce - captures) || captures[ci++] != legal[i])) ||
+              (!capture && (qi == size_t(qe - quiets) || quiets[qi++] != legal[i]))) {
+            std::cout << "selftest movepick FAIL: split generator fen " << pos.fen() << "\n";
+            return false;
+          }
+        }
+        if (ci != size_t(ce - captures) || qi != size_t(qe - quiets)) {
+          std::cout << "selftest movepick FAIL: split generator count\n";
+          return false;
+        }
+      }
+      const auto verify_tt = [&](Move m) {
+        const bool ordinary = m.flags() == QUIET || m.flags() == CAPTURE || m.flags() == DOUBLE_PUSH;
+        if (pos.legal_tt_move(m) != (ordinary && present[m.to_from()])) {
+          std::cout << "selftest movepick FAIL: TT legality " << m.to_from() << " fen " << pos.fen() << "\n";
+          return false;
+        }
+        return true;
+      };
+      if (exhaustive) {
+        for (unsigned bits = 0; bits < 65536; ++bits)
+          if (!verify_tt(Move(uint16_t(bits))))
+            return false;
+      } else {
+        for (size_t i = 0; i < n; ++i)
+          if (!verify_tt(legal[i]))
+            return false;
+        for (int i = 0; i < 256; ++i)
+          if (!verify_tt(Move(rng.rand<uint16_t>())))
+            return false;
+      }
+
+      const Move  killers[2] = {n ? legal[n / 2] : Move(), n ? legal[n - 1] : Move()};
+      const auto *ch1        = &hist->cont[WHITE_PAWN][a2];
+      const auto *ch2        = &hist->cont[BLACK_KNIGHT][b8];
+      for (bool qs: {false, true}) {
+        for (size_t i = 0; i < n + 2; ++i) {
+          const Move         ttm = i < n ? legal[i] : i == n ? Move() : Move(rng.rand<uint16_t>());
+          search::MovePicker eager(pos, *hist, ttm, killers, killers[1], ch1, ch2, qs, false);
+          search::MovePicker staged(pos, *hist, ttm, killers, killers[1], ch1, ch2, qs, true, false);
+          if (eager.has_moves() != staged.has_moves()) {
+            std::cout << "selftest movepick FAIL: empty-list mismatch\n";
+            return false;
+          }
+          size_t                     count = 0;
+          std::array<uint8_t, 65536> expected{};
+          Move                       expected_order[218];
+          for (;;) {
+            const Move a = eager.next(), b = staged.next();
+            if (a != b || eager.yielded_see() != staged.yielded_see() || ++count > 219) {
+              std::cout << "selftest movepick FAIL: ordering qs=" << qs << " tt=" << ttm.to_from() << " fen "
+                        << pos.fen() << "\n";
+              return false;
+            }
+            if (!a.to_from())
+              break;
+            expected[a.to_from()]     = uint8_t(eager.yielded_see()) + 1;
+            expected_order[count - 1] = a;
+          }
+          search::MovePicker split(pos, *hist, ttm, killers, killers[1], ch1, ch2, qs, true, true);
+          search::MovePicker sorted_bad(pos, *hist, ttm, killers, killers[1], ch1, ch2, qs, true, true,
+                                        search::MovePicker::ENABLE_REFUTATION_STAGE, false);
+          if (split.has_moves() != (count > 1))
+            return false;
+          const bool tt_present  = expected[ttm.to_from()] != 0;
+          const bool in_check    = pos.turn() == WHITE ? pos.in_check<WHITE>() : pos.in_check<BLACK>();
+          size_t     split_count = 0;
+          int        last_phase  = 0;
+          for (Move m; (m = split.next()).to_from();) {
+            if (m != sorted_bad.next() || split.yielded_see() != sorted_bad.yielded_see()) {
+              std::cout << "selftest movepick FAIL: lazy bad-capture order\n";
+              return false;
+            }
+            if (split_count >= count - 1 || expected[m.to_from()] != uint8_t(split.yielded_see()) + 1 ||
+                (tt_present && split_count == 0 && m != ttm) ||
+                ((qs || in_check) && m != expected_order[split_count])) {
+              std::cout << "selftest movepick FAIL: staged set/band qs=" << qs << " tt=" << ttm.to_from() << " fen "
+                        << pos.fen() << "\n";
+              return false;
+            }
+            if (m != ttm) {
+              const int phase = !m.is_capture() ? 1 : split.yielded_see() == search::MovePicker::SEE_WINNING ? 0 : 2;
+              if (phase < last_phase) {
+                std::cout << "selftest movepick FAIL: stage order\n";
+                return false;
+              }
+              last_phase = phase;
+            }
+            if (qs && !in_check && last_phase == 2) {
+              if (!m.is_capture() || search::see_ge(pos, m, 0)) {
+                std::cout << "selftest movepick FAIL: searchable move after losing QS band\n";
+                return false;
+              }
+              ++qs_tail_checks;
+            }
+            expected[m.to_from()] = 0;
+            ++split_count;
+          }
+          if (split_count + 1 != count || sorted_bad.next().to_from())
+            return false;
+          ++pickers;
+        }
+      }
+      ++positions;
+      return true;
+    };
+
+    const char *cases[] = {
+            DEFAULT_FEN.c_str(),
+            KIWIPETE.c_str(),
+            "4k3/8/8/8/8/8/4r3/4K3 w - - 0 1",
+            "4k3/8/8/8/1b6/8/4r3/4K3 w - - 0 1",
+            "4r1k1/8/8/8/8/8/4N3/4K3 w - - 0 1",
+            "7k/6Q1/5K2/8/8/8/8/8 b - - 0 1",
+            "7k/5K2/6Q1/8/8/8/8/8 b - - 0 1",
+            "4k3/8/8/r4pPK/8/8/8/8 w - f6 0 1",
+            "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1",
+            "k6r/6P1/8/8/8/8/8/K7 w - - 0 1",
+            "k7/8/8/8/8/8/6p1/K6R b - - 0 1",
+    };
+    for (const char *fen: cases) {
+      Position pos;
+      Position::set(fen, pos);
+      if (!check(pos, true))
+        return false;
+    }
+    for (int game = 0; game < 8; ++game) {
+      Position pos;
+      Position::set(DEFAULT_FEN, pos);
+      for (int ply = 0; ply < 64; ++ply) {
+        if (!check(pos, false))
+          return false;
+        Move         moves[218];
+        const size_t n = legal_moves(pos, moves);
+        if (!n)
+          break;
+        for (size_t i = 0; i < n; ++i) {
+          const Move    m                                        = moves[i];
+          const int16_t score                                    = int(rng.rand<unsigned>() % 32769) - 16384;
+          hist->butterfly[pos.turn()][m.from()][m.to()]          = score;
+          hist->cont[WHITE_PAWN][a2][pos.at(m.from())][m.to()]   = score / 2;
+          hist->cont[BLACK_KNIGHT][b8][pos.at(m.from())][m.to()] = -score / 3;
+          if (m.is_capture()) {
+            const PieceType victim                          = m.flags() == EN_PASSANT ? PAWN : type_of(pos.at(m.to()));
+            hist->capture[pos.at(m.from())][m.to()][victim] = score;
+          }
+        }
+        play_any_color(pos, moves[rng.rand<unsigned>() % n]);
+      }
+    }
+    {
+      Position pos;
+      Position::set(DEFAULT_FEN, pos);
+      hist->clear();
+      const Move         ttm(e2, e4, DOUBLE_PUSH), improved(d2, d4, DOUBLE_PUSH);
+      search::MovePicker eager(pos, *hist, ttm, nullptr, Move(), nullptr, nullptr, false, false);
+      search::MovePicker staged(pos, *hist, ttm, nullptr, Move(), nullptr, nullptr, false, true);
+      if (eager.next() != ttm || staged.next() != ttm)
+        return false;
+      hist->butterfly[WHITE][d2][d4] = search::HIST_MAX;
+      if (staged.next() != improved || eager.next() == improved) {
+        std::cout << "selftest movepick FAIL: deferred history read\n";
+        return false;
+      }
+    }
+    {
+      Position pos;
+      Position::set(DEFAULT_FEN, pos);
+      hist->clear();
+      const Move         k1(g1, f3), k2(b1, c3), counter(d2, d4, DOUBLE_PUSH), improved(a2, a4, DOUBLE_PUSH);
+      Move               killers[] = {k1, k2};
+      search::MovePicker picker(pos, *hist, Move(), killers, counter, nullptr, nullptr, false, true, true, true);
+      killers[0] = killers[1] = Move();
+      for (Move expected: {k1, k2, counter}) {
+        if (!picker.has_moves() || !picker.has_moves() || picker.next() != expected ||
+            picker.yielded_see() != search::MovePicker::SEE_UNKNOWN) {
+          std::cout << "selftest movepick FAIL: refutation order/snapshot\n";
+          return false;
+        }
+      }
+      hist->butterfly[WHITE][a2][a4] = search::HIST_MAX;
+      if (picker.next() != improved) {
+        std::cout << "selftest movepick FAIL: quiets generated before refutations finished\n";
+        return false;
+      }
+      size_t count = 4;
+      for (Move m; (m = picker.next()).to_from(); ++count)
+        if (m == k1 || m == k2 || m == counter || m == improved || count >= 20)
+          return false;
+      if (count != 20)
+        return false;
+
+      const Move         duplicates[] = {k1, k1};
+      search::MovePicker duplicate_picker(pos, *hist, k1, duplicates, k1, nullptr, nullptr, false, true, true, true);
+      if (duplicate_picker.next() != k1)
+        return false;
+      count = 1;
+      for (Move m; (m = duplicate_picker.next()).to_from(); ++count)
+        if (m == k1 || count >= 20)
+          return false;
+      if (count != 20)
+        return false;
+    }
+    {
+      Position pos;
+      Position::set("4r1k1/8/8/8/8/8/4N3/4K3 w - - 0 1", pos);
+      const Move         killers[] = {Move(e2, c3), Move(e8, e7)};
+      const Move         counter(e1, d1);
+      search::MovePicker picker(pos, *hist, Move(), killers, counter, nullptr, nullptr, false, true, true, true);
+      if (!picker.has_moves() || picker.next() != counter) {
+        std::cout << "selftest movepick FAIL: pinned or wrong-color refutation\n";
+        return false;
+      }
+    }
+    for (const auto &[fen, special]: {std::pair{KIWIPETE.c_str(), Move(e1, h1, OO)},
+                                      std::pair{"k6r/6P1/8/8/8/8/8/K7 w - - 0 1", Move(g7, g8, PR_QUEEN)}}) {
+      Position pos;
+      Position::set(fen, pos);
+      const Move         killers[] = {special, Move()};
+      search::MovePicker before(pos, *hist, Move(), killers, Move(), nullptr, nullptr, false, true, true, false);
+      search::MovePicker after(pos, *hist, Move(), killers, Move(), nullptr, nullptr, false, true, true, true);
+      for (;;) {
+        const Move a = before.next(), b = after.next();
+        if (a != b || before.yielded_see() != after.yielded_see()) {
+          std::cout << "selftest movepick FAIL: special refutation fallback\n";
+          return false;
+        }
+        if (!a.to_from())
+          break;
+      }
+    }
+    if (!qs_tail_checks)
+      return false;
+    std::cout << "selftest movepick PASS: " << positions << " positions, " << pickers
+              << " TT sequences and split sets/bands match, context, legality and refutations verified; "
+              << qs_tail_checks << " losing QS tail moves verified\n";
+    return true;
   }
 
   bool selftest_see() {
@@ -720,6 +987,7 @@ namespace {
   void selftest_all() {
     bool ok = true;
     ok &= selftest_perft();
+    ok &= selftest_movepick();
     ok &= selftest_see();
     ok &= selftest_draw();
     ok &= selftest_correction();
@@ -1237,6 +1505,8 @@ void uci::loop(bool tune) {
         selftest_perft();
       else if (what == "see")
         selftest_see();
+      else if (what == "movepick")
+        selftest_movepick();
       else if (what == "draw")
         selftest_draw();
       else if (what == "correction")

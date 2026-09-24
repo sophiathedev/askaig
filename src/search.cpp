@@ -260,14 +260,16 @@ namespace {
 
     const Move ttm = tp.move;
     MovePicker picker(pos, g_hist, ttm, nullptr, Move(), nullptr, nullptr, /*quiescence=*/true);
-    if (in_check && picker.total() == 0)
+    if (in_check && !picker.has_moves())
       return -MATE + ply;
 
     Move best_move{};
     for (Move m; (m = picker.next()).to_from() != 0;) {
       if (!in_check) {
         const auto band = picker.yielded_see();
-        if (band == MovePicker::SEE_LOSING || (band == MovePicker::SEE_UNKNOWN && !see_ge(pos, m, 0)))
+        if (band == MovePicker::SEE_LOSING)
+          break; // only losing captures remain
+        if (band == MovePicker::SEE_UNKNOWN && !see_ge(pos, m, 0))
           continue;
         const PieceType captured = m.flags() == EN_PASSANT ? PAWN : type_of(pos.at(m.to()));
         if (futility_base + PIECE_VAL[captured] <= alpha && m.flags() != PR_QUEEN && m.flags() != PC_QUEEN)
@@ -468,7 +470,7 @@ namespace {
                                  ? counter_load(g_hist.counter[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()])
                                  : Move();
     MovePicker picker(pos, g_hist, ttm, ss->killers, counter, (ss - 1)->ch, (ss - 2)->ch, /*quiescence=*/false);
-    if (picker.total() == 0) {
+    if (!picker.has_moves()) {
       if (excluded)
         return alpha;
       return in_check ? -MATE + ply : 0;

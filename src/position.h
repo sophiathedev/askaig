@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -50,6 +51,14 @@ struct UndoInfo {
   UndoInfo(const UndoInfo &prev) : entry(prev.entry), captured(NO_PIECE), epsq(NO_SQUARE), hash(0), fifty(prev.fifty) {}
 
   UndoInfo &operator=(const UndoInfo &) = default;
+};
+
+enum class MoveGen { ALL, QUIESCENCE, CAPTURES, QUIETS };
+
+struct LegalContext {
+  uint64_t hash;
+  Bitboard danger, pinned, checkers;
+  bool     ready = false;
 };
 
 class Position {
@@ -182,6 +191,47 @@ public:
     return attackers_from<~C>(bsf(bitboard_of(C, KING)), all_pieces<WHITE>() | all_pieces<BLACK>());
   }
 
+  // special moves stay on the full-generator path
+  [[nodiscard]] bool legal_tt_move(Move m) const {
+    const MoveFlags flags = m.flags();
+    if (flags != QUIET && flags != CAPTURE && flags != DOUBLE_PUSH)
+      return false;
+    const Square from = m.from(), to = m.to();
+    const Piece  mover = at(from), victim = at(to);
+    const Color  us = turn(), them = ~us;
+    if (from == to || mover == NO_PIECE || color_of(mover) != us)
+      return false;
+    if (flags == CAPTURE) {
+      if (victim == NO_PIECE || color_of(victim) != them || type_of(victim) == KING)
+        return false;
+    } else if (victim != NO_PIECE)
+      return false;
+
+    const PieceType pt  = type_of(mover);
+    const Bitboard  all = all_pieces<WHITE>() | all_pieces<BLACK>();
+    if (pt == PAWN) {
+      const Direction forward = us == WHITE ? NORTH : SOUTH;
+      if (rank_of(to) == RANK1 || rank_of(to) == RANK8)
+        return false;
+      if (flags == CAPTURE) {
+        const Bitboard targets = us == WHITE ? pawn_attacks<WHITE>(from) : pawn_attacks<BLACK>(from);
+        if (!(targets & sq_bb(to)))
+          return false;
+      } else if (flags == DOUBLE_PUSH) {
+        if (rank_of(from) != (us == WHITE ? RANK2 : RANK7) || int(to) != int(from) + 2 * int(forward) ||
+            at(from + forward) != NO_PIECE)
+          return false;
+      } else if (to != from + forward)
+        return false;
+    } else if (flags == DOUBLE_PUSH || !(attacks(pt, from, all) & sq_bb(to)))
+      return false;
+
+    const Square   king      = pt == KING ? to : bsf(bitboard_of(us, KING));
+    const Bitboard occ       = (all ^ sq_bb(from)) | sq_bb(to);
+    const Bitboard attackers = us == WHITE ? attackers_from<BLACK>(king, occ) : attackers_from<WHITE>(king, occ);
+    return !(attackers & ~sq_bb(to)) && !(KING_ATTACKS[king] & bitboard_of(them, KING));
+  }
+
   template<Color C>
   void play(Move m);
   template<Color C>
@@ -201,9 +251,9 @@ public:
     --game_ply;
   }
 
-  // captures-only is invalid while in check
-  template<Color Us, bool CAPTURES_ONLY = false>
-  Move *generate_legals(Move *list);
+  // quiescence mode is invalid while in check
+  template<Color Us, MoveGen Mode = MoveGen::ALL>
+  Move *generate_legals(Move *list, LegalContext *context = nullptr);
 };
 
 template<Color C>
@@ -398,9 +448,13 @@ template<Color C>
 }
 
 
-template<Color Us, bool CAPTURES_ONLY>
-[[gnu::hot]] Move *Position::generate_legals(Move *list) {
-  constexpr Color Them = ~Us;
+template<Color Us, MoveGen Mode>
+[[gnu::hot]] Move *Position::generate_legals(Move *list, LegalContext *context) {
+  constexpr Color Them          = ~Us;
+  constexpr bool  CAPTURES_ONLY = Mode == MoveGen::QUIESCENCE || Mode == MoveGen::CAPTURES;
+  constexpr bool  QUIETS_ONLY   = Mode == MoveGen::QUIETS;
+  const bool      cached        = context && context->ready;
+  assert(!cached || context->hash == get_hash());
 
   const Bitboard us_bb   = all_pieces<Us>();
   const Bitboard them_bb = all_pieces<Them>();
@@ -416,25 +470,28 @@ template<Color Us, bool CAPTURES_ONLY>
 
   Bitboard b1, b2, b3;
 
-  Bitboard danger = 0;
+  Bitboard danger = cached ? context->danger : 0;
 
-  danger |= pawn_attacks<Them>(bitboard_of(Them, PAWN)) | attacks<KING>(their_king, all) |
-            knight_attacks(bitboard_of(Them, KNIGHT));
+  if (!cached) {
+    danger |= pawn_attacks<Them>(bitboard_of(Them, PAWN)) | attacks<KING>(their_king, all) |
+              knight_attacks(bitboard_of(Them, KNIGHT));
 
-  const Bitboard all_no_king = all ^ sq_bb(our_king);
+    const Bitboard all_no_king = all ^ sq_bb(our_king);
 
-  b1 = their_diag_sliders;
-  while (b1)
-    danger |= attacks<BISHOP>(pop_lsb(&b1), all_no_king);
+    b1 = their_diag_sliders;
+    while (b1)
+      danger |= attacks<BISHOP>(pop_lsb(&b1), all_no_king);
 
-  b1 = their_orth_sliders;
-  while (b1)
-    danger |= attacks<ROOK>(pop_lsb(&b1), all_no_king);
+    b1 = their_orth_sliders;
+    while (b1)
+      danger |= attacks<ROOK>(pop_lsb(&b1), all_no_king);
+  }
 
   b1 = attacks<KING>(our_king, all) & ~(us_bb | danger);
   if constexpr (!CAPTURES_ONLY)
     list = make<QUIET>(our_king, b1 & ~them_bb, list);
-  list = make<CAPTURE>(our_king, b1 & them_bb, list);
+  if constexpr (!QUIETS_ONLY)
+    list = make<CAPTURE>(our_king, b1 & them_bb, list);
 
   Bitboard capture_mask;
 
@@ -442,31 +499,39 @@ template<Color Us, bool CAPTURES_ONLY>
 
   Square s;
 
-  Bitboard candidates = (attacks<ROOK>(our_king, them_bb) & their_orth_sliders) |
-                        (attacks<BISHOP>(our_king, them_bb) & their_diag_sliders);
-
-  pinned = 0;
-  if (!(danger & sq_bb(our_king))) [[likely]] {
-    checkers = 0;
-    while (candidates) {
-      s  = pop_lsb(&candidates);
-      b1 = SQUARES_BETWEEN_BB[our_king][s] & us_bb;
-      if (!(b1 & (b1 - 1)))
-        pinned ^= b1;
-    }
+  if (cached) {
+    pinned   = context->pinned;
+    checkers = context->checkers;
   } else {
-    checkers = (attacks<KNIGHT>(our_king, all) & bitboard_of(Them, KNIGHT)) |
-               (pawn_attacks<Us>(our_king) & bitboard_of(Them, PAWN));
+    Bitboard candidates = (attacks<ROOK>(our_king, them_bb) & their_orth_sliders) |
+                          (attacks<BISHOP>(our_king, them_bb) & their_diag_sliders);
 
-    while (candidates) {
-      s  = pop_lsb(&candidates);
-      b1 = SQUARES_BETWEEN_BB[our_king][s] & us_bb;
+    pinned = 0;
+    if (!(danger & sq_bb(our_king))) [[likely]] {
+      checkers = 0;
+      while (candidates) {
+        s  = pop_lsb(&candidates);
+        b1 = SQUARES_BETWEEN_BB[our_king][s] & us_bb;
+        if (!(b1 & (b1 - 1)))
+          pinned ^= b1;
+      }
+    } else {
+      checkers = (attacks<KNIGHT>(our_king, all) & bitboard_of(Them, KNIGHT)) |
+                 (pawn_attacks<Us>(our_king) & bitboard_of(Them, PAWN));
 
-      if (b1 == 0)
-        checkers ^= sq_bb(s);
-      else if (!(b1 & (b1 - 1)))
-        pinned ^= b1;
+      while (candidates) {
+        s  = pop_lsb(&candidates);
+        b1 = SQUARES_BETWEEN_BB[our_king][s] & us_bb;
+
+        if (b1 == 0)
+          checkers ^= sq_bb(s);
+        else if (!(b1 & (b1 - 1)))
+          pinned ^= b1;
+      }
     }
+
+    if (context)
+      *context = {get_hash(), danger, pinned, checkers, true};
   }
 
   const Bitboard not_pinned = ~pinned;
@@ -477,6 +542,9 @@ template<Color Us, bool CAPTURES_ONLY>
     {
 
       Square checker_square = bsf(checkers);
+      if constexpr (QUIETS_ONLY)
+        if (type_of(board[checker_square]) == PAWN || type_of(board[checker_square]) == KNIGHT)
+          return list;
 
       switch (board[checker_square]) {
         case make_piece(Them, PAWN):
@@ -500,7 +568,7 @@ template<Color Us, bool CAPTURES_ONLY>
 
           return list;
         default:
-          capture_mask = checkers;
+          capture_mask = QUIETS_ONLY ? 0 : checkers;
 
           quiet_mask = SQUARES_BETWEEN_BB[our_king][checker_square];
           break;
@@ -508,11 +576,11 @@ template<Color Us, bool CAPTURES_ONLY>
     }
   } else {
     {
-      capture_mask = them_bb;
+      capture_mask = QUIETS_ONLY ? 0 : them_bb;
 
       quiet_mask = ~all;
 
-      if (history[game_ply].epsq != NO_SQUARE) [[unlikely]] {
+      if (!QUIETS_ONLY && history[game_ply].epsq != NO_SQUARE) [[unlikely]] {
         b2 = pawn_attacks<Them>(history[game_ply].epsq) & bitboard_of(Us, PAWN);
         b1 = b2 & not_pinned;
         while (b1) {
@@ -560,7 +628,7 @@ template<Color Us, bool CAPTURES_ONLY>
           b2   = pawn_attacks<Us>(s) & capture_mask & LINE[our_king][s];
           list = make<PROMOTION_CAPTURES>(s, b2, list);
         } else {
-          b2   = pawn_attacks<Us>(s) & them_bb & LINE[s][our_king];
+          b2   = pawn_attacks<Us>(s) & capture_mask & LINE[s][our_king];
           list = make<CAPTURE>(s, b2, list);
 
           if constexpr (!CAPTURES_ONLY) {
@@ -637,7 +705,7 @@ template<Color Us, bool CAPTURES_ONLY>
 
   b1 = bitboard_of(Us, PAWN) & not_pinned & MASK_RANK[relative_rank<Us>(RANK7)];
   if (b1) [[unlikely]] {
-    b2 = shift<relative_dir<Us>(NORTH)>(b1) & quiet_mask;
+    b2 = Mode == MoveGen::CAPTURES ? 0 : shift<relative_dir<Us>(NORTH)>(b1) & quiet_mask;
     while (b2) {
       s = pop_lsb(&b2);
       if constexpr (!CAPTURES_ONLY) {
