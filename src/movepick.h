@@ -22,6 +22,7 @@ namespace search {
     static constexpr bool ENABLE_CAPTURE_STAGE    = true;
     static constexpr bool ENABLE_REFUTATION_STAGE = true;
     static constexpr bool ENABLE_LAZY_BAD_SORT    = true;
+    static constexpr bool ENABLE_SKIP_QUIETS      = true;
 
     enum SeeBand : int8_t {
       SEE_UNKNOWN, // TT move or a non-capture: never verified here
@@ -76,7 +77,7 @@ namespace search {
     }
 
     template<MoveGen Mode>
-    void append_moves() {
+    void append_moves(bool score_moves = true) {
       Move        *end   = pos->turn() == WHITE ? pos->generate_legals<WHITE, Mode>(moves + n, &context)
                                                 : pos->generate_legals<BLACK, Mode>(moves + n, &context);
       const size_t count = size_t(end - moves);
@@ -90,7 +91,7 @@ namespace search {
         if (emitted)
           continue;
         moves[n]    = m;
-        scores[n++] = move_score(m);
+        scores[n++] = score_moves ? move_score(m) : 0;
       }
       assert(n <= std::size(moves));
     }
@@ -184,6 +185,33 @@ namespace search {
     }
 
   public:
+    int skip_quiets(Move excluded) {
+      if (!split_captures || yields < SORT_AFTER || (stage != REFUTATIONS && stage != READY))
+        return 0;
+      // promotions keep their ordering and move counts
+      if (pos->bitboard_of(pos->turn(), PAWN) & MASK_RANK[pos->turn() == WHITE ? RANK7 : RANK2])
+        return 0;
+      if (stage == REFUTATIONS) {
+        append_moves<MoveGen::QUIETS>(false);
+        stage = READY;
+      }
+      int    skipped = 0;
+      size_t end     = cur;
+      for (size_t i = cur; i < n; ++i) {
+        if (!moves[i].is_capture()) {
+          skipped += moves[i] != excluded;
+          continue;
+        }
+        moves[end]    = moves[i];
+        scores[end++] = scores[i];
+      }
+      n = end;
+      sort_remaining(false);
+      sorted         = true;
+      defer_bad_sort = false;
+      return skipped;
+    }
+
     [[nodiscard]] bool has_moves() {
       if (stage == TT)
         return true;

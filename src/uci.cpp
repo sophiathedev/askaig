@@ -20,6 +20,7 @@
 #include "position.h"
 #include "search.h"
 #include "see.h"
+#include "smp.h"
 #include "syzygy.h"
 #include "tables.h"
 #include "tt.h"
@@ -362,7 +363,7 @@ namespace {
     auto hist = std::make_unique<search::Histories>();
     hist->clear();
     PRNG       rng(0x4d6f76655069636bull);
-    int        positions = 0, pickers = 0, qs_tail_checks = 0;
+    int        positions = 0, pickers = 0, qs_tail_checks = 0, quiet_skips = 0, skip_tail_checks = 0;
     const auto check = [&](Position &pos, bool exhaustive) {
       Move                    legal[218];
       const size_t            n = legal_moves(pos, legal);
@@ -487,6 +488,49 @@ namespace {
           ++pickers;
         }
       }
+      for (Move ttm: {Move(), n ? legal[0] : Move()})
+        for (bool qs: {false, true})
+          for (int prefix: {1, 3, 4, 8})
+            for (Move excluded: {Move(), killers[0], n ? legal[0] : Move()}) {
+              search::MovePicker before(pos, *hist, ttm, killers, killers[1], ch1, ch2, qs);
+              search::MovePicker after(pos, *hist, ttm, killers, killers[1], ch1, ch2, qs);
+              Move               last;
+              for (int j = 0; j < prefix; ++j) {
+                last = before.next();
+                if (last != after.next())
+                  return false;
+                if (!last.to_from())
+                  break;
+              }
+              if (!last.to_from() || !search::is_quiet(last))
+                continue;
+              const int skipped = after.skip_quiets(excluded);
+              quiet_skips += skipped;
+              int before_count = 0, after_count = skipped, expected_skips = 0;
+              for (Move m; (m = before.next()).to_from();) {
+                if (m == excluded)
+                  continue;
+                ++before_count;
+                if (skipped && search::is_quiet(m)) {
+                  ++expected_skips;
+                  continue;
+                }
+                Move actual;
+                do {
+                  actual = after.next();
+                } while (actual.to_from() && actual == excluded);
+                if (actual != m || before.yielded_see() != after.yielded_see() || ++after_count != before_count) {
+                  std::cout << "selftest movepick FAIL: quiet skip order/count fen " << pos.fen() << "\n";
+                  return false;
+                }
+                skip_tail_checks += skipped > 0;
+              }
+              if (skipped != expected_skips || after_count != before_count)
+                return false;
+              for (Move m; (m = after.next()).to_from();)
+                if (m != excluded)
+                  return false;
+            }
       ++positions;
       return true;
     };
@@ -615,11 +659,12 @@ namespace {
           break;
       }
     }
-    if (!qs_tail_checks)
+    if (!qs_tail_checks || !quiet_skips || !skip_tail_checks)
       return false;
     std::cout << "selftest movepick PASS: " << positions << " positions, " << pickers
               << " TT sequences and split sets/bands match, context, legality and refutations verified; "
-              << qs_tail_checks << " losing QS tail moves verified\n";
+              << qs_tail_checks << " losing QS tail moves verified; " << quiet_skips << " quiet skips, "
+              << skip_tail_checks << " retained moves/counts verified\n";
     return true;
   }
 

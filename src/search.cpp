@@ -494,8 +494,11 @@ namespace {
 
       if (!root && best > -MATE_IN_MAX) {
         if (quiet && !in_check) {
-          if (depth <= prm.LMP_DEPTH && quiet_count >= lmp_limit)
+          if (depth <= prm.LMP_DEPTH && quiet_count >= lmp_limit) {
+            if constexpr (MovePicker::ENABLE_SKIP_QUIETS)
+              move_count += picker.skip_quiets(ss->excluded);
             continue;
+          }
           if (depth <= prm.FUT_DEPTH && std::abs(alpha) < MATE_IN_MAX &&
               ss->static_eval + prm.FUT_BASE + prm.FUT_MULT * depth + prm.FUT_UNC * ss->eval_unc / 1024 <= alpha)
             continue;
