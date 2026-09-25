@@ -5,6 +5,51 @@ games against the previous version and run a statistical test. Node counts, perf
 spot-checks confirm **correctness**, never **Elo**. Use this harness for every change intended to
 gain strength (evaluation tweaks, search tuning, time management, …).
 
+## SPSA tuning
+
+Run a short pilot before spending a larger game budget. The tuner uses one frozen
+binary with two parameter sets, and excludes Hash, Threads, Contempt and Syzygy options.
+The default book is `UHO_4060_v4.epd`; without `PARAMS`, all exposed search/eval parameters
+are selected. NNUE weights are not tuned.
+
+```bash
+RUN_ID=search-pilot ENGINE=build-pgo/askaig TC=8+0.08 HASH=256 \
+  CONCURRENCY=4 ITERS=25 GAMES=8 python3 tools/spsa.py
+
+RESUME=search-pilot python3 tools/spsa.py
+
+# new schedule, optionally initialized from an old text export
+RUN_ID=search-long INIT=tools/work/spsa.tuned ENGINE=build-pgo/askaig \
+  TC=8+0.08 HASH=256 CONCURRENCY=4 ITERS=6000 GAMES=8 python3 tools/spsa.py
+```
+
+Each run lives in `tools/work/spsa-runs/<RUN_ID>/` with copies of the engine,
+fastchess and opening book, input checksums, unique batch logs, `checkpoint.json`,
+and `spsa.tuned`. Existing runs are never overwritten; one process may own a run.
+The old shared `tools/work/spsa.tuned` is left untouched.
+
+The checkpoint atomically records full-precision theta, completed iteration, RNG
+state and the original schedule after every valid batch. Resume uses these inputs
+and rejects changed settings, binaries, book or tuner code. `ITERS` is the total
+planned iterations, not additional iterations. A completed run cannot be extended
+without changing the schedule: start a new run with `INIT=<run>/spsa.tuned` instead.
+Resume with only `RESUME`, unsetting any exported input overrides first.
+
+Ctrl-C/SIGTERM, match errors, crashes, time losses, missing/partial scores and a batch timeout
+stop without updating that iteration. Resume replays the uncommitted batch with the
+same perturbations and opening seed; completed batches are not replayed. Timed game
+outcomes are still subject to hardware noise. `MATCH_TIMEOUT` defaults to 3600 seconds
+per batch; choose it before starting a run. Fix repeated failures before resuming.
+
+`INIT` is a warm start, not a resume: old `.tuned` files cannot recover lost RNG or
+schedule state. `PARAMS=LMR_,HB_` selects prefixes. `STEP_FRAC=0.05`, `PERT_FRAC=0.10`
+and `SEED=20260614` keep the previous update rule; this patch does not calibrate it.
+The runner supports macOS/Linux. Validate final frozen constants with a separate SPRT.
+
+```bash
+python3 -B tools/test_spsa.py
+```
+
 ## One-time setup
 
 ```bash

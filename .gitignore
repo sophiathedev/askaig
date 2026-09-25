@@ -11,6 +11,8 @@ cmake-build-*/
 !/tools/nnue/
 !/tools/README.md
 !/tools/sprt_state.py
+!/tools/spsa.py
+!/tools/test_spsa.py
 tools/nnue/__pycache__/
 tools/nnue/*.pt
 build-tune/
