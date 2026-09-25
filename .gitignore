@@ -13,6 +13,7 @@ cmake-build-*/
 !/tools/sprt_state.py
 !/tools/spsa.py
 !/tools/test_spsa.py
+!/tools/test_uci_time.py
 tools/nnue/__pycache__/
 tools/nnue/*.pt
 build-tune/

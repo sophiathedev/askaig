@@ -1268,7 +1268,7 @@ namespace {
     stop_search(); // serialize searches
 
     int         depth    = 0;
-    int64_t     movetime = 0, wtime = 0, btime = 0, winc = 0, binc = 0;
+    int64_t     movetime = -1, wtime = -1, btime = -1, winc = 0, binc = 0;
     int64_t     nodes     = 0;
     int         movestogo = 0;
     bool        infinite  = false;
@@ -1308,11 +1308,11 @@ namespace {
     int64_t soft_ms = 0, hard_ms = 0;
     if (nodes > 0)
       max_depth = search::MAX_PLY;
-    if (movetime > 0) {
+    if (movetime >= 0) {
       max_depth = search::MAX_PLY;
       hard_ms   = std::max<int64_t>(movetime - MOVE_OVERHEAD_MS, 1);
       soft_ms   = 0;
-    } else if (wtime > 0 || btime > 0) {
+    } else if (wtime >= 0 || btime >= 0) {
       max_depth             = search::MAX_PLY;
       const int64_t t       = pos.turn() == WHITE ? wtime : btime;
       const int64_t inc     = pos.turn() == WHITE ? winc : binc;
