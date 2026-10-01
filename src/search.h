@@ -67,5 +67,6 @@ namespace search {
   void                          params_dirty();
   bool                          selftest_correction();
   bool                          selftest_tt_eval();
+  bool                          selftest_tt_rule50();
 
 } // namespace search

@@ -1029,6 +1029,13 @@ namespace {
     return ok;
   }
 
+  bool selftest_tt_rule50() {
+    const bool ok = search::selftest_tt_rule50();
+    std::cout << (ok ? "selftest tt-rule50 PASS: score bounds gated, move and raw eval retained\n"
+                     : "selftest tt-rule50 FAIL: unsafe score reuse near rule50\n");
+    return ok;
+  }
+
   void selftest_all() {
     bool ok = true;
     ok &= selftest_perft();
@@ -1037,6 +1044,7 @@ namespace {
     ok &= selftest_draw();
     ok &= selftest_correction();
     ok &= selftest_tt_eval();
+    ok &= selftest_tt_rule50();
     ok &= selftest_nnue(500, 80);
     ok &= selftest_search();
     ok &= selftest_contempt();
@@ -1558,6 +1566,8 @@ void uci::loop(bool tune) {
         selftest_correction();
       else if (what == "tt-eval")
         selftest_tt_eval();
+      else if (what == "tt-rule50")
+        selftest_tt_rule50();
       else if (what == "search")
         selftest_search();
       else if (what == "contempt")

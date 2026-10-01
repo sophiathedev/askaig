@@ -68,10 +68,16 @@ namespace {
     return (majors * 0xC2B2AE3D27D4EB4Full) >> CORR_SHIFT;
   }
 
-  [[gnu::const, gnu::always_inline]] inline int to_tt(int v, int ply) {
+  constexpr int TT_RULE50_LIMIT = 80;
+
+  [[gnu::const, gnu::always_inline]] inline int to_tt(int v, int ply, int fifty) {
+    if (fifty >= TT_RULE50_LIMIT)
+      return tt::VALUE_NONE_TT;
     return v >= MATE_IN_MAX ? v + ply : v <= -MATE_IN_MAX ? v - ply : v;
   }
-  [[gnu::const, gnu::always_inline]] inline int from_tt(int v, int ply) {
+  [[gnu::const, gnu::always_inline]] inline int from_tt(int v, int ply, int fifty) {
+    if (v == tt::VALUE_NONE_TT || fifty >= TT_RULE50_LIMIT)
+      return tt::VALUE_NONE_TT;
     return v >= MATE_IN_MAX ? v - ply : v <= -MATE_IN_MAX ? v + ply : v;
   }
 
@@ -235,7 +241,7 @@ namespace {
     const uint64_t key      = tt_key(pos);
 
     const tt::Probe tp   = tt::probe(key);
-    const int       ttsc = tp.hit && tp.score != tt::VALUE_NONE_TT ? from_tt(tp.score, ply) : tt::VALUE_NONE_TT;
+    const int       ttsc = tp.hit ? from_tt(tp.score, ply, pos.fifty()) : tt::VALUE_NONE_TT;
     if (!PV && tp.hit && ttsc != tt::VALUE_NONE_TT) {
       if (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && ttsc >= beta) || (tp.bound == tt::UPPER && ttsc <= alpha))
         return ttsc;
@@ -309,8 +315,8 @@ namespace {
       }
     }
 
-    tt::store(tp.slot, key, best_move, to_tt(best, ply), raw_eval, /*depth=*/0, best >= beta ? tt::LOWER : tt::UPPER,
-              PV);
+    tt::store(tp.slot, key, best_move, to_tt(best, ply, pos.fifty()), raw_eval, /*depth=*/0,
+              best >= beta ? tt::LOWER : tt::UPPER, PV);
     return best;
   }
 
@@ -351,7 +357,7 @@ namespace {
     tt::Probe      tp;
     if (!excluded) {
       tp           = tt::probe(key);
-      const int sc = tp.hit && tp.score != tt::VALUE_NONE_TT ? from_tt(tp.score, ply) : tt::VALUE_NONE_TT;
+      const int sc = tp.hit ? from_tt(tp.score, ply, pos.fifty()) : tt::VALUE_NONE_TT;
       if (!PV && tp.hit && tp.depth >= depth && sc != tt::VALUE_NONE_TT &&
           (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && sc >= beta) || (tp.bound == tt::UPPER && sc <= alpha))) {
         if (tp.bound == tt::LOWER && sc >= beta)
@@ -360,13 +366,13 @@ namespace {
       }
     }
     const Move ttm  = tp.move;
-    const int  ttsc = tp.hit && tp.score != tt::VALUE_NONE_TT ? from_tt(tp.score, ply) : tt::VALUE_NONE_TT;
+    const int  ttsc = tp.hit ? from_tt(tp.score, ply, pos.fifty()) : tt::VALUE_NONE_TT;
 
     if (!root && !excluded && syzygy::can_probe(pos, depth)) {
       if (const auto wdl = syzygy::probe_wdl(pos)) {
         ++t.tbhits;
         const int value = tablebase_score(*wdl, pos);
-        tt::store(tp.slot, key, Move(), value, tt::VALUE_NONE_TT, depth, tt::EXACT, PV);
+        tt::store(tp.slot, key, Move(), to_tt(value, ply, pos.fifty()), tt::VALUE_NONE_TT, depth, tt::EXACT, PV);
         return value;
       }
     }
@@ -459,7 +465,7 @@ namespace {
           if (stopped()) [[unlikely]]
             return 0;
           if (v >= pc_beta) {
-            tt::store(tp.slot, key, m, to_tt(v, ply), raw_eval, pc_depth + 1, tt::LOWER, false);
+            tt::store(tp.slot, key, m, to_tt(v, ply, pos.fifty()), raw_eval, pc_depth + 1, tt::LOWER, false);
             return v;
           }
         }
@@ -619,7 +625,7 @@ namespace {
       best = alpha;
 
     if (!excluded) {
-      tt::store(tp.slot, key, best_move, to_tt(best, ply), raw_eval, depth, bound, PV);
+      tt::store(tp.slot, key, best_move, to_tt(best, ply, pos.fifty()), raw_eval, depth, bound, PV);
 
       if (!in_check && (best_move.to_from() == 0 || is_quiet(best_move)) &&
           !(bound == tt::LOWER && best <= ss->static_eval) && !(bound == tt::UPPER && best >= ss->static_eval) &&
@@ -779,6 +785,81 @@ bool search::selftest_tt_eval() {
       ok &= result.raw == tt::VALUE_NONE_TT && result.score == raw / 2 + correction;
     }
   }
+  return ok;
+}
+
+bool search::selftest_tt_rule50() {
+  if (!nnue::loaded())
+    return false;
+  bool ok = true;
+  for (int clock: {0, TT_RULE50_LIMIT - 1, TT_RULE50_LIMIT, 99})
+    for (int value: {137, -137, MATE - 5, -MATE + 5, TABLEBASE_WIN, -TABLEBASE_WIN}) {
+      const int encoded = to_tt(value, 3, clock);
+      ok &= clock < TT_RULE50_LIMIT ? from_tt(encoded, 3, clock) == value : encoded == tt::VALUE_NONE_TT;
+      ok &= from_tt(to_tt(value, 3, 0), 3, clock) == (clock < TT_RULE50_LIMIT ? value : tt::VALUE_NONE_TT);
+    }
+  ok &= from_tt(tt::VALUE_NONE_TT, 3, 0) == tt::VALUE_NONE_TT;
+
+  const bool     saved_stop        = g_stop.exchange(false);
+  const bool     saved_helper      = g_helper_stop.exchange(false);
+  const int64_t  saved_hard        = g_hard_ms;
+  const uint64_t saved_limit       = g_node_limit;
+  const int      saved_contempt    = g_contempt;
+  const int      saved_probe_limit = syzygy::probe_limit;
+  syzygy::set_probe_limit(0);
+  g_hard_ms    = 0;
+  g_node_limit = 0;
+  g_contempt   = 0;
+  auto     t   = std::make_unique<ThreadData>();
+  Stack   *ss  = t->stack + 4;
+  Position pos;
+  Position::set("4k3/8/8/8/8/8/8/3QK3 w - - 99 1", pos);
+  const uint64_t key   = tt_key(pos);
+  const auto     reset = [&] {
+    tt::clear();
+    g_hist.clear();
+    std::memset(t->stack, 0, sizeof(t->stack));
+    t->nodes = 0;
+    t->ev.reset(pos);
+  };
+  reset();
+  const EvalResult ev    = evaluate(*t, pos, ss);
+  const int        alpha = ev.score - 10;
+  const int        fresh = negamax<false>(*t, pos, ss, alpha, alpha + 1, 1, 1, false);
+  ok &= fresh == 0 && t->nodes > 0;
+  for (auto bound: {tt::EXACT, tt::LOWER, tt::UPPER}) {
+    const int value = bound == tt::UPPER ? -1000 : 1000;
+    reset();
+    tt::store(tt::probe(key).slot, key, Move(d1, d4, QUIET), to_tt(value, 1, 0), ev.raw, 8, bound, false);
+    ok &= negamax<false>(*t, pos, ss, alpha, alpha + 1, 1, 1, false) == fresh && t->nodes > 0;
+    reset();
+    tt::store(tt::probe(key).slot, key, Move(), to_tt(value, 1, 0), ev.raw, 8, bound, false);
+    ok &= qsearch<false>(*t, pos, ss, alpha, alpha + 1, 1) == ev.score;
+  }
+
+  reset();
+  ok &= negamax<true>(*t, pos, ss, -INF, INF, 1, 1, false) == 0;
+  auto hit = tt::probe(key);
+  ok &= hit.hit && hit.score == tt::VALUE_NONE_TT && hit.eval == ev.raw && hit.move.to_from() != 0;
+  pos.history[pos.ply()].fifty = 0;
+  ok &= from_tt(hit.score, 1, pos.fifty()) == tt::VALUE_NONE_TT;
+  g_hist.clear();
+  std::memset(t->stack, 0, sizeof(t->stack));
+  t->nodes = 0;
+  ok &= negamax<true>(*t, pos, ss, -INF, INF, 1, 1, false) > 0 && t->nodes > 0;
+
+  pos.history[pos.ply()].fifty = 99;
+  reset();
+  ok &= qsearch<false>(*t, pos, ss, ev.score + 1, ev.score + 2, 1) == ev.score;
+  hit = tt::probe(key);
+  ok &= hit.hit && hit.score == tt::VALUE_NONE_TT && hit.eval == ev.raw;
+  reset();
+  g_stop.store(saved_stop);
+  g_helper_stop.store(saved_helper);
+  g_hard_ms    = saved_hard;
+  g_node_limit = saved_limit;
+  g_contempt   = saved_contempt;
+  syzygy::set_probe_limit(saved_probe_limit);
   return ok;
 }
 
