@@ -532,9 +532,9 @@ namespace {
           }
         } else if (v >= beta && std::abs(v) < MATE_IN_MAX)
           return v;
-        else if (ttsc >= beta)
+        else if (!PV && ttsc >= beta)
           extension = -2; // negative extension
-        else if (cutnode)
+        else if (!PV && cutnode)
           extension = -1;
       } else if (in_check && ply < 2 * t.root_depth)
         extension = 1;
