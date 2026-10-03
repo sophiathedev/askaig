@@ -76,7 +76,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-14 ninja-build zip
+          sudo apt-get install -y gcc-14 g++-14 ninja-build zip
           if [ -n "${{ matrix.mingw_triple }}" ]; then
             url="https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_TAG}/llvm-mingw-${LLVM_MINGW_TAG}-ucrt-ubuntu-${LLVM_MINGW_UBUNTU}-x86_64.tar.xz"
             curl -fL "$url" -o llvm-mingw.tar.xz
@@ -96,7 +96,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DSIMD=ON -DARCH=${{ matrix.arch }} \
             -DASKAIG_VERSION=${{ needs.meta.outputs.date }} \
-            ${{ runner.os == 'Linux' && '-DCMAKE_CXX_COMPILER=g++-14' || '' }} \
+            ${{ runner.os == 'Linux' && '-DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14' || '' }} \
             ${{ matrix.osx_arch && format('-DCMAKE_OSX_ARCHITECTURES={0}', matrix.osx_arch) || '' }}
           cmake --build build -j
 
@@ -109,7 +109,7 @@ jobs:
         if: ${{ matrix.pgo == 'gcc' }}
         run: |
           set -e
-          common="-S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSIMD=ON -DARCH=${{ matrix.arch }} -DASKAIG_VERSION=${{ needs.meta.outputs.date }} -DCMAKE_CXX_COMPILER=g++-14"
+          common="-S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSIMD=ON -DARCH=${{ matrix.arch }} -DASKAIG_VERSION=${{ needs.meta.outputs.date }} -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14"
           cmake $common -DPGO=generate
           cmake --build build -j
           # GCC writes .gcda into build/; the 'use' stage below must reuse this same dir.

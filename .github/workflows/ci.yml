@@ -24,6 +24,7 @@ jobs:
           - name: linux-x86_64-avx2
             runner: ubuntu-24.04
             arch: AVX2
+            cc: gcc-14
             cxx: g++-14
           - name: macos-arm64-neon
             runner: macos-15
@@ -31,6 +32,7 @@ jobs:
           - name: linux-scalar-fallback
             runner: ubuntu-24.04
             simd: "OFF"
+            cc: gcc-14
             cxx: g++-14
     steps:
       - uses: actions/checkout@v6
@@ -43,7 +45,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-14 ninja-build
+          sudo apt-get install -y gcc-14 g++-14 ninja-build
 
       - name: Install macOS deps
         if: runner.os == 'macOS'
@@ -55,6 +57,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DSIMD=${{ matrix.simd || 'ON' }} \
             ${{ matrix.arch && format('-DARCH={0}', matrix.arch) || '' }} \
+            ${{ matrix.cc && format('-DCMAKE_C_COMPILER={0}', matrix.cc) || '' }} \
             ${{ matrix.cxx && format('-DCMAKE_CXX_COMPILER={0}', matrix.cxx) || '' }}
           cmake --build build -j
 
@@ -121,10 +124,10 @@ jobs:
       - uses: jwlawson/actions-setup-cmake@v2
         with:
           cmake-version: latest
-      - run: sudo apt-get update && sudo apt-get install -y g++-14 ninja-build
+      - run: sudo apt-get update && sudo apt-get install -y gcc-14 g++-14 ninja-build
       - name: Configure & build (Debug — NDEBUG unset, every assert() actually runs)
         run: |
-          cmake --preset debug -DCMAKE_CXX_COMPILER=g++-14
+          cmake --preset debug -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14
           cmake --build --preset debug -j
       - name: selftest all
         run: |
@@ -141,11 +144,12 @@ jobs:
       - uses: jwlawson/actions-setup-cmake@v2
         with:
           cmake-version: latest
-      - run: sudo apt-get update && sudo apt-get install -y g++-14 ninja-build
+      - run: sudo apt-get update && sudo apt-get install -y gcc-14 g++-14 ninja-build
       - name: Configure & build
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER=gcc-14 \
             -DCMAKE_CXX_COMPILER=g++-14 \
             -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
@@ -165,11 +169,12 @@ jobs:
       - uses: jwlawson/actions-setup-cmake@v2
         with:
           cmake-version: latest
-      - run: sudo apt-get update && sudo apt-get install -y g++-14 ninja-build
+      - run: sudo apt-get update && sudo apt-get install -y gcc-14 g++-14 ninja-build
       - name: Configure & build
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_COMPILER=gcc-14 \
             -DCMAKE_CXX_COMPILER=g++-14 \
             -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
