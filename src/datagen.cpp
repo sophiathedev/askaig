@@ -73,9 +73,11 @@ namespace {
     return n == 0 ? Move() : buf[rng.rand<uint64_t>() % n];
   }
 
-  int search_once(Position &pos, Move *best) {
+  int search_once(Position &pos, datagen::SearchMode mode, uint64_t limit, Move *best) {
     search::clear_stop(); // the node cap left g_stop raised after the previous search
-    const search::Result r = search::think(pos, search::MAX_PLY - 1, nullptr, 0, 0);
+    const int depth = (mode == datagen::SearchMode::Depth) ? std::clamp(static_cast<int>(limit), 1, search::MAX_PLY - 1)
+                                                           : search::MAX_PLY - 1;
+    const search::Result r = search::think(pos, depth, nullptr, 0, 0);
     if (best)
       *best = r.best;
     return r.score;
@@ -98,14 +100,17 @@ namespace {
 
 } // namespace
 
-void datagen::run(uint64_t count, const std::string &out, uint64_t nodes, uint64_t seed) {
+void datagen::run(uint64_t count, const std::string &out, SearchMode mode, uint64_t limit, uint64_t seed) {
   std::FILE *f = std::fopen(out.c_str(), "ab");
   if (!f) {
     std::printf("datagen: cannot open %s\n", out.c_str());
     return;
   }
   tt::resize(16);
-  search::set_node_limit(nodes ? nodes : 5000);
+  if (mode == SearchMode::Nodes)
+    search::set_node_limit(limit ? limit : 5000);
+  else
+    search::set_node_limit(0);
   PRNG rng(seed ? seed : 0x9E3779B97F4A7C15ull);
 
   struct Pending {
@@ -139,10 +144,10 @@ void datagen::run(uint64_t count, const std::string &out, uint64_t nodes, uint64
     ++games;
     if (!ok || count_legals(pos) == 0)
       continue;
-    if (std::abs(search_once(pos, nullptr)) > OPENING_GATE_CP)
+    if (std::abs(search_once(pos, mode, limit, nullptr)) > OPENING_GATE_CP)
       continue;
 
-    int wr         = -1; // white pov: 0 loss, 1 draw, 2 win
+    int wr        = -1; // white pov: 0 loss, 1 draw, 2 win
     int win_plies = 0, draw_plies = 0;
     for (int ply = 0; ply < MAX_PLIES; ++ply) {
       if (count_legals(pos) == 0) {
@@ -155,7 +160,7 @@ void datagen::run(uint64_t count, const std::string &out, uint64_t nodes, uint64
       }
 
       Move      best;
-      const int score = search_once(pos, &best);
+      const int score = search_once(pos, mode, limit, &best);
       if (best.to_from() == 0)
         break; // aborted search: discard the game tail
 

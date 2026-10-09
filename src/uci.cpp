@@ -15,8 +15,8 @@
 #include <thread>
 #include <vector>
 #include "datagen.h"
-#include "nnue.h"
 #include "movepick.h"
+#include "nnue.h"
 #include "position.h"
 #include "search.h"
 #include "see.h"
@@ -1535,17 +1535,47 @@ void uci::loop(bool tune) {
       }
     } else if (cmd == "datagen") {
       stop_search();
-      uint64_t    count = 0, nodes = 5000, seed = 1, tmp = 0;
-      std::string out;
+      uint64_t            count = 0;
+      std::string         out;
+      datagen::SearchMode mode  = datagen::SearchMode::Nodes;
+      uint64_t            limit = 5000;
+      uint64_t            seed  = 1;
+
       is >> count >> out;
-      if (is >> tmp)
-        nodes = tmp;
-      if (is >> tmp)
-        seed = tmp;
-      if (count == 0 || out.empty())
-        std::cout << "usage: datagen <count> <out.bf> [nodes] [seed]\n";
+      std::string token;
+      if (is >> token) {
+        if (token == "depth") {
+          mode  = datagen::SearchMode::Depth;
+          limit = 8;
+          if (is >> limit) {
+            uint64_t s = 0;
+            if (is >> s)
+              seed = s;
+          }
+        } else if (token == "nodes") {
+          mode  = datagen::SearchMode::Nodes;
+          limit = 5000;
+          if (is >> limit) {
+            uint64_t s = 0;
+            if (is >> s)
+              seed = s;
+          }
+        } else {
+          try {
+            limit = std::stoull(token);
+            mode  = datagen::SearchMode::Nodes;
+          } catch (...) {
+            limit = 5000;
+          }
+          uint64_t s = 0;
+          if (is >> s)
+            seed = s;
+        }
+      }
+      if (count == 0 || out.empty() || limit == 0)
+        std::cout << "usage: datagen <count> <out.bf> [nodes|depth] [limit] [seed]\n";
       else
-        datagen::run(count, out, nodes, seed);
+        datagen::run(count, out, mode, limit, seed);
     } else if (cmd == "selftest") {
       stop_search();
       std::string what;
