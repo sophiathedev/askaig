@@ -124,7 +124,7 @@ if [ "$MODE" = resume ]; then
   exit "${PIPESTATUS[0]}"
 fi
 
-BOOK="${BOOK:-$HERE/books/UHO_4060_v4.epd}"
+BOOK="${BOOK:-$HERE/books/UHO_Lichess_4852_v1.epd}"
 # Opening-book format passed to fastchess (epd|pgn). Default epd (UHO). A balanced PGN book
 # (e.g. books/8moves_v3.pgn) reaches endgames far more often — set BOOK_FORMAT=pgn for it. Pair
 # with ADJUDICATE=0 when testing endgame eval, or the resign rule ends won games before they

@@ -33,13 +33,12 @@ namespace search {
     [[gnu::hot]] MovePicker(Position &pos, const Histories &hist, Move ttm, const Move *killers, Move counter,
                             const ContTable *ch1, const ContTable *ch2, bool quiescence, bool staged = ENABLE_TT_STAGE,
                             bool split = ENABLE_CAPTURE_STAGE, bool refutations = ENABLE_REFUTATION_STAGE,
-                            bool lazy_bad_sort = ENABLE_LAZY_BAD_SORT) :
+                            [[maybe_unused]] bool lazy_bad_sort = ENABLE_LAZY_BAD_SORT) :
         pos(&pos), hist(&hist), ttm(ttm), counter(counter), ch1(ch1), ch2(ch2) {
       const bool in_check = pos.turn() == WHITE ? pos.in_check<WHITE>() : pos.in_check<BLACK>();
       caps_only           = quiescence && !in_check;
       split_captures      = staged && split && !quiescence && !in_check;
       stage_refutations   = split_captures && refutations;
-      defer_bad_sort      = split_captures && lazy_bad_sort;
       if (killers) {
         this->killers[0] = killers[0];
         this->killers[1] = killers[1];
@@ -106,8 +105,10 @@ namespace search {
     }
 
     void prepare_quiets() {
+      n = cur = 0;
       append_moves<MoveGen::QUIETS>();
-      stage = READY;
+      stage  = QUIETS;
+      sorted = false;
     }
 
     void prepare_refutations() {
@@ -145,13 +146,12 @@ namespace search {
     }
 
     void generate() {
-      defer_bad_sort = false;
-      Position &pos  = *this->pos;
-      Move     *end  = pos.turn() == WHITE ? (caps_only ? pos.generate_legals<WHITE, MoveGen::QUIESCENCE>(moves)
-                                                        : pos.generate_legals<WHITE>(moves))
-                                           : (caps_only ? pos.generate_legals<BLACK, MoveGen::QUIESCENCE>(moves)
-                                                        : pos.generate_legals<BLACK>(moves));
-      n              = size_t(end - moves);
+      Position &pos = *this->pos;
+      Move     *end = pos.turn() == WHITE ? (caps_only ? pos.generate_legals<WHITE, MoveGen::QUIESCENCE>(moves)
+                                                       : pos.generate_legals<WHITE>(moves))
+                                          : (caps_only ? pos.generate_legals<BLACK, MoveGen::QUIESCENCE>(moves)
+                                                       : pos.generate_legals<BLACK>(moves));
+      n             = size_t(end - moves);
 
       for (size_t i = 0; i < n; ++i)
         scores[i] = move_score(moves[i]);
@@ -168,13 +168,11 @@ namespace search {
       stage = READY;
     }
 
-    void sort_remaining(bool skip_bad) {
+    void sort_remaining() {
       for (size_t i = cur + 1; i < n; ++i) {
         const Move m = moves[i];
         const int  s = scores[i];
-        if (skip_bad && s < -(SCORE_CAPTURE - 500'000))
-          continue;
-        size_t j = i;
+        size_t     j = i;
         for (; j > cur && scores[j - 1] < s; --j) {
           moves[j]  = moves[j - 1];
           scores[j] = scores[j - 1];
@@ -186,29 +184,20 @@ namespace search {
 
   public:
     int skip_quiets(Move excluded) {
-      if (!split_captures || yields < SORT_AFTER || (stage != REFUTATIONS && stage != READY))
+      if (!split_captures || yields < SORT_AFTER || (stage != REFUTATIONS && stage != QUIETS))
         return 0;
       // promotions keep their ordering and move counts
       if (pos->bitboard_of(pos->turn(), PAWN) & MASK_RANK[pos->turn() == WHITE ? RANK7 : RANK2])
         return 0;
       if (stage == REFUTATIONS) {
+        n = cur = 0;
         append_moves<MoveGen::QUIETS>(false);
-        stage = READY;
+        stage = QUIETS;
       }
-      int    skipped = 0;
-      size_t end     = cur;
-      for (size_t i = cur; i < n; ++i) {
-        if (!moves[i].is_capture()) {
-          skipped += moves[i] != excluded;
-          continue;
-        }
-        moves[end]    = moves[i];
-        scores[end++] = scores[i];
-      }
-      n = end;
-      sort_remaining(false);
-      sorted         = true;
-      defer_bad_sort = false;
+      int skipped = 0;
+      for (size_t i = cur; i < n; ++i)
+        skipped += moves[i] != excluded;
+      stage = BAD_CAPTURES;
       return skipped;
     }
 
@@ -224,6 +213,10 @@ namespace search {
           return true;
         prepare_quiets();
       }
+      if (stage == QUIETS && cur == n)
+        stage = BAD_CAPTURES;
+      if (stage == BAD_CAPTURES)
+        return bad_i < n_bad;
       return cur < n;
     }
 
@@ -243,17 +236,18 @@ namespace search {
           for (size_t i = cur + 1; i < n; ++i)
             if (scores[i] > scores[best])
               best = i;
-          if (scores[best] < SCORE_CAPTURE - 500'000)
-            break;
-          if (!see_ge(*pos, moves[best], 0)) {
-            scores[best] -= DEMOTION;
-            continue;
-          }
+          const Move m = moves[best];
           std::swap(moves[cur], moves[best]);
           std::swap(scores[cur], scores[best]);
+          ++cur;
+          if (!see_ge(*pos, m, 0)) {
+            if (n_bad < std::size(bad))
+              bad[n_bad++] = m;
+            continue;
+          }
           band = SEE_WINNING;
           ++yields;
-          return moves[cur++];
+          return m;
         }
         prepare_refutations();
       }
@@ -266,57 +260,89 @@ namespace search {
         }
         prepare_quiets();
       }
-      if (!sorted) {
-        if (yields < SORT_AFTER) {
-          while (cur < n) {
-            size_t best = cur;
-            for (size_t i = cur + 1; i < n; ++i)
-              if (scores[i] > scores[best])
-                best = i;
-            if (scores[best] > SCORE_CAPTURE - 500'000 && scores[best] < SCORE_CAPTURE + 500'000) {
-              if (!see_ge(*pos, moves[best], 0)) {
-                scores[best] -= DEMOTION;
-                continue;
-              }
-              band = SEE_WINNING;
-            } else
-              band = scores[best] < -(SCORE_CAPTURE - 500'000) ? SEE_LOSING : SEE_UNKNOWN;
-            std::swap(moves[cur], moves[best]);
-            std::swap(scores[cur], scores[best]);
-            ++yields;
-            return moves[cur++];
-          }
-          return Move();
-        }
-        sort_remaining(defer_bad_sort);
-        sorted = true;
-      }
-
-      if (defer_bad_sort && cur < n && scores[cur] < -(SCORE_CAPTURE - 500'000)) {
-        sort_remaining(false);
-        defer_bad_sort = false;
-      }
-      while (cur < n) {
-        const int s = scores[cur];
-        if (s > SCORE_CAPTURE - 500'000 && s < SCORE_CAPTURE + 500'000) {
-          if (!see_ge(*pos, moves[cur], 0)) {
-            const Move m  = moves[cur];
-            const int  ds = s - DEMOTION;
-            size_t     j  = cur + 1;
-            while (j < n && scores[j] > ds)
-              ++j;
-            for (size_t k = cur; k + 1 < j; ++k) {
-              moves[k]  = moves[k + 1];
-              scores[k] = scores[k + 1];
+      if (stage == QUIETS) {
+        if (!sorted) {
+          if (yields < SORT_AFTER) {
+            while (cur < n) {
+              size_t best = cur;
+              for (size_t i = cur + 1; i < n; ++i)
+                if (scores[i] > scores[best])
+                  best = i;
+              std::swap(moves[cur], moves[best]);
+              std::swap(scores[cur], scores[best]);
+              band = SEE_UNKNOWN;
+              ++yields;
+              return moves[cur++];
             }
-            moves[j - 1]  = m;
-            scores[j - 1] = ds;
-            continue;
+          } else {
+            sort_remaining();
+            sorted = true;
           }
-          band = SEE_WINNING;
-        } else
-          band = s < -(SCORE_CAPTURE - 500'000) ? SEE_LOSING : SEE_UNKNOWN;
-        return moves[cur++];
+        }
+        if (cur < n) {
+          band = SEE_UNKNOWN;
+          ++yields;
+          return moves[cur++];
+        }
+        stage = BAD_CAPTURES;
+      }
+      if (stage == BAD_CAPTURES) {
+        if (bad_i < n_bad) {
+          band = SEE_LOSING;
+          return bad[bad_i++];
+        }
+        return Move();
+      }
+      if (stage == READY) {
+        if (!sorted) {
+          if (yields < SORT_AFTER) {
+            while (cur < n) {
+              size_t best = cur;
+              for (size_t i = cur + 1; i < n; ++i)
+                if (scores[i] > scores[best])
+                  best = i;
+              if (scores[best] > SCORE_CAPTURE - 500'000 && scores[best] < SCORE_CAPTURE + 500'000) {
+                if (!see_ge(*pos, moves[best], 0)) {
+                  scores[best] -= DEMOTION;
+                  continue;
+                }
+                band = SEE_WINNING;
+              } else
+                band = scores[best] < -(SCORE_CAPTURE - 500'000) ? SEE_LOSING : SEE_UNKNOWN;
+              std::swap(moves[cur], moves[best]);
+              std::swap(scores[cur], scores[best]);
+              ++yields;
+              return moves[cur++];
+            }
+            return Move();
+          }
+          sort_remaining();
+          sorted = true;
+        }
+
+        while (cur < n) {
+          const int s = scores[cur];
+          if (s > SCORE_CAPTURE - 500'000 && s < SCORE_CAPTURE + 500'000) {
+            if (!see_ge(*pos, moves[cur], 0)) {
+              const Move m  = moves[cur];
+              const int  ds = s - DEMOTION;
+              size_t     j  = cur + 1;
+              while (j < n && scores[j] > ds)
+                ++j;
+              for (size_t k = cur; k + 1 < j; ++k) {
+                moves[k]  = moves[k + 1];
+                scores[k] = scores[k + 1];
+              }
+              moves[j - 1]  = m;
+              scores[j - 1] = ds;
+              continue;
+            }
+            band = SEE_WINNING;
+          } else
+            band = s < -(SCORE_CAPTURE - 500'000) ? SEE_LOSING : SEE_UNKNOWN;
+          return moves[cur++];
+        }
+        return Move();
       }
       return Move();
     }
@@ -324,7 +350,7 @@ namespace search {
     [[nodiscard]] SeeBand yielded_see() const { return band; }
 
   private:
-    enum Stage { TT, REST, CAPTURES, REFUTATIONS, READY };
+    enum Stage { TT, REST, CAPTURES, REFUTATIONS, QUIETS, BAD_CAPTURES, READY };
     Position        *pos;
     const Histories *hist;
     Move             ttm, counter, killers[2]{};
@@ -332,9 +358,10 @@ namespace search {
     bool             caps_only;
     bool             split_captures, tt_emitted = false;
     bool             stage_refutations;
-    bool             defer_bad_sort;
     Move             refutation_moves[3];
     uint8_t          refutation_count = 0, refutation_index = 0, refutation_candidate = 0;
+    Move             bad[64];
+    uint8_t          n_bad = 0, bad_i = 0;
     LegalContext     context;
     Stage            stage = READY;
     Move             moves[218];
