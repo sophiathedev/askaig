@@ -420,11 +420,12 @@ namespace {
       const Move  killers[2] = {n ? legal[n / 2] : Move(), n ? legal[n - 1] : Move()};
       const auto *ch1        = &hist->cont[WHITE_PAWN][a2];
       const auto *ch2        = &hist->cont[BLACK_KNIGHT][b8];
+      const auto *ch4        = &hist->cont[WHITE_BISHOP][c4];
       for (bool qs: {false, true}) {
         for (size_t i = 0; i < n + 2; ++i) {
           const Move         ttm = i < n ? legal[i] : i == n ? Move() : Move(rng.rand<uint16_t>());
-          search::MovePicker eager(pos, *hist, ttm, killers, killers[1], ch1, ch2, qs, false);
-          search::MovePicker staged(pos, *hist, ttm, killers, killers[1], ch1, ch2, qs, true, false);
+          search::MovePicker eager(pos, *hist, ttm, killers, killers[1], ch1, ch2, ch4, qs, false);
+          search::MovePicker staged(pos, *hist, ttm, killers, killers[1], ch1, ch2, ch4, qs, true, false);
           if (eager.has_moves() != staged.has_moves()) {
             std::cout << "selftest movepick FAIL: empty-list mismatch\n";
             return false;
@@ -444,8 +445,8 @@ namespace {
             expected[a.to_from()]     = uint8_t(eager.yielded_see()) + 1;
             expected_order[count - 1] = a;
           }
-          search::MovePicker split(pos, *hist, ttm, killers, killers[1], ch1, ch2, qs, true, true);
-          search::MovePicker sorted_bad(pos, *hist, ttm, killers, killers[1], ch1, ch2, qs, true, true,
+          search::MovePicker split(pos, *hist, ttm, killers, killers[1], ch1, ch2, ch4, qs, true, true);
+          search::MovePicker sorted_bad(pos, *hist, ttm, killers, killers[1], ch1, ch2, ch4, qs, true, true,
                                         search::MovePicker::ENABLE_REFUTATION_STAGE, false);
           if (split.has_moves() != (count > 1))
             return false;
@@ -492,8 +493,8 @@ namespace {
         for (bool qs: {false, true})
           for (int prefix: {1, 3, 4, 8})
             for (Move excluded: {Move(), killers[0], n ? legal[0] : Move()}) {
-              search::MovePicker before(pos, *hist, ttm, killers, killers[1], ch1, ch2, qs);
-              search::MovePicker after(pos, *hist, ttm, killers, killers[1], ch1, ch2, qs);
+              search::MovePicker before(pos, *hist, ttm, killers, killers[1], ch1, ch2, ch4, qs);
+              search::MovePicker after(pos, *hist, ttm, killers, killers[1], ch1, ch2, ch4, qs);
               Move               last;
               for (int j = 0; j < prefix; ++j) {
                 last = before.next();
@@ -570,6 +571,7 @@ namespace {
           hist->butterfly[pos.turn()][m.from()][m.to()]          = score;
           hist->cont[WHITE_PAWN][a2][pos.at(m.from())][m.to()]   = score / 2;
           hist->cont[BLACK_KNIGHT][b8][pos.at(m.from())][m.to()] = -score / 3;
+          hist->cont[WHITE_BISHOP][c4][pos.at(m.from())][m.to()] = score / 4;
           if (m.is_capture()) {
             const PieceType victim                          = m.flags() == EN_PASSANT ? PAWN : type_of(pos.at(m.to()));
             hist->capture[pos.at(m.from())][m.to()][victim] = score;
@@ -583,8 +585,8 @@ namespace {
       Position::set(DEFAULT_FEN, pos);
       hist->clear();
       const Move         ttm(e2, e4, DOUBLE_PUSH), improved(d2, d4, DOUBLE_PUSH);
-      search::MovePicker eager(pos, *hist, ttm, nullptr, Move(), nullptr, nullptr, false, false);
-      search::MovePicker staged(pos, *hist, ttm, nullptr, Move(), nullptr, nullptr, false, true);
+      search::MovePicker eager(pos, *hist, ttm, nullptr, Move(), nullptr, nullptr, nullptr, false, false);
+      search::MovePicker staged(pos, *hist, ttm, nullptr, Move(), nullptr, nullptr, nullptr, false, true);
       if (eager.next() != ttm || staged.next() != ttm)
         return false;
       hist->butterfly[WHITE][d2][d4] = search::HIST_MAX;
@@ -599,7 +601,8 @@ namespace {
       hist->clear();
       const Move         k1(g1, f3), k2(b1, c3), counter(d2, d4, DOUBLE_PUSH), improved(a2, a4, DOUBLE_PUSH);
       Move               killers[] = {k1, k2};
-      search::MovePicker picker(pos, *hist, Move(), killers, counter, nullptr, nullptr, false, true, true, true);
+      search::MovePicker picker(pos, *hist, Move(), killers, counter, nullptr, nullptr, nullptr, false, true, true,
+                                true);
       killers[0] = killers[1] = Move();
       for (Move expected: {k1, k2, counter}) {
         if (!picker.has_moves() || !picker.has_moves() || picker.next() != expected ||
@@ -621,7 +624,8 @@ namespace {
         return false;
 
       const Move         duplicates[] = {k1, k1};
-      search::MovePicker duplicate_picker(pos, *hist, k1, duplicates, k1, nullptr, nullptr, false, true, true, true);
+      search::MovePicker duplicate_picker(pos, *hist, k1, duplicates, k1, nullptr, nullptr, nullptr, false, true, true,
+                                          true);
       if (duplicate_picker.next() != k1)
         return false;
       count = 1;
@@ -636,7 +640,8 @@ namespace {
       Position::set("4r1k1/8/8/8/8/8/4N3/4K3 w - - 0 1", pos);
       const Move         killers[] = {Move(e2, c3), Move(e8, e7)};
       const Move         counter(e1, d1);
-      search::MovePicker picker(pos, *hist, Move(), killers, counter, nullptr, nullptr, false, true, true, true);
+      search::MovePicker picker(pos, *hist, Move(), killers, counter, nullptr, nullptr, nullptr, false, true, true,
+                                true);
       if (!picker.has_moves() || picker.next() != counter) {
         std::cout << "selftest movepick FAIL: pinned or wrong-color refutation\n";
         return false;
@@ -647,8 +652,9 @@ namespace {
       Position pos;
       Position::set(fen, pos);
       const Move         killers[] = {special, Move()};
-      search::MovePicker before(pos, *hist, Move(), killers, Move(), nullptr, nullptr, false, true, true, false);
-      search::MovePicker after(pos, *hist, Move(), killers, Move(), nullptr, nullptr, false, true, true, true);
+      search::MovePicker before(pos, *hist, Move(), killers, Move(), nullptr, nullptr, nullptr, false, true, true,
+                                false);
+      search::MovePicker after(pos, *hist, Move(), killers, Move(), nullptr, nullptr, nullptr, false, true, true, true);
       for (;;) {
         const Move a = before.next(), b = after.next();
         if (a != b || before.yielded_see() != after.yielded_see()) {

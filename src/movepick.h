@@ -31,10 +31,11 @@ namespace search {
     };
 
     [[gnu::hot]] MovePicker(Position &pos, const Histories &hist, Move ttm, const Move *killers, Move counter,
-                            const ContTable *ch1, const ContTable *ch2, bool quiescence, bool staged = ENABLE_TT_STAGE,
-                            bool split = ENABLE_CAPTURE_STAGE, bool refutations = ENABLE_REFUTATION_STAGE,
+                            const ContTable *ch1, const ContTable *ch2, const ContTable *ch4, bool quiescence,
+                            bool staged = ENABLE_TT_STAGE, bool split = ENABLE_CAPTURE_STAGE,
+                            bool                  refutations   = ENABLE_REFUTATION_STAGE,
                             [[maybe_unused]] bool lazy_bad_sort = ENABLE_LAZY_BAD_SORT) :
-        pos(&pos), hist(&hist), ttm(ttm), counter(counter), ch1(ch1), ch2(ch2) {
+        pos(&pos), hist(&hist), ttm(ttm), counter(counter), ch1(ch1), ch2(ch2), ch4(ch4) {
       const bool in_check = pos.turn() == WHITE ? pos.in_check<WHITE>() : pos.in_check<BLACK>();
       caps_only           = quiescence && !in_check;
       split_captures      = staged && split && !quiescence && !in_check;
@@ -72,6 +73,8 @@ namespace search {
         score += (*ch1)[pc][m.to()];
       if (ch2)
         score += (*ch2)[pc][m.to()];
+      if (ch4)
+        score += (*ch4)[pc][m.to()];
       return score;
     }
 
@@ -354,7 +357,7 @@ namespace search {
     Position        *pos;
     const Histories *hist;
     Move             ttm, counter, killers[2]{};
-    const ContTable *ch1, *ch2;
+    const ContTable *ch1, *ch2, *ch4;
     bool             caps_only;
     bool             split_captures, tt_emitted = false;
     bool             stage_refutations;

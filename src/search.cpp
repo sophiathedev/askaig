@@ -159,6 +159,8 @@ namespace {
       h += (*(ss - 1)->ch)[pc][m.to()];
     if ((ss - 2)->ch)
       h += (*(ss - 2)->ch)[pc][m.to()];
+    if ((ss - 4)->ch)
+      h += (*(ss - 4)->ch)[pc][m.to()];
     return h;
   }
 
@@ -174,6 +176,8 @@ namespace {
       hist_update((*(ss - 1)->ch)[pc][m.to()], bonus);
     if ((ss - 2)->ch)
       hist_update((*(ss - 2)->ch)[pc][m.to()], bonus);
+    if ((ss - 4)->ch)
+      hist_update((*(ss - 4)->ch)[pc][m.to()], bonus);
   }
 
   [[gnu::hot]] void update_quiet_hists(Stack *ss, const Position &pos, Move best, const Move *tried, int n_tried,
@@ -186,6 +190,8 @@ namespace {
         hist_update((*(ss - 1)->ch)[pc][m.to()], b);
       if ((ss - 2)->ch)
         hist_update((*(ss - 2)->ch)[pc][m.to()], b);
+      if ((ss - 4)->ch)
+        hist_update((*(ss - 4)->ch)[pc][m.to()], b);
     };
     touch(best, bonus);
     for (int i = 0; i < n_tried; ++i)
@@ -265,7 +271,7 @@ namespace {
     const int futility_base = ss->static_eval + prm.QS_FUT;
 
     const Move ttm = tp.move;
-    MovePicker picker(pos, g_hist, ttm, nullptr, Move(), nullptr, nullptr, /*quiescence=*/true);
+    MovePicker picker(pos, g_hist, ttm, nullptr, Move(), nullptr, nullptr, nullptr, /*quiescence=*/true);
     if (in_check && !picker.has_moves())
       return -MATE + ply;
 
@@ -446,7 +452,7 @@ namespace {
       const int pc_depth = std::max(depth - (improving ? 5 : 3), 0);
       if (depth >= prm.PC_DEPTH && std::abs(beta) < MATE_IN_MAX &&
           !(tp.hit && tp.depth >= depth - 3 && ttsc != tt::VALUE_NONE_TT && ttsc < pc_beta)) {
-        MovePicker pcpick(pos, g_hist, ttm.is_capture() ? ttm : Move(), nullptr, Move(), nullptr, nullptr,
+        MovePicker pcpick(pos, g_hist, ttm.is_capture() ? ttm : Move(), nullptr, Move(), nullptr, nullptr, nullptr,
                           /*quiescence=*/true);
         for (Move m; (m = pcpick.next()).to_from() != 0;) {
           if (!m.is_capture() || !see_ge(pos, m, pc_beta - ss->static_eval))
@@ -475,7 +481,8 @@ namespace {
     const Move counter = (ss - 1)->move.to_from() != 0
                                  ? counter_load(g_hist.counter[pos.at((ss - 1)->move.to())][(ss - 1)->move.to()])
                                  : Move();
-    MovePicker picker(pos, g_hist, ttm, ss->killers, counter, (ss - 1)->ch, (ss - 2)->ch, /*quiescence=*/false);
+    MovePicker picker(pos, g_hist, ttm, ss->killers, counter, (ss - 1)->ch, (ss - 2)->ch, (ss - 4)->ch,
+                      /*quiescence=*/false);
     if (!picker.has_moves()) {
       if (excluded)
         return alpha;

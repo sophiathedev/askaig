@@ -125,11 +125,16 @@ if [ "$MODE" = resume ]; then
 fi
 
 BOOK="${BOOK:-$HERE/books/UHO_Lichess_4852_v1.epd}"
-# Opening-book format passed to fastchess (epd|pgn). Default epd (UHO). A balanced PGN book
-# (e.g. books/8moves_v3.pgn) reaches endgames far more often — set BOOK_FORMAT=pgn for it. Pair
-# with ADJUDICATE=0 when testing endgame eval, or the resign rule ends won games before they
-# reach the bare-king phase those terms operate in.
-BOOK_FORMAT="${BOOK_FORMAT:-epd}"
+# Opening-book format passed to fastchess (epd|pgn). Auto-detected from file extension if unset,
+# defaulting to epd (UHO). A balanced PGN book (e.g. books/8moves_v3.pgn) reaches endgames far
+# more often. Pair with ADJUDICATE=0 when testing endgame eval, or the resign rule ends won games
+# before they reach the bare-king phase those terms operate in.
+if [ -z "${BOOK_FORMAT:-}" ]; then
+  case "$BOOK" in
+    *.pgn|*.PGN) BOOK_FORMAT=pgn ;;
+    *)           BOOK_FORMAT=epd ;;
+  esac
+fi
 [ -f "$BOOK" ] || { echo "opening book missing — run 'bash tools/setup.sh' to download it"; exit 1; }
 
 TC="${TC:-5+0.05}"
@@ -156,11 +161,12 @@ esac
 [ "$SAME_BINARY" = 0 ] || [ "$MODE" = new ] || { echo "SAME_BINARY is only supported for new runs"; exit 1; }
 [ "$SAME_BINARY" = 0 ] || [ "$BASE_REF" = HEAD ] || { echo "SAME_BINARY does not accept a baseline argument"; exit 1; }
 
-CAND_SYZYGY_PATH="${CAND_SYZYGY_PATH:-}"
+SYZYGY_PATH="${SYZYGY_PATH:-}"
+CAND_SYZYGY_PATH="${CAND_SYZYGY_PATH:-$SYZYGY_PATH}"
 CAND_SYZYGY_PROBE_DEPTH="${CAND_SYZYGY_PROBE_DEPTH:-1}"
 CAND_SYZYGY_50_MOVE_RULE="${CAND_SYZYGY_50_MOVE_RULE:-true}"
 CAND_SYZYGY_PROBE_LIMIT="${CAND_SYZYGY_PROBE_LIMIT:-5}"
-BASE_SYZYGY_PATH="${BASE_SYZYGY_PATH:-}"
+BASE_SYZYGY_PATH="${BASE_SYZYGY_PATH:-$SYZYGY_PATH}"
 BASE_SYZYGY_PROBE_DEPTH="${BASE_SYZYGY_PROBE_DEPTH:-1}"
 BASE_SYZYGY_50_MOVE_RULE="${BASE_SYZYGY_50_MOVE_RULE:-true}"
 BASE_SYZYGY_PROBE_LIMIT="${BASE_SYZYGY_PROBE_LIMIT:-5}"
