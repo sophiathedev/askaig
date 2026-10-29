@@ -243,11 +243,10 @@ namespace {
     if (ply >= MAX_PLY) [[unlikely]]
       return evaluate(t, pos, ss).score;
 
-    const bool     in_check = stm_in_check(pos);
-    const uint64_t key      = tt_key(pos);
-
-    const tt::Probe tp   = tt::probe(key);
-    const int       ttsc = tp.hit ? from_tt(tp.score, ply, pos.fifty()) : tt::VALUE_NONE_TT;
+    const bool      in_check = stm_in_check(pos);
+    const uint64_t  key      = tt_key(pos);
+    const tt::Probe tp       = tt::probe(key);
+    const int       ttsc     = tp.hit ? from_tt(tp.score, ply, pos.fifty()) : tt::VALUE_NONE_TT;
     if (!PV && tp.hit && ttsc != tt::VALUE_NONE_TT) {
       if (tp.bound == tt::EXACT || (tp.bound == tt::LOWER && ttsc >= beta) || (tp.bound == tt::UPPER && ttsc <= alpha))
         return ttsc;
@@ -281,10 +280,10 @@ namespace {
         const auto band = picker.yielded_see();
         if (band == MovePicker::SEE_LOSING)
           break; // only losing captures remain
-        if (band == MovePicker::SEE_UNKNOWN && !see_ge(pos, m, 0))
-          continue;
         const PieceType captured = m.flags() == EN_PASSANT ? PAWN : type_of(pos.at(m.to()));
         if (futility_base + PIECE_VAL[captured] <= alpha && m.flags() != PR_QUEEN && m.flags() != PC_QUEEN)
+          continue;
+        if (band == MovePicker::SEE_UNKNOWN && !see_ge(pos, m, 0))
           continue;
       }
 

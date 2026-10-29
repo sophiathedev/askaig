@@ -985,6 +985,7 @@ namespace {
     const int saved_threads = g_threads;
     g_threads               = 1; // deterministic scores
     search::set_threads(1);
+    search::clear_stop();
 
     Position pos;
     Position::set(FEN, pos);
