@@ -39,22 +39,22 @@ namespace search {
   void set_node_limit(uint64_t n);
 
   struct Params {
-    int LMR_BASE = 80, LMR_DIV = 230, LMR_TACT_MC = 6, LMR_CONF_HI = 40, LMR_CONF_LO = 15;
-    int MAT_BASE = 736, MAT_MULT = 5;
-    int HB_MULT = 160, HB_SUB = 80, HB_MAX = 2000;
-    int QS_FUT      = 120;
-    int IIR_DEPTH   = 4;
-    int RAZOR_DEPTH = 4, RAZOR_MULT = 300;
-    int RFP_DEPTH = 8, RFP_MULT = 80;
-    int NMP_DEPTH = 3, NMP_BASE = 3, NMP_DDIV = 3, NMP_EDIV = 200, NMP_ECAP = 3, NMP_VDEPTH = 12;
-    int PC_MARGIN = 180, PC_IMP = 60, PC_DEPTH = 5;
-    int LMP_BASE = 3, LMP_DEPTH = 8;
-    int FUT_DEPTH = 6, FUT_BASE = 100, FUT_MULT = 120;
-    int HP_DEPTH = 4, HP_MULT = 2048;
-    int SEEP_DEPTH = 8, SEEP_QUIET = 50, SEEP_CAPT = 90;
-    int SE_DEPTH = 8, SE_TTSUB = 3, SE_BMULT = 2, SE_DBL = 25, SE_TRI = 100, SE_DBLMAX = 6;
-    int ASP_DELTA = 14;
-    int RAZOR_UNC = 8, RFP_UNC = 8, FUT_UNC = 8;
+    int LMR_BASE = 93, LMR_DIV = 207, LMR_TACT_MC = 3, LMR_CONF_HI = 32, LMR_CONF_LO = 18;
+    int MAT_BASE = 798, MAT_MULT = 4;
+    int HB_MULT = 181, HB_SUB = 111, HB_MAX = 2797;
+    int QS_FUT      = 103;
+    int IIR_DEPTH   = 8;
+    int RAZOR_DEPTH = 4, RAZOR_MULT = 280;
+    int RFP_DEPTH = 12, RFP_MULT = 84;
+    int NMP_DEPTH = 4, NMP_BASE = 4, NMP_DDIV = 5, NMP_EDIV = 103, NMP_ECAP = 5, NMP_VDEPTH = 13;
+    int PC_MARGIN = 181, PC_IMP = 24, PC_DEPTH = 3;
+    int LMP_BASE = 1, LMP_DEPTH = 11;
+    int FUT_DEPTH = 4, FUT_BASE = 107, FUT_MULT = 111;
+    int HP_DEPTH = 7, HP_MULT = 1989;
+    int SEEP_DEPTH = 8, SEEP_QUIET = 57, SEEP_CAPT = 56;
+    int SE_DEPTH = 6, SE_TTSUB = 3, SE_BMULT = 1, SE_DBL = 38, SE_TRI = 93, SE_DBLMAX = 5;
+    int ASP_DELTA = 18;
+    int RAZOR_UNC = 37, RFP_UNC = 3, FUT_UNC = 12;
   };
   extern Params prm;
 
