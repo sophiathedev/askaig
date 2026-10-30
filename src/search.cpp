@@ -269,6 +269,26 @@ namespace {
       ss->static_eval = tt::VALUE_NONE_TT;
     const int futility_base = ss->static_eval + prm.QS_FUT;
 
+    if (!in_check) {
+      const Bitboard promo_pawns = pos.bitboard_of(pos.turn(), PAWN) & MASK_RANK[pos.turn() == WHITE ? RANK7 : RANK2];
+      if (!promo_pawns) {
+        int         max_victim = PIECE_VAL[QUEEN];
+        const Color them       = ~pos.turn();
+        if (!pos.bitboard_of(them, QUEEN)) {
+          if (pos.bitboard_of(them, ROOK))
+            max_victim = PIECE_VAL[ROOK];
+          else if (pos.bitboard_of(them, BISHOP) || pos.bitboard_of(them, KNIGHT))
+            max_victim = PIECE_VAL[BISHOP];
+          else
+            max_victim = PIECE_VAL[PAWN];
+        }
+        if (futility_base + max_victim <= alpha) {
+          tt::store(tp.slot, key, Move(), to_tt(best, ply, pos.fifty()), raw_eval, /*depth=*/0, tt::UPPER, PV);
+          return best;
+        }
+      }
+    }
+
     const Move ttm = tp.move;
     MovePicker picker(pos, g_hist, ttm, nullptr, Move(), nullptr, nullptr, nullptr, /*quiescence=*/true);
     if (in_check && !picker.has_moves())
